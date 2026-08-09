@@ -43,7 +43,6 @@ impl fmt::Display for SecretReferenceSummary {
 pub struct SecretBackendDescriptor {
     pub id: SecretBackendId,
     pub kind: String,
-    pub writable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +87,8 @@ pub trait SecretResolver: Send + Sync {
 
 #[async_trait]
 pub trait SecretAdministrator: Send + Sync {
+    fn backend_id(&self) -> SecretBackendId;
+
     async fn put(
         &self,
         locator: &SecretLocator,

@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use secrecy::SecretString;
-use tokio::sync::Semaphore;
+use tokio::sync::{Barrier, Semaphore};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
     OperationId, ProviderStateRootId,
@@ -49,8 +49,10 @@ fn secret_binding(slot: &str, backend: &str, locator: &str) -> CredentialBinding
     CredentialBindingRecord {
         slot: CredentialSlot::new(slot).unwrap(),
         binding: CredentialBinding::Secret {
-            backend: backend.into(),
-            locator: locator.into(),
+            reference: SecretReference {
+                backend_id: backend_id(backend),
+                locator: SecretLocator::new(locator).unwrap(),
+            },
         },
     }
 }
@@ -278,6 +280,121 @@ fn backend_registry_rejects_mismatched_keys_and_duplicate_descriptor_ids() {
     );
 }
 
+#[test]
+fn backend_registry_rejects_mismatched_resolver_and_administrator_ids() {
+    let connections = [connection(CONNECTION_A, "connection-a", Vec::new())];
+    let resolver = Arc::new(MemorySecretBackend::new(backend_id("resolver")));
+    let administrator = Arc::new(MemorySecretBackend::new(backend_id("administrator")));
+
+    assert!(
+        CredentialBroker::new(
+            [(
+                backend_id("resolver"),
+                SecretBackendHandle {
+                    resolver,
+                    administrator: Some(administrator),
+                },
+            )],
+            &connections,
+            Arc::new(AuditLog::default()),
+            Duration::from_secs(1),
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn read_only_put_rejection_is_audited() {
+    let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
+    let connections = [connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "memory", "a/key")],
+    )];
+    let audit = Arc::new(AuditLog::default());
+    let broker = CredentialBroker::new(
+        [(
+            backend_id("memory"),
+            SecretBackendHandle {
+                resolver: backend,
+                administrator: None,
+            },
+        )],
+        &connections,
+        audit.clone(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let context = context(CONNECTION_A, "provider.api_key", "request-read-only-put");
+
+    assert!(matches!(
+        broker
+            .put(
+                &connections,
+                &connections[0].credentials[0],
+                &context,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+                &BrokerCancellation::default(),
+            )
+            .await,
+        Err(SecretError::UnsupportedOperation {
+            operation: SecretOperation::Put,
+            ..
+        })
+    ));
+    assert!(audit.0.lock().unwrap().iter().any(|event| {
+        event.operation == SecretOperation::Put
+            && event.outcome == yakshed_secrets::SecretAuditOutcome::Failed
+            && event.backend.as_ref() == Some(&backend_id("memory"))
+    }));
+}
+
+#[tokio::test]
+async fn read_only_delete_rejection_is_audited() {
+    let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
+    let connections = [connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "memory", "a/key")],
+    )];
+    let audit = Arc::new(AuditLog::default());
+    let broker = CredentialBroker::new(
+        [(
+            backend_id("memory"),
+            SecretBackendHandle {
+                resolver: backend,
+                administrator: None,
+            },
+        )],
+        &connections,
+        audit.clone(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let context = context(CONNECTION_A, "provider.api_key", "request-read-only-delete");
+
+    assert!(matches!(
+        broker
+            .delete(
+                &connections,
+                &connections[0].credentials[0],
+                &context,
+                &BrokerCancellation::default(),
+            )
+            .await,
+        Err(SecretError::UnsupportedOperation {
+            operation: SecretOperation::Delete,
+            ..
+        })
+    ));
+    assert!(audit.0.lock().unwrap().iter().any(|event| {
+        event.operation == SecretOperation::Delete
+            && event.outcome == yakshed_secrets::SecretAuditOutcome::Failed
+            && event.backend.as_ref() == Some(&backend_id("memory"))
+    }));
+}
+
 #[tokio::test]
 async fn broker_maps_required_failures_and_uncertain_write_reconciliation() {
     let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
@@ -418,7 +535,6 @@ impl SecretResolver for PanicResolver {
         SecretBackendDescriptor {
             id: backend_id("panic"),
             kind: "test".into(),
-            writable: false,
         }
     }
 
@@ -605,6 +721,131 @@ async fn pre_cancelled_put_never_mutates_an_immediately_completing_backend() {
     );
 }
 
+struct ImmediateWriteBackend {
+    writes: AtomicUsize,
+}
+
+#[async_trait]
+impl SecretResolver for ImmediateWriteBackend {
+    fn descriptor(&self) -> SecretBackendDescriptor {
+        SecretBackendDescriptor {
+            id: backend_id("immediate"),
+            kind: "test".into(),
+        }
+    }
+
+    async fn probe(&self) -> Result<SecretBackendStatus, SecretError> {
+        Ok(SecretBackendStatus::Available)
+    }
+
+    async fn resolve(
+        &self,
+        locator: &SecretLocator,
+        _context: &SecretAccessContext,
+    ) -> Result<ResolvedSecret, SecretError> {
+        Err(SecretError::NotFound {
+            reference: yakshed_secrets::SecretReferenceSummary::from(&SecretReference {
+                backend_id: backend_id("immediate"),
+                locator: locator.clone(),
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl SecretAdministrator for ImmediateWriteBackend {
+    fn backend_id(&self) -> SecretBackendId {
+        backend_id("immediate")
+    }
+
+    async fn put(
+        &self,
+        _locator: &SecretLocator,
+        _value: &SecretString,
+        _options: PutSecretOptions,
+    ) -> Result<PutSecretOutcome, SecretError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Ok(PutSecretOutcome::Written)
+    }
+
+    async fn delete(&self, _locator: &SecretLocator) -> Result<DeleteSecretOutcome, SecretError> {
+        Ok(DeleteSecretOutcome::NotFound)
+    }
+}
+
+#[tokio::test]
+async fn cancellation_race_never_reports_cancelled_after_a_write() {
+    let backend = Arc::new(ImmediateWriteBackend {
+        writes: AtomicUsize::new(0),
+    });
+    let connections = Arc::new(vec![connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "immediate", "a/key")],
+    )]);
+    let broker = Arc::new(
+        CredentialBroker::new(
+            [(
+                backend_id("immediate"),
+                SecretBackendHandle {
+                    resolver: backend.clone(),
+                    administrator: Some(backend.clone()),
+                },
+            )],
+            &connections,
+            Arc::new(AuditLog::default()),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    );
+
+    for iteration in 0..300 {
+        let before = backend.writes.load(Ordering::SeqCst);
+        let barrier = Arc::new(Barrier::new(3));
+        let cancellation = BrokerCancellation::default();
+        let put = {
+            let barrier = barrier.clone();
+            let broker = broker.clone();
+            let connections = connections.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                broker
+                    .put(
+                        &connections,
+                        &connections[0].credentials[0],
+                        &context(
+                            CONNECTION_A,
+                            "provider.api_key",
+                            &format!("race-{iteration}"),
+                        ),
+                        &SecretString::from(CANARY.to_owned()),
+                        PutSecretOptions::OVERWRITE,
+                        &cancellation,
+                    )
+                    .await
+            })
+        };
+        let cancel = {
+            let barrier = barrier.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                cancellation.cancel();
+            })
+        };
+        barrier.wait().await;
+        let result = put.await.unwrap();
+        cancel.await.unwrap();
+        let after = backend.writes.load(Ordering::SeqCst);
+        match result {
+            Ok(_) => assert_eq!(after, before + 1),
+            Err(SecretError::Cancelled { .. }) => assert_eq!(after, before),
+            Err(error) => panic!("unexpected race result: {error}"),
+        }
+    }
+}
+
 struct SequencedBackend {
     calls: AtomicUsize,
     first_completed: AtomicBool,
@@ -618,7 +859,6 @@ impl SecretResolver for SequencedBackend {
         SecretBackendDescriptor {
             id: backend_id("sequence"),
             kind: "test".into(),
-            writable: true,
         }
     }
 
@@ -642,6 +882,10 @@ impl SecretResolver for SequencedBackend {
 
 #[async_trait]
 impl SecretAdministrator for SequencedBackend {
+    fn backend_id(&self) -> SecretBackendId {
+        backend_id("sequence")
+    }
+
     async fn put(
         &self,
         _locator: &SecretLocator,
@@ -889,6 +1133,36 @@ fn delivery_curates_runtime_environment_and_drops_ambient_credentials() {
         assert!(!environment.contains_key(&OsString::from("UNRELATED")));
     });
     assert!(shape_process_environment(&ambient, "BAD=NAME", &resolved).is_err());
+}
+
+#[test]
+fn controlled_environment_application_clears_inherited_variables() {
+    let resolved = ResolvedSecret::new(
+        SecretString::from(CANARY.to_owned()),
+        yakshed_secrets::ResolvedSecretSource {
+            backend: backend_id("memory"),
+        },
+        None,
+    );
+    let environment = shape_process_environment(
+        &HashMap::from([(OsString::from("PATH"), OsString::from("/usr/bin"))]),
+        "TEST_API_KEY",
+        &resolved,
+    )
+    .unwrap();
+    let mut command = std::process::Command::new("/usr/bin/env");
+    command.env("AMBIENT_FAKE_CREDENTIAL", "must-be-cleared");
+    environment.apply_to(&mut command);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    let names = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+        .collect::<Vec<_>>();
+    assert!(names.iter().any(|name| name == "PATH"));
+    assert!(names.iter().any(|name| name == "TEST_API_KEY"));
+    assert!(!names.iter().any(|name| name == "AMBIENT_FAKE_CREDENTIAL"));
 }
 
 #[test]

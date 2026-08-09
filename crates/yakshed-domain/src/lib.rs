@@ -71,7 +71,7 @@ impl CredentialBindingRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CredentialBinding {
     Delegated { authority: String },
-    Secret { backend: String, locator: String },
+    Secret { reference: SecretReference },
     Disabled,
 }
 
@@ -81,11 +81,7 @@ impl CredentialBinding {
             Self::Delegated { authority } => {
                 require_nonempty("delegated credential authority", authority)
             }
-            Self::Secret { backend, locator } => {
-                require_nonempty("secret credential backend", backend)?;
-                require_nonempty("secret credential locator", locator)
-            }
-            Self::Disabled => Ok(()),
+            Self::Secret { .. } | Self::Disabled => Ok(()),
         }
     }
 }
@@ -295,14 +291,13 @@ pub struct SecretReference {
 /// Configuration for a secret-reference backend, never a secret value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretBackend {
-    pub id: String,
+    pub id: SecretBackendId,
     pub kind: String,
     pub account: Option<String>,
 }
 
 impl SecretBackend {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        require_nonempty("secret backend id", &self.id)?;
         require_nonempty("secret backend kind", &self.kind)
     }
 }
@@ -363,14 +358,7 @@ mod tests {
             .validate()
             .is_err()
         );
-        assert!(
-            CredentialBinding::Secret {
-                backend: "memory".to_owned(),
-                locator: String::new()
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(SecretLocator::new(String::new()).is_err());
     }
 
     #[test]
@@ -391,8 +379,10 @@ mod tests {
                 CredentialBindingRecord {
                     slot: CredentialSlot::new("codex.account").unwrap(),
                     binding: CredentialBinding::Secret {
-                        backend: "local-os".to_owned(),
-                        locator: "connection/work/codex_account".to_owned(),
+                        reference: SecretReference {
+                            backend_id: SecretBackendId::new("local-os").unwrap(),
+                            locator: SecretLocator::new("connection/work/codex_account").unwrap(),
+                        },
                     },
                 },
             ],

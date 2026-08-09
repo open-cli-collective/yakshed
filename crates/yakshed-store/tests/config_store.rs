@@ -4,7 +4,7 @@ use tempfile::tempdir;
 use yakshed_application::{AppConfig, ConfigChange, ConfigRevision};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
-    ProviderStateRootId, SecretBackend,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretLocator, SecretReference,
 };
 use yakshed_store::{AppPaths, ConfigError, ConfigStore};
 
@@ -20,8 +20,10 @@ fn connection() -> Connection {
         credentials: vec![CredentialBindingRecord {
             slot: CredentialSlot::new("anthropic.api_key").unwrap(),
             binding: CredentialBinding::Secret {
-                backend: "memory".into(),
-                locator: "connection/work/anthropic_api_key".into(),
+                reference: SecretReference {
+                    backend_id: SecretBackendId::new("memory").unwrap(),
+                    locator: SecretLocator::new("connection/work/anthropic_api_key").unwrap(),
+                },
             },
         }],
     }
@@ -37,7 +39,7 @@ async fn config_round_trips_through_disk() {
         .update(
             ConfigRevision::INITIAL,
             ConfigChange::PutSecretBackend(SecretBackend {
-                id: "memory".into(),
+                id: SecretBackendId::new("memory").unwrap(),
                 kind: "memory".into(),
                 account: None,
             }),
@@ -102,6 +104,57 @@ fn malformed_config_has_a_parse_error() {
         ConfigStore::open(paths),
         Err(ConfigError::Parse(_))
     ));
+}
+
+#[test]
+fn invalid_persisted_backend_id_fails_closed_without_rewrite() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    let config_path = paths.config_root.join("config.toml");
+    let bytes =
+        b"schema_version = 1\n\n[[secret_backends]]\nid = \"bad backend\"\nkind = \"memory\"\n";
+    fs::write(&config_path, bytes).unwrap();
+
+    assert!(matches!(
+        ConfigStore::open(paths),
+        Err(ConfigError::Validation(_))
+    ));
+    assert_eq!(fs::read(config_path).unwrap(), bytes);
+}
+
+#[test]
+fn invalid_persisted_secret_locator_fails_closed_without_rewrite() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    let config_path = paths.config_root.join("config.toml");
+    let bytes = br#"schema_version = 1
+
+[[secret_backends]]
+id = "memory"
+kind = "memory"
+
+[[connections]]
+id = "0193f26e-7a72-7d42-bf77-0de14c4cc222"
+name = "Work"
+harness = "mock"
+model_provider = "anthropic"
+provider_state = "work-test"
+
+[[connections.credentials]]
+slot = "anthropic.api_key"
+source = "secret"
+backend = "memory"
+locator = "bad\nlocator"
+"#;
+    fs::write(&config_path, bytes).unwrap();
+
+    assert!(matches!(
+        ConfigStore::open(paths),
+        Err(ConfigError::Validation(_))
+    ));
+    assert_eq!(fs::read(config_path).unwrap(), bytes);
 }
 
 #[tokio::test]
@@ -176,7 +229,7 @@ async fn remove_operations_are_persisted() {
     let paths = AppPaths::for_test(temp.path());
     let store = ConfigStore::open(paths.clone()).unwrap();
     let backend = SecretBackend {
-        id: "memory".into(),
+        id: SecretBackendId::new("memory").unwrap(),
         kind: "memory".into(),
         account: None,
     };
@@ -201,7 +254,7 @@ async fn remove_operations_are_persisted() {
     store
         .update(
             snapshot.revision,
-            ConfigChange::RemoveSecretBackend("memory".into()),
+            ConfigChange::RemoveSecretBackend(SecretBackendId::new("memory").unwrap()),
         )
         .await
         .unwrap();

@@ -91,7 +91,6 @@ impl SecretResolver for MemorySecretBackend {
         SecretBackendDescriptor {
             id: self.id.clone(),
             kind: "memory".into(),
-            writable: true,
         }
     }
 
@@ -124,6 +123,10 @@ impl SecretResolver for MemorySecretBackend {
 
 #[async_trait]
 impl SecretAdministrator for MemorySecretBackend {
+    fn backend_id(&self) -> SecretBackendId {
+        self.id.clone()
+    }
+
     async fn put(
         &self,
         locator: &SecretLocator,

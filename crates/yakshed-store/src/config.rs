@@ -11,7 +11,8 @@ use thiserror::Error;
 use yakshed_application::{AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, UiConfig};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
-    ProviderStateRootId, SecretBackend,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretLocator, SecretReference,
+    ValidationError,
 };
 
 use crate::{AppPaths, PathError};
@@ -84,15 +85,25 @@ impl Default for UiDto {
     }
 }
 
-impl From<ConfigDto> for AppConfig {
-    fn from(config: ConfigDto) -> Self {
-        Self {
-            connections: config.connections.into_iter().map(Into::into).collect(),
-            secret_backends: config.secret_backends.into_iter().map(Into::into).collect(),
+impl TryFrom<ConfigDto> for AppConfig {
+    type Error = ValidationError;
+
+    fn try_from(config: ConfigDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            connections: config
+                .connections
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            secret_backends: config
+                .secret_backends
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             ui: UiConfig {
                 theme: config.ui.theme,
             },
-        }
+        })
     }
 }
 
@@ -109,16 +120,22 @@ impl From<&AppConfig> for ConfigDto {
     }
 }
 
-impl From<ConnectionDto> for Connection {
-    fn from(connection: ConnectionDto) -> Self {
-        Self {
+impl TryFrom<ConnectionDto> for Connection {
+    type Error = ValidationError;
+
+    fn try_from(connection: ConnectionDto) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: connection.id,
             name: connection.name,
             harness: connection.harness,
             model_provider: connection.model_provider,
             provider_state: connection.provider_state,
-            credentials: connection.credentials.into_iter().map(Into::into).collect(),
-        }
+            credentials: connection
+                .credentials
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -135,9 +152,11 @@ impl From<&Connection> for ConnectionDto {
     }
 }
 
-impl From<CredentialBindingDto> for CredentialBindingRecord {
-    fn from(binding: CredentialBindingDto) -> Self {
-        match binding {
+impl TryFrom<CredentialBindingDto> for CredentialBindingRecord {
+    type Error = ValidationError;
+
+    fn try_from(binding: CredentialBindingDto) -> Result<Self, Self::Error> {
+        Ok(match binding {
             CredentialBindingDto::Delegated { slot, authority } => Self {
                 slot,
                 binding: CredentialBinding::Delegated { authority },
@@ -148,13 +167,18 @@ impl From<CredentialBindingDto> for CredentialBindingRecord {
                 locator,
             } => Self {
                 slot,
-                binding: CredentialBinding::Secret { backend, locator },
+                binding: CredentialBinding::Secret {
+                    reference: SecretReference {
+                        backend_id: SecretBackendId::new(backend)?,
+                        locator: SecretLocator::new(locator)?,
+                    },
+                },
             },
             CredentialBindingDto::Disabled { slot } => Self {
                 slot,
                 binding: CredentialBinding::Disabled,
             },
-        }
+        })
     }
 }
 
@@ -165,10 +189,10 @@ impl From<&CredentialBindingRecord> for CredentialBindingDto {
                 slot: record.slot.clone(),
                 authority: authority.clone(),
             },
-            CredentialBinding::Secret { backend, locator } => Self::Secret {
+            CredentialBinding::Secret { reference } => Self::Secret {
                 slot: record.slot.clone(),
-                backend: backend.clone(),
-                locator: locator.clone(),
+                backend: reference.backend_id.as_str().to_owned(),
+                locator: reference.locator.as_str().to_owned(),
             },
             CredentialBinding::Disabled => Self::Disabled {
                 slot: record.slot.clone(),
@@ -177,20 +201,22 @@ impl From<&CredentialBindingRecord> for CredentialBindingDto {
     }
 }
 
-impl From<SecretBackendDto> for SecretBackend {
-    fn from(backend: SecretBackendDto) -> Self {
-        Self {
-            id: backend.id,
+impl TryFrom<SecretBackendDto> for SecretBackend {
+    type Error = ValidationError;
+
+    fn try_from(backend: SecretBackendDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: SecretBackendId::new(backend.id)?,
             kind: backend.kind,
             account: backend.account,
-        }
+        })
     }
 }
 
 impl From<&SecretBackend> for SecretBackendDto {
     fn from(backend: &SecretBackend) -> Self {
         Self {
-            id: backend.id.clone(),
+            id: backend.id.as_str().to_owned(),
             kind: backend.kind.clone(),
             account: backend.account.clone(),
         }
@@ -346,7 +372,8 @@ fn read_config(path: &Path) -> Result<AppConfig, ConfigError> {
     })?;
     let value = toml::from_str::<toml::Value>(&source).map_err(ConfigError::Parse)?;
     let value = migrate(value)?;
-    let config = AppConfig::from(value.try_into::<ConfigDto>().map_err(ConfigError::Parse)?);
+    let config = AppConfig::try_from(value.try_into::<ConfigDto>().map_err(ConfigError::Parse)?)
+        .map_err(|error| ConfigError::Validation(error.to_string()))?;
     config
         .validate()
         .map_err(|error| ConfigError::Validation(error.to_string()))?;

@@ -16,8 +16,7 @@ use yakshed_domain::{Connection, CredentialBinding, CredentialBindingRecord};
 use crate::{
     DeleteSecretOutcome, InvalidBindingReason, PutSecretOptions, PutSecretOutcome, ResolvedSecret,
     SecretAccessContext, SecretAuditEvent, SecretAuditOutcome, SecretAuditSink,
-    SecretBackendHandle, SecretBackendId, SecretError, SecretLocator, SecretOperation,
-    SecretReference,
+    SecretBackendHandle, SecretBackendId, SecretError, SecretOperation, SecretReference,
 };
 
 #[derive(Clone, Default)]
@@ -46,6 +45,8 @@ impl BrokerCancellation {
             return;
         }
         let notified = self.inner.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
@@ -108,6 +109,16 @@ impl CredentialBroker {
                     redacted_message: "backend registry key does not match descriptor".into(),
                 });
             }
+            if handle
+                .administrator
+                .as_ref()
+                .is_some_and(|administrator| administrator.backend_id() != descriptor_id)
+            {
+                return Err(SecretError::BackendFailure {
+                    backend: descriptor_id,
+                    redacted_message: "administrator identity does not match resolver".into(),
+                });
+            }
             if registry.insert(descriptor_id.clone(), handle).is_some() {
                 return Err(SecretError::BackendFailure {
                     backend: descriptor_id,
@@ -133,8 +144,8 @@ impl CredentialBroker {
                     redacted_message: "invalid connection credential configuration".into(),
                 })?;
             for binding in &connection.credentials {
-                if let Some(reference) = secret_reference(&binding.binding)?
-                    && !references.insert(reference)
+                if let Some(reference) = secret_reference(&binding.binding)
+                    && !references.insert(reference.clone())
                 {
                     return Err(SecretError::BackendFailure {
                         backend: broker_id(),
@@ -295,12 +306,11 @@ impl CredentialBroker {
             }
             binding => {
                 let reference = required_reference(binding)?;
-                let backend =
-                    self.audited_backend(&reference, context, SecretOperation::Resolve)?;
+                let backend = self.audited_backend(reference, context, SecretOperation::Resolve)?;
                 match self
                     .run(
                         context,
-                        &reference,
+                        reference,
                         SecretOperation::Resolve,
                         cancellation,
                         || backend.resolver.resolve(&reference.locator, context),
@@ -346,11 +356,10 @@ impl CredentialBroker {
             }
             binding => {
                 let reference = required_reference(binding)?;
-                let backend =
-                    self.audited_backend(&reference, context, SecretOperation::Resolve)?;
+                let backend = self.audited_backend(reference, context, SecretOperation::Resolve)?;
                 self.run(
                     context,
-                    &reference,
+                    reference,
                     SecretOperation::Resolve,
                     cancellation,
                     || backend.resolver.resolve(&reference.locator, context),
@@ -388,18 +397,22 @@ impl CredentialBroker {
             ));
         }
         let reference = required_reference(current)?;
-        let backend = self.audited_backend(&reference, context, SecretOperation::Put)?;
-        let administrator =
-            backend
-                .administrator
-                .as_ref()
-                .ok_or_else(|| SecretError::UnsupportedOperation {
-                    backend: reference.backend_id.clone(),
-                    operation: SecretOperation::Put,
-                })?;
+        let backend = self.audited_backend(reference, context, SecretOperation::Put)?;
+        let Some(administrator) = backend.administrator.as_ref() else {
+            self.audit(
+                context,
+                Some(reference.backend_id.clone()),
+                SecretOperation::Put,
+                SecretAuditOutcome::Failed,
+            );
+            return Err(SecretError::UnsupportedOperation {
+                backend: reference.backend_id.clone(),
+                operation: SecretOperation::Put,
+            });
+        };
         self.run(
             context,
-            &reference,
+            reference,
             SecretOperation::Put,
             cancellation,
             || administrator.put(&reference.locator, value, options),
@@ -433,18 +446,22 @@ impl CredentialBroker {
             ));
         }
         let reference = required_reference(current)?;
-        let backend = self.audited_backend(&reference, context, SecretOperation::Delete)?;
-        let administrator =
-            backend
-                .administrator
-                .as_ref()
-                .ok_or_else(|| SecretError::UnsupportedOperation {
-                    backend: reference.backend_id.clone(),
-                    operation: SecretOperation::Delete,
-                })?;
+        let backend = self.audited_backend(reference, context, SecretOperation::Delete)?;
+        let Some(administrator) = backend.administrator.as_ref() else {
+            self.audit(
+                context,
+                Some(reference.backend_id.clone()),
+                SecretOperation::Delete,
+                SecretAuditOutcome::Failed,
+            );
+            return Err(SecretError::UnsupportedOperation {
+                backend: reference.backend_id.clone(),
+                operation: SecretOperation::Delete,
+            });
+        };
         self.run(
             context,
-            &reference,
+            reference,
             SecretOperation::Delete,
             cancellation,
             || administrator.delete(&reference.locator),
@@ -457,27 +474,15 @@ fn broker_id() -> SecretBackendId {
     SecretBackendId::new("broker").unwrap()
 }
 
-fn secret_reference(binding: &CredentialBinding) -> Result<Option<SecretReference>, SecretError> {
-    let CredentialBinding::Secret { backend, locator } = binding else {
-        return Ok(None);
+fn secret_reference(binding: &CredentialBinding) -> Option<&SecretReference> {
+    let CredentialBinding::Secret { reference } = binding else {
+        return None;
     };
-    let backend_id =
-        SecretBackendId::new(backend.clone()).map_err(|_| SecretError::ProtocolViolation {
-            backend: broker_id(),
-            reason: "invalid secret backend ID".into(),
-        })?;
-    let locator = SecretLocator::new(locator.clone()).map_err(|_| SecretError::InvalidLocator {
-        backend: backend_id.clone(),
-        reason: "invalid secret locator".into(),
-    })?;
-    Ok(Some(SecretReference {
-        backend_id,
-        locator,
-    }))
+    Some(reference)
 }
 
-fn required_reference(binding: &CredentialBinding) -> Result<SecretReference, SecretError> {
-    secret_reference(binding)?.ok_or_else(|| SecretError::BackendFailure {
+fn required_reference(binding: &CredentialBinding) -> Result<&SecretReference, SecretError> {
+    secret_reference(binding).ok_or_else(|| SecretError::BackendFailure {
         backend: broker_id(),
         redacted_message: "credential is not secret-backed".into(),
     })
@@ -490,6 +495,10 @@ pub struct ChildProcessEnvironment {
 impl ChildProcessEnvironment {
     pub fn expose<R>(&self, use_environment: impl FnOnce(&HashMap<OsString, OsString>) -> R) -> R {
         use_environment(&self.variables)
+    }
+
+    pub fn apply_to(&self, command: &mut std::process::Command) {
+        command.env_clear().envs(&self.variables);
     }
 }
 
