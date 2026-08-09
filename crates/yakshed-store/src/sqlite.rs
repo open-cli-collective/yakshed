@@ -11,6 +11,7 @@ use std::{
 use async_trait::async_trait;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
 use rusqlite_migration::{M, Migrations};
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use yakshed_application::{
     AppStore, ApprovalPage, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateProject,
@@ -540,6 +541,11 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<ProjectSnapshot> {
     })
 }
 
+const RUN_SELECT: &str = "
+SELECT id, connection_id, work_item_id, status, provider_namespace,
+       provider_run_id, created_at_ms, ended_at_ms
+FROM runs";
+
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
     Ok(RunSnapshot {
         id: parse_column(row, 0)?,
@@ -552,6 +558,21 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
             .get::<_, Option<i64>>(7)?
             .map(UtcTimestamp::from_unix_millis),
     })
+}
+
+fn get_run(connection: &Connection, id: RunId) -> Result<RunSnapshot, StoreError> {
+    connection
+        .query_row(
+            &format!("{RUN_SELECT} WHERE id = ?1"),
+            [id.to_string()],
+            run_from_row,
+        )
+        .optional()
+        .map_err(map_database_error)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: id.to_string(),
+        })
 }
 
 fn run_status_value(status: RunStatus) -> &'static str {
@@ -715,38 +736,37 @@ fn find_stream_cursor(
         .map_err(map_database_error)
 }
 
-/// FNV-1a over `yakshed.timeline-batch.v1\0`, the item count, then each ordered
+/// SHA-256 over `yakshed.timeline-batch.v1\0`, the item count, then each ordered
 /// item's UUID, kind, body, and optional provider namespace/value. Integers and
 /// byte-string lengths are unsigned little-endian u64 values.
 fn timeline_payload_digest(items: &[yakshed_application::NewTimelineItem]) -> String {
-    fn add(hash: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    fn add_bytes(hash: &mut u64, bytes: &[u8]) {
-        add(hash, &(bytes.len() as u64).to_le_bytes());
-        add(hash, bytes);
+    fn add_bytes(hash: &mut Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
     }
 
-    let mut hash = 0xcbf29ce484222325;
-    add(&mut hash, b"yakshed.timeline-batch.v1\0");
-    add(&mut hash, &(items.len() as u64).to_le_bytes());
+    let mut hash = Sha256::new();
+    hash.update(b"yakshed.timeline-batch.v1\0");
+    hash.update((items.len() as u64).to_le_bytes());
     for item in items {
         add_bytes(&mut hash, item.id.to_string().as_bytes());
         add_bytes(&mut hash, item.kind.as_bytes());
         add_bytes(&mut hash, item.body.as_bytes());
         match &item.provider_id {
             Some(provider) => {
-                add(&mut hash, &[1]);
+                hash.update([1]);
                 add_bytes(&mut hash, provider.namespace().as_bytes());
                 add_bytes(&mut hash, provider.value().as_bytes());
             }
-            None => add(&mut hash, &[0]),
+            None => hash.update([0]),
         }
     }
-    format!("{hash:016x}")
+    let mut encoded = String::with_capacity(64);
+    for byte in hash.finalize() {
+        use std::fmt::Write as _;
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[async_trait]
@@ -1036,8 +1056,7 @@ impl AppStore for SqliteStore {
             let existing = worker
                 .connection
                 .query_row(
-                    "SELECT id, connection_id, work_item_id, status, provider_namespace,
-                            provider_run_id, created_at_ms, ended_at_ms FROM runs WHERE id = ?1",
+                    &format!("{RUN_SELECT} WHERE id = ?1"),
                     [command.id.to_string()],
                     run_from_row,
                 )
@@ -1110,6 +1129,11 @@ impl AppStore for SqliteStore {
             })
         })
         .await
+    }
+
+    async fn get_run(&self, id: RunId) -> Result<RunSnapshot, StoreError> {
+        self.call(move |worker| get_run(&worker.connection, id))
+            .await
     }
 
     async fn transition_run(&self, command: TransitionRun) -> Result<RunSnapshot, StoreError> {
@@ -1192,14 +1216,49 @@ impl AppStore for SqliteStore {
                 .map_err(map_database_error)?;
             let snapshot = transaction
                 .query_row(
-                    "SELECT id, connection_id, work_item_id, status, provider_namespace,
-                            provider_run_id, created_at_ms, ended_at_ms FROM runs WHERE id = ?1",
+                    &format!("{RUN_SELECT} WHERE id = ?1"),
                     [command.run_id.to_string()],
                     run_from_row,
                 )
                 .map_err(map_database_error)?;
             transaction.commit().map_err(map_database_error)?;
             Ok(snapshot)
+        })
+        .await
+    }
+
+    async fn list_runs_for_work_item(
+        &self,
+        work_item_id: WorkItemId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            let sql = format!(
+                "{RUN_SELECT}
+                 WHERE work_item_id = ?1 AND (?2 IS NULL OR id > ?2)
+                 ORDER BY id LIMIT ?3"
+            );
+            let mut statement = worker
+                .connection
+                .prepare(&sql)
+                .map_err(map_database_error)?;
+            let after = after.map(|id| id.to_string());
+            let mut items = statement
+                .query_map(
+                    params![work_item_id.to_string(), after, fetch_limit],
+                    run_from_row,
+                )
+                .map_err(map_database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_database_error)?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after = has_more.then(|| items.last().map(|item| item.id)).flatten();
+            Ok(RunPage { items, next_after })
         })
         .await
     }
@@ -1216,12 +1275,11 @@ impl AppStore for SqliteStore {
             let after = after.map(|id| id.to_string());
             let mut statement = worker
                 .connection
-                .prepare(
-                    "SELECT id, connection_id, work_item_id, status, provider_namespace,
-                            provider_run_id, created_at_ms, ended_at_ms
-                     FROM runs WHERE status = 'running' AND (?1 IS NULL OR id > ?1)
-                     ORDER BY id LIMIT ?2",
-                )
+                .prepare(&format!(
+                    "{RUN_SELECT}
+                     WHERE status = 'running' AND (?1 IS NULL OR id > ?1)
+                     ORDER BY id LIMIT ?2"
+                ))
                 .map_err(map_database_error)?;
             let mut items = statement
                 .query_map(params![after, fetch_limit], run_from_row)
@@ -1493,8 +1551,35 @@ impl AppStore for SqliteStore {
         validate_text("approval kind", &approval.kind)?;
         let now = self.clock.now();
         self.call(move |worker| {
-            let existing = worker
+            let transaction = worker
                 .connection
+                .transaction()
+                .map_err(map_database_error)?;
+            let run = transaction
+                .query_row(
+                    "SELECT connection_id, status FROM runs WHERE id = ?1",
+                    [approval.run_id.to_string()],
+                    |row| {
+                        Ok((
+                            parse_column::<ConnectionId>(row, 0)?,
+                            row.get::<_, String>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            let Some((connection_id, run_status)) = run else {
+                return Err(StoreError::NotFound {
+                    entity: "run",
+                    id: approval.run_id.to_string(),
+                });
+            };
+            if run_status != "running" {
+                return Err(StoreError::Conflict(
+                    "cannot record an approval for a terminal run".to_owned(),
+                ));
+            }
+            let existing = transaction
                 .query_row(
                     &format!("{APPROVAL_SELECT} WHERE id = ?1"),
                     [approval.id.to_string()],
@@ -1516,23 +1601,7 @@ impl AppStore for SqliteStore {
                     )))
                 };
             }
-            let connection_id = worker
-                .connection
-                .query_row(
-                    "SELECT connection_id FROM runs WHERE id = ?1",
-                    [approval.run_id.to_string()],
-                    |row| parse_column::<ConnectionId>(row, 0),
-                )
-                .optional()
-                .map_err(map_database_error)?;
-            let Some(connection_id) = connection_id else {
-                return Err(StoreError::NotFound {
-                    entity: "run",
-                    id: approval.run_id.to_string(),
-                });
-            };
-            worker
-                .connection
+            transaction
                 .execute(
                     "INSERT INTO approval_requests
                      (id, connection_id, run_id, provider_namespace, provider_approval_id, kind,
@@ -1550,7 +1619,7 @@ impl AppStore for SqliteStore {
                     ],
                 )
                 .map_err(map_database_error)?;
-            Ok(ApprovalSnapshot {
+            let snapshot = ApprovalSnapshot {
                 id: approval.id,
                 connection_id,
                 run_id: approval.run_id,
@@ -1562,7 +1631,9 @@ impl AppStore for SqliteStore {
                 response_started_at: None,
                 resolved_at: None,
                 voided_at: None,
-            })
+            };
+            transaction.commit().map_err(map_database_error)?;
+            Ok(snapshot)
         })
         .await
     }
@@ -1577,6 +1648,42 @@ impl AppStore for SqliteStore {
             i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
         self.call(move |worker| {
             list_approval_page(&worker.connection, "pending", after, limit, fetch_limit)
+        })
+        .await
+    }
+
+    async fn list_approvals_for_run(
+        &self,
+        run_id: RunId,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            let sql = format!(
+                "{APPROVAL_SELECT}
+                 WHERE run_id = ?1 AND (?2 IS NULL OR id > ?2)
+                 ORDER BY id LIMIT ?3"
+            );
+            let mut statement = worker
+                .connection
+                .prepare(&sql)
+                .map_err(map_database_error)?;
+            let after = after.map(|id| id.to_string());
+            let mut items = statement
+                .query_map(
+                    params![run_id.to_string(), after, fetch_limit],
+                    approval_from_row,
+                )
+                .map_err(map_database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_database_error)?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after = has_more.then(|| items.last().map(|item| item.id)).flatten();
+            Ok(ApprovalPage { items, next_after })
         })
         .await
     }

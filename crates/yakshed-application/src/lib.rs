@@ -366,7 +366,14 @@ pub trait AppStore: Send + Sync {
     async fn list_work_items(&self, query: ListWorkItems) -> Result<WorkItemPage, StoreError>;
     async fn archive_work_subtree(&self, root: WorkItemId) -> Result<u64, StoreError>;
     async fn create_run(&self, command: CreateRun) -> Result<RunSnapshot, StoreError>;
+    async fn get_run(&self, id: RunId) -> Result<RunSnapshot, StoreError>;
     async fn transition_run(&self, command: TransitionRun) -> Result<RunSnapshot, StoreError>;
+    async fn list_runs_for_work_item(
+        &self,
+        work_item_id: WorkItemId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError>;
     async fn list_active_runs(
         &self,
         after: Option<RunId>,
@@ -385,6 +392,12 @@ pub trait AppStore: Send + Sync {
     ) -> Result<ApprovalSnapshot, StoreError>;
     async fn list_pending_approvals(
         &self,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError>;
+    async fn list_approvals_for_run(
+        &self,
+        run_id: RunId,
         after: Option<ApprovalRequestId>,
         limit: u32,
     ) -> Result<ApprovalPage, StoreError>;

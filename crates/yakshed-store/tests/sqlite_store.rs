@@ -1065,6 +1065,84 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
 }
 
 #[tokio::test]
+async fn terminal_run_rejects_late_pending_approval() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "closed run".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    context
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Completed,
+            occurred_at: UtcTimestamp::from_unix_millis(60),
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        context
+            .store
+            .record_pending_approval(PendingApproval {
+                id: context.ids.next_approval_request_id(),
+                run_id: run.id,
+                provider_id: NamespacedProviderId::new("mock", "late").unwrap(),
+                kind: "command".into(),
+                summary: "too late".into(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(
+        context
+            .store
+            .list_pending_approvals(None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        context
+            .store
+            .list_unconfirmed_approval_responses(None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        context
+            .store
+            .list_approvals_for_run(run.id, None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
@@ -1110,6 +1188,15 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
             connection_id: connection_a(),
             work_item_id: child.id,
             provider_run: Some(NamespacedProviderId::new("mock", "run/restart").unwrap()),
+        })
+        .await
+        .unwrap();
+    let second_run = store
+        .create_run(CreateRun {
+            id: ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: child.id,
+            provider_run: Some(NamespacedProviderId::new("mock", "run/restart-2").unwrap()),
         })
         .await
         .unwrap();
@@ -1172,6 +1259,70 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
         })
         .await
         .unwrap();
+    let resolved = store
+        .record_pending_approval(PendingApproval {
+            id: ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "approval/resolved").unwrap(),
+            kind: "command".into(),
+            summary: "resolved".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .begin_approval_response(BeginApprovalResponse {
+            approval_id: resolved.id,
+            decision: ApprovalDecision::Denied,
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    store
+        .confirm_approval_response(ConfirmApprovalResponse {
+            approval_id: resolved.id,
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_approvals_for_run(run.id, None, 10)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|approval| approval.status)
+            .collect::<Vec<_>>(),
+        vec![
+            ApprovalStatus::Pending,
+            ApprovalStatus::Responding {
+                decision: ApprovalDecision::Approved,
+            },
+            ApprovalStatus::Resolved {
+                decision: ApprovalDecision::Denied,
+            },
+        ]
+    );
+    let terminal_run = store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Completed,
+            occurred_at: UtcTimestamp::from_unix_millis(98),
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    let second_terminal_run = store
+        .transition_run(TransitionRun {
+            run_id: second_run.id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Completed,
+            occurred_at: UtcTimestamp::from_unix_millis(99),
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
     store.shutdown().await.unwrap();
 
     let reopened = SqliteStore::open(paths, Arc::new(FixedClock))
@@ -1190,27 +1341,64 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
         .unwrap();
     assert_eq!(work.items.len(), 2);
     assert_eq!(work.items[1].parent_id, Some(root.id));
-    assert_eq!(
-        reopened.list_active_runs(None, 10).await.unwrap().items,
-        vec![run.clone()]
-    );
-    assert_eq!(
+    assert!(
         reopened
-            .list_pending_approvals(None, 10)
+            .list_active_runs(None, 10)
             .await
             .unwrap()
-            .items[0]
-            .id,
-        pending.id
+            .items
+            .is_empty()
+    );
+    assert_eq!(reopened.get_run(run.id).await.unwrap(), terminal_run);
+    let first_runs = reopened
+        .list_runs_for_work_item(child.id, None, 1)
+        .await
+        .unwrap();
+    let second_runs = reopened
+        .list_runs_for_work_item(child.id, first_runs.next_after, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_runs.items, vec![terminal_run.clone()]);
+    assert_eq!(second_runs.items, vec![second_terminal_run]);
+    let first_approvals = reopened
+        .list_approvals_for_run(run.id, None, 1)
+        .await
+        .unwrap();
+    let second_approvals = reopened
+        .list_approvals_for_run(run.id, first_approvals.next_after, 1)
+        .await
+        .unwrap();
+    let third_approvals = reopened
+        .list_approvals_for_run(run.id, second_approvals.next_after, 1)
+        .await
+        .unwrap();
+    let approval_history = [
+        first_approvals.items[0].clone(),
+        second_approvals.items[0].clone(),
+        third_approvals.items[0].clone(),
+    ];
+    assert_eq!(
+        approval_history
+            .iter()
+            .map(|approval| approval.id)
+            .collect::<Vec<_>>(),
+        vec![pending.id, responding.id, resolved.id]
     );
     assert_eq!(
-        reopened
-            .list_unconfirmed_approval_responses(None, 10)
-            .await
-            .unwrap()
-            .items[0]
-            .id,
-        responding.id
+        approval_history[0].status,
+        ApprovalStatus::Voided { decision: None }
+    );
+    assert_eq!(
+        approval_history[1].status,
+        ApprovalStatus::Voided {
+            decision: Some(ApprovalDecision::Approved)
+        }
+    );
+    assert_eq!(
+        approval_history[2].status,
+        ApprovalStatus::Resolved {
+            decision: ApprovalDecision::Denied
+        }
     );
     let first_page = reopened
         .list_timeline_page(ListTimeline {
@@ -1262,45 +1450,5 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
             .items
             .len(),
         2
-    );
-    assert_eq!(
-        reopened
-            .append_timeline_batch(TimelineBatch {
-                batch_id: ids.next_timeline_batch_id(),
-                connection_id: connection_a(),
-                run_id: run.id,
-                source_namespace: "mock".into(),
-                stream_id: "restart-stream".into(),
-                expected_stream_revision: recovered_cursor.cursor,
-                items: vec![NewTimelineItem {
-                    id: ids.next_timeline_item_id(),
-                    kind: "message".into(),
-                    body: "three".into(),
-                    provider_id: None,
-                }],
-            })
-            .await
-            .unwrap()
-            .get(),
-        3
-    );
-    let interrupted = reopened
-        .transition_run(TransitionRun {
-            run_id: run.id,
-            expected_current: RunStatus::Running,
-            target: RunStatus::Interrupted,
-            occurred_at: UtcTimestamp::from_unix_millis(99),
-            audit_event_id: ids.next_audit_event_id(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(interrupted.status, RunStatus::Interrupted);
-    assert!(
-        reopened
-            .list_active_runs(None, 10)
-            .await
-            .unwrap()
-            .items
-            .is_empty()
     );
 }
