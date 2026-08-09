@@ -437,7 +437,12 @@ impl<C: Clock> ArtifactStore<C> {
         Ok(())
     }
 
-    /// Preserves the canonical path until staging atomically replaces its corrupt contents.
+    /// Preserves the canonical path while replacing corrupt contents.
+    ///
+    /// Unix promotion is atomic. Windows has a bounded remove/rename window with explicit
+    /// rollback from the durable quarantine link. This std-only sequence is preferred to an
+    /// untestable native call because the project has no Windows CI, matching the existing
+    /// Windows directory-durability limitation.
     fn replace_corrupt_blob(
         &self,
         digest: &ContentDigest,
@@ -448,9 +453,10 @@ impl<C: Clock> ArtifactStore<C> {
     ) -> Result<(), ArtifactError> {
         let quarantine = self.quarantine_corrupt(digest, canonical)?;
         after_quarantine(&quarantine);
-        promote_staging_with(
+        promote_repair_staging(
             staging,
             canonical,
+            &quarantine,
             &self.sha256_root,
             rename,
             sync_directory,
@@ -524,13 +530,71 @@ fn promote_staging_with(
     destination: &Path,
     sha256_root: &Path,
     rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
-    mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
     rename(staging, destination)?;
+    finish_promotion(destination, sha256_root, sync)
+}
+
+fn finish_promotion(
+    destination: &Path,
+    sha256_root: &Path,
+    mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
     set_private_file_permissions(destination)?;
     sync(destination.parent().expect("digest path has a parent"))?;
     sync(sha256_root)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn promote_repair_staging(
+    staging: &Path,
+    destination: &Path,
+    _quarantine: &Path,
+    sha256_root: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    promote_staging_with(staging, destination, sha256_root, rename, sync)
+}
+
+#[cfg(windows)]
+fn promote_repair_staging(
+    staging: &Path,
+    destination: &Path,
+    quarantine: &Path,
+    sha256_root: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    promote_staging_over_existing_windows_sequence(
+        staging,
+        destination,
+        quarantine,
+        sha256_root,
+        rename,
+        sync,
+    )
+}
+
+#[cfg(any(windows, test))]
+fn promote_staging_over_existing_windows_sequence(
+    staging: &Path,
+    destination: &Path,
+    quarantine: &Path,
+    sha256_root: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    fs::remove_file(destination)?;
+    if let Err(promotion) = rename(staging, destination) {
+        return match fs::hard_link(quarantine, destination) {
+            Ok(()) => Err(ArtifactError::Io(promotion)),
+            Err(restore) => Err(ArtifactError::PromotionRollback { promotion, restore }),
+        };
+    }
+    finish_promotion(destination, sha256_root, sync)
 }
 
 /// Flushes a directory entry on Unix, where directory handles support `fsync`.
@@ -614,6 +678,13 @@ pub enum ArtifactError {
     BoundExceeded { byte_len: u64, max_bytes: u64 },
     #[error("invalid artifact input: {0}")]
     InvalidInput(&'static str),
+    #[error(
+        "artifact promotion failed: {promotion}; restoring the canonical blob also failed: {restore}"
+    )]
+    PromotionRollback {
+        promotion: io::Error,
+        restore: io::Error,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -635,6 +706,22 @@ mod tests {
             media_type: "text/plain".to_owned(),
             provenance: ArtifactProvenance::new("test").unwrap(),
         }
+    }
+
+    fn windows_promotion_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let sha256_root = temp.path().join("sha256");
+        let shard = sha256_root.join("ab");
+        let quarantine_root = temp.path().join("quarantine");
+        fs::create_dir_all(&shard).unwrap();
+        fs::create_dir(&quarantine_root).unwrap();
+        let staging = temp.path().join("staging");
+        let canonical = shard.join("digest");
+        let quarantine = quarantine_root.join("digest-quarantine");
+        fs::write(&staging, b"repaired").unwrap();
+        fs::write(&canonical, b"corrupt").unwrap();
+        fs::hard_link(&canonical, &quarantine).unwrap();
+        (temp, staging, canonical, quarantine, sha256_root)
     }
 
     #[cfg(unix)]
@@ -665,6 +752,64 @@ mod tests {
         .unwrap();
 
         assert_eq!(*synced.borrow(), [shard, sha256_root]);
+    }
+
+    #[test]
+    fn windows_shaped_repair_replaces_existing_canonical() {
+        let (_temp, staging, canonical, quarantine, sha256_root) = windows_promotion_fixture();
+
+        promote_staging_over_existing_windows_sequence(
+            &staging,
+            &canonical,
+            &quarantine,
+            &sha256_root,
+            |from, to| {
+                if to.exists() {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "simulated Windows rename semantics",
+                    ))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(canonical).unwrap(), b"repaired");
+        assert_eq!(fs::read(quarantine).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn windows_shaped_repair_failure_rolls_back_and_is_retriable() {
+        let (_temp, staging, canonical, quarantine, sha256_root) = windows_promotion_fixture();
+
+        let error = promote_staging_over_existing_windows_sequence(
+            &staging,
+            &canonical,
+            &quarantine,
+            &sha256_root,
+            |_, _| Err(io::Error::other("injected Windows promotion failure")),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert_eq!(fs::read(&canonical).unwrap(), b"corrupt");
+        assert_eq!(fs::read(&quarantine).unwrap(), b"corrupt");
+
+        promote_staging_over_existing_windows_sequence(
+            &staging,
+            &canonical,
+            &quarantine,
+            &sha256_root,
+            |from, to| fs::rename(from, to),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(canonical).unwrap(), b"repaired");
+        assert_eq!(fs::read(quarantine).unwrap(), b"corrupt");
     }
 
     #[cfg(unix)]
