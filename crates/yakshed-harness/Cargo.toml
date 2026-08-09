@@ -1,0 +1,9 @@
+[package]
+name = "yakshed-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+yakshed-application.workspace = true
+yakshed-domain.workspace = true
