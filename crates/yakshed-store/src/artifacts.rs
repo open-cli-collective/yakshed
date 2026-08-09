@@ -142,13 +142,16 @@ impl<C: Clock> ArtifactStore<C> {
             create_directory_durable(directory, sync_directory)?;
         }
         let canonical_root = fs::canonicalize(&artifacts_root)?;
+        let sha256_root = canonical_root.join("sha256");
+        let state = shared_artifact_state(&canonical_root);
+        recover_repair_sidecars(&sha256_root, &state, sync_directory)?;
         Ok(Self {
-            sha256_root: canonical_root.join("sha256"),
+            sha256_root,
             staging_root: canonical_root.join("staging"),
             quarantine_root: canonical_root.join("quarantine"),
             max_size,
             clock,
-            state: shared_artifact_state(&canonical_root),
+            state,
         })
     }
 
@@ -212,6 +215,7 @@ impl<C: Clock> ArtifactStore<C> {
                         &destination,
                         |_| {},
                         |from, to| fs::rename(from, to),
+                        |path| fs::remove_file(path),
                     )?;
                 }
                 Err(error) => return Err(error),
@@ -310,8 +314,13 @@ impl<C: Clock> ArtifactStore<C> {
                 if !entry.file_type()?.is_file() {
                     continue;
                 }
-                let Ok(digest) = entry.file_name().to_string_lossy().parse::<ContentDigest>()
-                else {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                // Recovery sidecars are startup-owned state, never garbage-collectable blobs.
+                if file_name.ends_with(".old") {
+                    continue;
+                }
+                let Ok(digest) = file_name.parse::<ContentDigest>() else {
                     continue;
                 };
                 if referenced.contains(&digest) {
@@ -437,28 +446,28 @@ impl<C: Clock> ArtifactStore<C> {
         Ok(())
     }
 
-    /// Preserves the canonical path while replacing corrupt contents.
+    /// Replaces corrupt contents through a recoverable sidecar protocol on every platform.
     ///
-    /// Unix promotion is atomic. Windows has a bounded remove/rename window with explicit
-    /// rollback from the durable quarantine link. This std-only sequence is preferred to an
-    /// untestable native call because the project has no Windows CI, matching the existing
-    /// Windows directory-durability limitation.
+    /// The unified path trades Unix's single atomic replacement for one implementation whose
+    /// persisted `.old` state is exercised on every platform: startup rolls back when only the
+    /// sidecar exists and rolls forward when the replacement and sidecar coexist.
     fn replace_corrupt_blob(
         &self,
         digest: &ContentDigest,
         staging: &Path,
         canonical: &Path,
         after_quarantine: impl FnOnce(&Path),
-        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+        remove: impl FnOnce(&Path) -> io::Result<()>,
     ) -> Result<(), ArtifactError> {
         let quarantine = self.quarantine_corrupt(digest, canonical)?;
         after_quarantine(&quarantine);
         promote_repair_staging(
             staging,
             canonical,
-            &quarantine,
             &self.sha256_root,
             rename,
+            remove,
             sync_directory,
         )
     }
@@ -547,54 +556,59 @@ fn finish_promotion(
     Ok(())
 }
 
-#[cfg(unix)]
 fn promote_repair_staging(
     staging: &Path,
     destination: &Path,
-    _quarantine: &Path,
     sha256_root: &Path,
-    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
-    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+    remove: impl FnOnce(&Path) -> io::Result<()>,
+    mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
-    promote_staging_with(staging, destination, sha256_root, rename, sync)
+    let sidecar = destination.with_extension("old");
+    rename(destination, &sidecar)?;
+    sync(destination.parent().expect("digest path has a parent"))?;
+    rename(staging, destination)?;
+    finish_promotion(destination, sha256_root, &mut sync)?;
+    remove(&sidecar)?;
+    sync(destination.parent().expect("digest path has a parent"))
 }
 
-#[cfg(windows)]
-fn promote_repair_staging(
-    staging: &Path,
-    destination: &Path,
-    quarantine: &Path,
+fn recover_repair_sidecars(
     sha256_root: &Path,
-    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
-    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+    state: &SharedArtifactState,
+    mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
-    promote_staging_over_existing_windows_sequence(
-        staging,
-        destination,
-        quarantine,
-        sha256_root,
-        rename,
-        sync,
-    )
-}
-
-#[cfg(any(windows, test))]
-fn promote_staging_over_existing_windows_sequence(
-    staging: &Path,
-    destination: &Path,
-    quarantine: &Path,
-    sha256_root: &Path,
-    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
-    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
-) -> Result<(), ArtifactError> {
-    fs::remove_file(destination)?;
-    if let Err(promotion) = rename(staging, destination) {
-        return match fs::hard_link(quarantine, destination) {
-            Ok(()) => Err(ArtifactError::Io(promotion)),
-            Err(restore) => Err(ArtifactError::PromotionRollback { promotion, restore }),
-        };
+    for shard in fs::read_dir(sha256_root)? {
+        let shard = shard?;
+        if !shard.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(shard.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(digest) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".old"))
+                .and_then(|name| name.parse::<ContentDigest>().ok())
+            else {
+                continue;
+            };
+            let digest_lock = state.get(&digest);
+            let _guard = digest_lock.lock().unwrap();
+            let canonical = shard.path().join(digest.as_str());
+            if canonical.try_exists()? {
+                fs::remove_file(entry.path())?;
+            } else {
+                fs::rename(entry.path(), &canonical)?;
+                set_private_file_permissions(&canonical)?;
+            }
+            sync(&shard.path())?;
+        }
     }
-    finish_promotion(destination, sha256_root, sync)
+    Ok(())
 }
 
 /// Flushes a directory entry on Unix, where directory handles support `fsync`.
@@ -678,13 +692,6 @@ pub enum ArtifactError {
     BoundExceeded { byte_len: u64, max_bytes: u64 },
     #[error("invalid artifact input: {0}")]
     InvalidInput(&'static str),
-    #[error(
-        "artifact promotion failed: {promotion}; restoring the canonical blob also failed: {restore}"
-    )]
-    PromotionRollback {
-        promotion: io::Error,
-        restore: io::Error,
-    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -693,7 +700,7 @@ pub enum ArtifactError {
 mod tests {
     #[cfg(unix)]
     use std::cell::RefCell;
-    use std::{sync::mpsc, thread};
+    use std::{cell::Cell, sync::mpsc, thread};
 
     use super::*;
 
@@ -706,22 +713,6 @@ mod tests {
             media_type: "text/plain".to_owned(),
             provenance: ArtifactProvenance::new("test").unwrap(),
         }
-    }
-
-    fn windows_promotion_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        let sha256_root = temp.path().join("sha256");
-        let shard = sha256_root.join("ab");
-        let quarantine_root = temp.path().join("quarantine");
-        fs::create_dir_all(&shard).unwrap();
-        fs::create_dir(&quarantine_root).unwrap();
-        let staging = temp.path().join("staging");
-        let canonical = shard.join("digest");
-        let quarantine = quarantine_root.join("digest-quarantine");
-        fs::write(&staging, b"repaired").unwrap();
-        fs::write(&canonical, b"corrupt").unwrap();
-        fs::hard_link(&canonical, &quarantine).unwrap();
-        (temp, staging, canonical, quarantine, sha256_root)
     }
 
     #[cfg(unix)]
@@ -752,64 +743,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(*synced.borrow(), [shard, sha256_root]);
-    }
-
-    #[test]
-    fn windows_shaped_repair_replaces_existing_canonical() {
-        let (_temp, staging, canonical, quarantine, sha256_root) = windows_promotion_fixture();
-
-        promote_staging_over_existing_windows_sequence(
-            &staging,
-            &canonical,
-            &quarantine,
-            &sha256_root,
-            |from, to| {
-                if to.exists() {
-                    Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "simulated Windows rename semantics",
-                    ))
-                } else {
-                    fs::rename(from, to)
-                }
-            },
-            |_| Ok(()),
-        )
-        .unwrap();
-
-        assert_eq!(fs::read(canonical).unwrap(), b"repaired");
-        assert_eq!(fs::read(quarantine).unwrap(), b"corrupt");
-    }
-
-    #[test]
-    fn windows_shaped_repair_failure_rolls_back_and_is_retriable() {
-        let (_temp, staging, canonical, quarantine, sha256_root) = windows_promotion_fixture();
-
-        let error = promote_staging_over_existing_windows_sequence(
-            &staging,
-            &canonical,
-            &quarantine,
-            &sha256_root,
-            |_, _| Err(io::Error::other("injected Windows promotion failure")),
-            |_| Ok(()),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, ArtifactError::Io(_)));
-        assert_eq!(fs::read(&canonical).unwrap(), b"corrupt");
-        assert_eq!(fs::read(&quarantine).unwrap(), b"corrupt");
-
-        promote_staging_over_existing_windows_sequence(
-            &staging,
-            &canonical,
-            &quarantine,
-            &sha256_root,
-            |from, to| fs::rename(from, to),
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(fs::read(canonical).unwrap(), b"repaired");
-        assert_eq!(fs::read(quarantine).unwrap(), b"corrupt");
     }
 
     #[cfg(unix)]
@@ -926,6 +859,7 @@ mod tests {
                     assert!(quarantine.exists());
                 },
                 |from, to| fs::rename(from, to),
+                |path| fs::remove_file(path),
             )
             .unwrap();
         drop(guard);
@@ -938,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_repair_promotion_keeps_canonical_and_is_retriable() {
+    fn startup_recovery_rolls_back_after_first_repair_rename() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
         paths.create_data_root().unwrap();
@@ -957,6 +891,7 @@ mod tests {
         drop(staging);
         let digest_lock = store.state.get(&record.digest);
         let guard = digest_lock.lock().unwrap();
+        let rename_count = Cell::new(0);
 
         let error = store
             .replace_corrupt_blob(
@@ -964,22 +899,32 @@ mod tests {
                 &staging_path,
                 &canonical,
                 |_| {},
-                |_, _| Err(io::Error::other("injected promotion failure")),
+                |from, to| {
+                    rename_count.set(rename_count.get() + 1);
+                    if rename_count.get() == 2 {
+                        Err(io::Error::other("injected crash after first rename"))
+                    } else {
+                        fs::rename(from, to)
+                    }
+                },
+                |path| fs::remove_file(path),
             )
             .unwrap_err();
         drop(guard);
         drop(active);
+        drop(store);
 
         assert!(matches!(error, ArtifactError::Io(_)));
-        let mut reader = store.open(&record.digest, 1024).unwrap();
-        let mut corrupt = Vec::new();
-        reader.read_to_end(&mut corrupt).unwrap();
-        assert_eq!(corrupt, b"corrupt");
+        assert!(!canonical.exists());
+        assert!(canonical.with_extension("old").exists());
+
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        assert_eq!(fs::read(&canonical).unwrap(), b"corrupt");
+        assert!(!canonical.with_extension("old").exists());
         assert!(matches!(
             store.verify(&record.digest),
             Err(ArtifactError::DigestMismatch { .. })
         ));
-        assert_eq!(fs::read_dir(&store.quarantine_root).unwrap().count(), 1);
 
         store
             .publish(
@@ -989,5 +934,79 @@ mod tests {
             .unwrap();
         store.verify(&record.digest).unwrap();
         assert_eq!(fs::read(canonical).unwrap(), b"repair after failure");
+    }
+
+    #[test]
+    fn startup_recovery_rolls_forward_after_second_repair_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_data_root().unwrap();
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        let record = store
+            .publish(
+                &b"roll forward"[..],
+                artifact_metadata("0193f26e-7a72-7d42-bf77-0de14c4cc245"),
+            )
+            .unwrap();
+        let canonical = store.path_for_digest(&record.digest);
+        fs::write(&canonical, b"corrupt").unwrap();
+        let (mut staging, staging_path, active) = store.create_staging_file().unwrap();
+        staging.write_all(b"roll forward").unwrap();
+        staging.sync_all().unwrap();
+        drop(staging);
+        let digest_lock = store.state.get(&record.digest);
+        let guard = digest_lock.lock().unwrap();
+
+        let error = store
+            .replace_corrupt_blob(
+                &record.digest,
+                &staging_path,
+                &canonical,
+                |_| {},
+                |from, to| fs::rename(from, to),
+                |_| Err(io::Error::other("injected crash after second rename")),
+            )
+            .unwrap_err();
+        drop(guard);
+        drop(active);
+        drop(store);
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert_eq!(fs::read(&canonical).unwrap(), b"roll forward");
+        assert!(canonical.with_extension("old").exists());
+
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        assert!(!canonical.with_extension("old").exists());
+        store.verify(&record.digest).unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_precedes_gc_and_ignores_unrelated_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_data_root().unwrap();
+        let digest = "0000000000000000000000000000000000000000000000000000000000000000"
+            .parse::<ContentDigest>()
+            .unwrap();
+        let shard = paths.data_root.join("artifacts/sha256/00");
+        fs::create_dir_all(&shard).unwrap();
+        let sidecar = shard.join(format!("{}.old", digest));
+        let unrelated = shard.join("notes.old");
+        fs::write(&sidecar, b"recoverable").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        let canonical = shard.join(digest.as_str());
+        assert_eq!(fs::read(&canonical).unwrap(), b"recoverable");
+        assert!(!sidecar.exists());
+        assert!(unrelated.exists());
+
+        assert_eq!(
+            store
+                .collect_unreferenced(&BTreeSet::from([digest]), Duration::ZERO,)
+                .unwrap(),
+            0
+        );
+        assert!(unrelated.exists());
     }
 }

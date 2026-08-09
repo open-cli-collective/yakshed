@@ -171,6 +171,7 @@ fn republishing_over_corrupt_blob_quarantines_and_repairs() {
 
     assert_eq!(repaired.digest, original.digest);
     assert_eq!(fs::read(&canonical).unwrap(), b"repairable");
+    assert!(!canonical.with_extension("old").exists());
     store.verify(&repaired.digest).unwrap();
     let quarantined: Vec<_> = fs::read_dir(paths.data_root.join("artifacts/quarantine"))
         .unwrap()
