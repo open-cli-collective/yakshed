@@ -13,12 +13,15 @@ fn version_is_the_only_implemented_invocation() {
         format!("yakshed-contract-host {}\n", env!("CARGO_PKG_VERSION"))
     );
 
-    let stub = Command::new(binary)
-        .output()
-        .expect("contract host should run");
-    assert!(!stub.status.success());
-    assert_eq!(
-        String::from_utf8(stub.stderr).unwrap(),
-        "contract host not yet implemented\n"
-    );
+    for args in [&[][..], &["--version", "extra"][..], &["--frobnicate"][..]] {
+        let stub = Command::new(binary)
+            .args(args)
+            .output()
+            .expect("contract host should run");
+        assert!(!stub.status.success(), "{args:?} unexpectedly succeeded");
+        assert_eq!(
+            String::from_utf8(stub.stderr).unwrap(),
+            "contract host not yet implemented\n"
+        );
+    }
 }
