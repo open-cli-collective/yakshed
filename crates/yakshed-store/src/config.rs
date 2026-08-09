@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yakshed_application::{AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, UiConfig};
 use yakshed_domain::{
-    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, SecretBackend,
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
+    ProviderStateRootId, SecretBackend,
 };
 
 use crate::{AppPaths, PathError};
@@ -38,7 +39,7 @@ struct ConnectionDto {
     name: String,
     harness: String,
     model_provider: String,
-    provider_state: String,
+    provider_state: ProviderStateRootId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     credentials: Vec<CredentialBindingDto>,
 }
@@ -47,16 +48,16 @@ struct ConnectionDto {
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 enum CredentialBindingDto {
     Delegated {
-        slot: String,
+        slot: CredentialSlot,
         authority: String,
     },
     Secret {
-        slot: String,
+        slot: CredentialSlot,
         backend: String,
         locator: String,
     },
     Disabled {
-        slot: String,
+        slot: CredentialSlot,
     },
 }
 
@@ -602,7 +603,7 @@ mod tests {
     #[test]
     fn credential_dto_has_only_closed_reference_shapes() {
         let delegated = CredentialBindingDto::Delegated {
-            slot: "codex.account".to_owned(),
+            slot: CredentialSlot::new("codex.account").unwrap(),
             authority: "codex-app-server".to_owned(),
         };
         let CredentialBindingDto::Delegated {
@@ -614,7 +615,7 @@ mod tests {
         };
 
         let secret = CredentialBindingDto::Secret {
-            slot: "anthropic.api_key".to_owned(),
+            slot: CredentialSlot::new("anthropic.api_key").unwrap(),
             backend: "memory".to_owned(),
             locator: "connection/work/anthropic_api_key".to_owned(),
         };
@@ -628,7 +629,7 @@ mod tests {
         };
 
         let disabled = CredentialBindingDto::Disabled {
-            slot: "unused".to_owned(),
+            slot: CredentialSlot::new("unused").unwrap(),
         };
         let CredentialBindingDto::Disabled { slot: _ } = disabled else {
             panic!("disabled binding expected")

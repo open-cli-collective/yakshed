@@ -32,6 +32,7 @@ impl AppConfig {
         }
 
         let mut connection_ids = HashSet::new();
+        let mut provider_state_roots = HashSet::new();
         for connection in &self.connections {
             connection
                 .validate()
@@ -40,6 +41,12 @@ impl AppConfig {
                 return Err(ConfigValidationError(format!(
                     "duplicate connection id: {}",
                     connection.id
+                )));
+            }
+            if !provider_state_roots.insert(&connection.provider_state) {
+                return Err(ConfigValidationError(format!(
+                    "duplicate provider state root: {}",
+                    connection.provider_state
                 )));
             }
             for credential in &connection.credentials {
@@ -115,3 +122,33 @@ impl fmt::Display for ConfigValidationError {
 }
 
 impl Error for ConfigValidationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yakshed_domain::ProviderStateRootId;
+
+    fn connection(id: &str) -> Connection {
+        Connection {
+            id: id.parse().unwrap(),
+            name: id.to_owned(),
+            harness: "codex".to_owned(),
+            model_provider: "openai".to_owned(),
+            provider_state: ProviderStateRootId::new("shared-codex").unwrap(),
+            credentials: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_rejects_connections_sharing_a_provider_state_root() {
+        let config = AppConfig {
+            connections: vec![
+                connection("0193f26e-7a72-7d42-bf77-0de14c4cc111"),
+                connection("0193f26e-7a72-7d42-bf77-0de14c4cc222"),
+            ],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+}

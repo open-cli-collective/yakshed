@@ -3,7 +3,8 @@ use std::fs;
 use tempfile::tempdir;
 use yakshed_application::{AppConfig, ConfigChange, ConfigRevision};
 use yakshed_domain::{
-    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, SecretBackend,
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
+    ProviderStateRootId, SecretBackend,
 };
 use yakshed_store::{AppPaths, ConfigError, ConfigStore};
 
@@ -15,9 +16,9 @@ fn connection() -> Connection {
         name: "Work".into(),
         harness: "mock".into(),
         model_provider: "anthropic".into(),
-        provider_state: "work-test".into(),
+        provider_state: ProviderStateRootId::new("work-test").unwrap(),
         credentials: vec![CredentialBindingRecord {
-            slot: "anthropic.api_key".into(),
+            slot: CredentialSlot::new("anthropic.api_key").unwrap(),
             binding: CredentialBinding::Secret {
                 backend: "memory".into(),
                 locator: "connection/work/anthropic_api_key".into(),
