@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -20,6 +20,8 @@ use crate::AppPaths;
 
 static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
 static NEXT_QUARANTINE_FILE: AtomicU64 = AtomicU64::new(0);
+static ARTIFACT_LOCK_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<KeyedArtifactLocks>>>> =
+    OnceLock::new();
 
 #[derive(Default)]
 struct KeyedArtifactLocks {
@@ -37,6 +39,18 @@ impl KeyedArtifactLocks {
         locks.insert(digest.clone(), Arc::downgrade(&lock));
         lock
     }
+}
+
+fn shared_artifact_locks(root: &Path) -> Arc<KeyedArtifactLocks> {
+    let registry = ARTIFACT_LOCK_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap();
+    registry.retain(|_, locks| locks.strong_count() > 0);
+    if let Some(locks) = registry.get(root).and_then(Weak::upgrade) {
+        return locks;
+    }
+    let locks = Arc::new(KeyedArtifactLocks::default());
+    registry.insert(root.to_owned(), Arc::downgrade(&locks));
+    locks
 }
 
 /// Caller-owned metadata needed to publish one artifact body.
@@ -64,16 +78,20 @@ impl Clock for SystemClock {
 }
 
 /// Content-addressed immutable artifact blob storage.
+///
+/// Stores over the same canonical root share process-global digest locks. Cross-process
+/// exclusion is intentionally owned by YakShed's single-instance application guarantee.
 pub struct ArtifactStore<C = SystemClock> {
     sha256_root: PathBuf,
     staging_root: PathBuf,
     quarantine_root: PathBuf,
     max_size: u64,
     clock: C,
-    locks: KeyedArtifactLocks,
+    locks: Arc<KeyedArtifactLocks>,
 }
 
 impl ArtifactStore {
+    /// Opens a store beneath an `AppPaths` data root that the application already created.
     pub fn new(paths: &AppPaths, max_size: u64) -> Result<Self, ArtifactError> {
         Self::with_clock(paths, max_size, SystemClock)
     }
@@ -84,23 +102,29 @@ impl<C: Clock> ArtifactStore<C> {
         let artifacts_root = paths.data_root.join("artifacts");
         let sha256_root = artifacts_root.join("sha256");
         let staging_root = artifacts_root.join("staging");
+        // Quarantine is disposable diagnostic debris, never metadata-owned durable state.
         let quarantine_root = artifacts_root.join("quarantine");
+        if !fs::metadata(&paths.data_root)?.is_dir() {
+            return Err(ArtifactError::InvalidInput(
+                "artifact data root must be an existing directory",
+            ));
+        }
         for directory in [
-            &paths.data_root,
             &artifacts_root,
             &sha256_root,
             &staging_root,
             &quarantine_root,
         ] {
-            create_private_directory(directory)?;
+            create_directory_durable(directory, sync_directory)?;
         }
+        let canonical_root = fs::canonicalize(&artifacts_root)?;
         Ok(Self {
             sha256_root,
             staging_root,
             quarantine_root,
             max_size,
             clock,
-            locks: KeyedArtifactLocks::default(),
+            locks: shared_artifact_locks(&canonical_root),
         })
     }
 
@@ -152,7 +176,7 @@ impl<C: Clock> ArtifactStore<C> {
         let shard = destination.parent().expect("digest path has a parent");
         let digest_lock = self.locks.get(&digest);
         let _guard = digest_lock.lock().unwrap();
-        create_private_directory(shard)?;
+        create_directory_durable(shard, sync_directory)?;
 
         if destination.try_exists()? {
             match self.verify_file(&digest) {
@@ -235,7 +259,9 @@ impl<C: Clock> ArtifactStore<C> {
         Ok(())
     }
 
-    /// Removes old unreferenced blobs while honoring publish's mtime lease.
+    /// Removes old unreferenced blobs and disposable staging/quarantine debris.
+    ///
+    /// Quarantine entries are never referenced and are retained by age alone.
     ///
     /// `grace` is also the metadata-commit lease: callers must commit a record within this
     /// duration after `publish` returns. Age is re-read under the digest lock immediately
@@ -246,7 +272,8 @@ impl<C: Clock> ArtifactStore<C> {
         grace: Duration,
     ) -> Result<usize, ArtifactError> {
         let now = self.clock.now();
-        let mut removed = collect_old_staging(&self.staging_root, now, grace)?;
+        let mut removed = collect_old_debris(&self.staging_root, now, grace)?;
+        removed += collect_old_debris(&self.quarantine_root, now, grace)?;
 
         for shard in fs::read_dir(&self.sha256_root)? {
             let shard = shard?;
@@ -345,8 +372,9 @@ impl<C: Clock> ArtifactStore<C> {
             if quarantine.try_exists()? {
                 continue;
             }
-            match fs::rename(canonical, quarantine) {
+            match fs::rename(canonical, &quarantine) {
                 Ok(()) => {
+                    self.refresh_lease(&quarantine)?;
                     sync_directory(&self.quarantine_root)?;
                     sync_directory(canonical.parent().expect("digest path has a parent"))?;
                     return Ok(());
@@ -369,7 +397,7 @@ impl Read for BoundedArtifactReader {
     }
 }
 
-fn collect_old_staging(
+fn collect_old_debris(
     root: &Path,
     now: SystemTime,
     grace: Duration,
@@ -419,9 +447,17 @@ fn digest_from_hasher(hasher: Sha256) -> ContentDigest {
         .expect("SHA-256 always formats as 64 lowercase hexadecimal characters")
 }
 
-fn create_private_directory(path: &Path) -> Result<(), ArtifactError> {
-    fs::create_dir_all(path)?;
-    set_private_directory_permissions(path)
+fn create_directory_durable(
+    path: &Path,
+    mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+        Err(error) => return Err(ArtifactError::Io(error)),
+    }
+    set_private_directory_permissions(path)?;
+    sync(path.parent().expect("managed directory has a parent"))
 }
 
 #[cfg(unix)]
@@ -502,5 +538,64 @@ mod tests {
         .unwrap();
 
         assert_eq!(*synced.borrow(), [shard, sha256_root]);
+    }
+
+    #[test]
+    fn cold_start_syncs_each_new_directory_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("data");
+        let artifacts_root = data_root.join("artifacts");
+        let sha256_root = artifacts_root.join("sha256");
+        let staging_root = artifacts_root.join("staging");
+        let quarantine_root = artifacts_root.join("quarantine");
+        let shard = sha256_root.join("ab");
+        fs::create_dir(&data_root).unwrap();
+        let synced = RefCell::new(Vec::new());
+        let mut record_sync = |directory: &Path| {
+            synced.borrow_mut().push(directory.to_owned());
+            Ok(())
+        };
+
+        for directory in [
+            &artifacts_root,
+            &sha256_root,
+            &staging_root,
+            &quarantine_root,
+            &shard,
+        ] {
+            create_directory_durable(directory, &mut record_sync).unwrap();
+        }
+        let staging = staging_root.join("cold-start.tmp");
+        let destination = shard.join("abcdef");
+        fs::write(&staging, b"blob").unwrap();
+        promote_staging(&staging, &destination, &sha256_root, &mut record_sync).unwrap();
+
+        assert_eq!(
+            *synced.borrow(),
+            [
+                data_root,
+                artifacts_root.clone(),
+                artifacts_root.clone(),
+                artifacts_root,
+                sha256_root.clone(),
+                shard,
+                sha256_root,
+            ]
+        );
+    }
+
+    #[test]
+    fn stores_for_one_canonical_root_share_digest_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+
+        let first = shared_artifact_locks(&root);
+        let second = shared_artifact_locks(&root);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none());
     }
 }

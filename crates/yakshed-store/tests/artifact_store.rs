@@ -25,6 +25,7 @@ impl Clock for TestClock {
 fn fixture(max_size: u64) -> (TempDir, AppPaths, ArtifactStore) {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
+    paths.create_data_root().unwrap();
     let store = ArtifactStore::new(&paths, max_size).unwrap();
     (temp, paths, store)
 }
@@ -187,11 +188,13 @@ fn republishing_over_corrupt_blob_quarantines_and_repairs() {
 }
 
 #[test]
-fn concurrent_republish_of_old_orphan_survives_collection() {
+fn concurrent_republish_across_store_handles_survives_collection() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    let store = Arc::new(ArtifactStore::new(&paths, 1024).unwrap());
-    let record = store
+    paths.create_data_root().unwrap();
+    let publisher_store = Arc::new(ArtifactStore::new(&paths, 1024).unwrap());
+    let collector_store = Arc::new(ArtifactStore::new(&paths, 1024).unwrap());
+    let record = publisher_store
         .publish(
             &b"raced"[..],
             metadata("0193f26e-7a72-7d42-bf77-0de14c4cc237"),
@@ -208,7 +211,7 @@ fn concurrent_republish_of_old_orphan_survives_collection() {
             .set_times(FileTimes::new().set_modified(old))
             .unwrap();
         let barrier = Arc::new(Barrier::new(2));
-        let publisher = Arc::clone(&store);
+        let publisher = Arc::clone(&publisher_store);
         let publish_barrier = Arc::clone(&barrier);
         let publish = thread::spawn(move || {
             publish_barrier.wait();
@@ -217,7 +220,7 @@ fn concurrent_republish_of_old_orphan_survives_collection() {
                 metadata("0193f26e-7a72-7d42-bf77-0de14c4cc238"),
             )
         });
-        let collector = Arc::clone(&store);
+        let collector = Arc::clone(&collector_store);
         let collect = thread::spawn(move || {
             barrier.wait();
             collector.collect_unreferenced(&BTreeSet::new(), Duration::from_secs(3600))
@@ -226,8 +229,33 @@ fn concurrent_republish_of_old_orphan_survives_collection() {
         publish.join().unwrap().unwrap();
         collect.join().unwrap().unwrap();
         assert!(path.exists());
-        store.verify(&record.digest).unwrap();
+        publisher_store.verify(&record.digest).unwrap();
     }
+}
+
+#[test]
+fn quarantine_collection_respects_grace_period() {
+    let (_temp, paths, store) = fixture(1024);
+    let quarantine = paths.data_root.join("artifacts/quarantine");
+    let old = quarantine.join("old-corrupt-blob");
+    let young = quarantine.join("young-corrupt-blob");
+    fs::write(&old, b"old sensitive debris").unwrap();
+    fs::write(&young, b"young sensitive debris").unwrap();
+    File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(7200)))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .collect_unreferenced(&BTreeSet::new(), Duration::from_secs(3600))
+            .unwrap(),
+        1
+    );
+    assert!(!old.exists());
+    assert!(young.exists());
 }
 
 #[test]
@@ -266,6 +294,7 @@ impl Read for FailingReader {
 fn interrupted_publish_leaves_only_collectable_staging() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
+    paths.create_data_root().unwrap();
     let store = ArtifactStore::with_clock(&paths, 1024, TestClock(SystemTime::now())).unwrap();
 
     assert!(matches!(
@@ -303,6 +332,7 @@ fn interrupted_publish_leaves_only_collectable_staging() {
 fn garbage_collection_respects_references_and_grace_period() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
+    paths.create_data_root().unwrap();
     let now = SystemTime::now();
     let store = ArtifactStore::with_clock(&paths, 1024, TestClock(now)).unwrap();
     let old = store
