@@ -206,7 +206,13 @@ impl<C: Clock> ArtifactStore<C> {
             match self.verify_file(&digest) {
                 Ok(()) => fs::remove_file(&staging_path)?,
                 Err(ArtifactError::DigestMismatch { .. }) => {
-                    self.replace_corrupt_blob(&digest, &staging_path, &destination, |_| {})?;
+                    self.replace_corrupt_blob(
+                        &digest,
+                        &staging_path,
+                        &destination,
+                        |_| {},
+                        |from, to| fs::rename(from, to),
+                    )?;
                 }
                 Err(error) => return Err(error),
             }
@@ -431,16 +437,24 @@ impl<C: Clock> ArtifactStore<C> {
         Ok(())
     }
 
+    /// Preserves the canonical path until staging atomically replaces its corrupt contents.
     fn replace_corrupt_blob(
         &self,
         digest: &ContentDigest,
         staging: &Path,
         canonical: &Path,
         after_quarantine: impl FnOnce(&Path),
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> Result<(), ArtifactError> {
         let quarantine = self.quarantine_corrupt(digest, canonical)?;
         after_quarantine(&quarantine);
-        promote_staging(staging, canonical, &self.sha256_root, sync_directory)
+        promote_staging_with(
+            staging,
+            canonical,
+            &self.sha256_root,
+            rename,
+            sync_directory,
+        )
     }
 
     fn quarantine_corrupt(
@@ -457,10 +471,9 @@ impl<C: Clock> ArtifactStore<C> {
             if quarantine.try_exists()? {
                 continue;
             }
-            match fs::rename(canonical, &quarantine) {
+            match fs::hard_link(canonical, &quarantine) {
                 Ok(()) => {
                     sync_directory(&self.quarantine_root)?;
-                    sync_directory(canonical.parent().expect("digest path has a parent"))?;
                     return Ok(quarantine);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -495,9 +508,25 @@ fn promote_staging(
     staging: &Path,
     destination: &Path,
     sha256_root: &Path,
+    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    promote_staging_with(
+        staging,
+        destination,
+        sha256_root,
+        |from, to| fs::rename(from, to),
+        sync,
+    )
+}
+
+fn promote_staging_with(
+    staging: &Path,
+    destination: &Path,
+    sha256_root: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
     mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
-    fs::rename(staging, destination)?;
+    rename(staging, destination)?;
     set_private_file_permissions(destination)?;
     sync(destination.parent().expect("digest path has a parent"))?;
     sync(sha256_root)?;
@@ -596,6 +625,17 @@ mod tests {
     use std::{sync::mpsc, thread};
 
     use super::*;
+
+    fn artifact_metadata(id: &str) -> ArtifactMetadata {
+        ArtifactMetadata {
+            id: id.parse().unwrap(),
+            work_item_id: "0193f26e-7a72-7d42-bf77-0de14c4cc243".parse().unwrap(),
+            run_id: None,
+            kind: ArtifactKind::Plan,
+            media_type: "text/plain".to_owned(),
+            provenance: ArtifactProvenance::new("test").unwrap(),
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -697,14 +737,7 @@ mod tests {
         let record = repairer
             .publish(
                 &b"repair race"[..],
-                ArtifactMetadata {
-                    id: "0193f26e-7a72-7d42-bf77-0de14c4cc240".parse().unwrap(),
-                    work_item_id: "0193f26e-7a72-7d42-bf77-0de14c4cc241".parse().unwrap(),
-                    run_id: None,
-                    kind: ArtifactKind::Plan,
-                    media_type: "text/plain".to_owned(),
-                    provenance: ArtifactProvenance::new("test").unwrap(),
-                },
+                artifact_metadata("0193f26e-7a72-7d42-bf77-0de14c4cc240"),
             )
             .unwrap();
         let canonical = repairer.path_for_digest(&record.digest);
@@ -734,15 +767,21 @@ mod tests {
         let guard = digest_lock.lock().unwrap();
 
         repairer
-            .replace_corrupt_blob(&record.digest, &staging_path, &canonical, |quarantine| {
-                visible_tx.send(()).unwrap();
-                collecting_rx.recv().unwrap();
-                assert!(
-                    done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-                    "quarantine GC did not wait for the digest lock"
-                );
-                assert!(quarantine.exists());
-            })
+            .replace_corrupt_blob(
+                &record.digest,
+                &staging_path,
+                &canonical,
+                |quarantine| {
+                    visible_tx.send(()).unwrap();
+                    collecting_rx.recv().unwrap();
+                    assert!(
+                        done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                        "quarantine GC did not wait for the digest lock"
+                    );
+                    assert!(quarantine.exists());
+                },
+                |from, to| fs::rename(from, to),
+            )
             .unwrap();
         drop(guard);
 
@@ -751,5 +790,59 @@ mod tests {
         repairer.verify(&record.digest).unwrap();
         assert_eq!(fs::read(canonical).unwrap(), b"repair race");
         assert_eq!(fs::read_dir(&repairer.quarantine_root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_repair_promotion_keeps_canonical_and_is_retriable() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_data_root().unwrap();
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        let record = store
+            .publish(
+                &b"repair after failure"[..],
+                artifact_metadata("0193f26e-7a72-7d42-bf77-0de14c4cc242"),
+            )
+            .unwrap();
+        let canonical = store.path_for_digest(&record.digest);
+        fs::write(&canonical, b"corrupt").unwrap();
+        let (mut staging, staging_path, active) = store.create_staging_file().unwrap();
+        staging.write_all(b"repair after failure").unwrap();
+        staging.sync_all().unwrap();
+        drop(staging);
+        let digest_lock = store.state.get(&record.digest);
+        let guard = digest_lock.lock().unwrap();
+
+        let error = store
+            .replace_corrupt_blob(
+                &record.digest,
+                &staging_path,
+                &canonical,
+                |_| {},
+                |_, _| Err(io::Error::other("injected promotion failure")),
+            )
+            .unwrap_err();
+        drop(guard);
+        drop(active);
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        let mut reader = store.open(&record.digest, 1024).unwrap();
+        let mut corrupt = Vec::new();
+        reader.read_to_end(&mut corrupt).unwrap();
+        assert_eq!(corrupt, b"corrupt");
+        assert!(matches!(
+            store.verify(&record.digest),
+            Err(ArtifactError::DigestMismatch { .. })
+        ));
+        assert_eq!(fs::read_dir(&store.quarantine_root).unwrap().count(), 1);
+
+        store
+            .publish(
+                &b"repair after failure"[..],
+                artifact_metadata("0193f26e-7a72-7d42-bf77-0de14c4cc244"),
+            )
+            .unwrap();
+        store.verify(&record.digest).unwrap();
+        assert_eq!(fs::read(canonical).unwrap(), b"repair after failure");
     }
 }
