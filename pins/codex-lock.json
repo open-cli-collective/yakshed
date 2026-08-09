@@ -28,9 +28,10 @@
       "sha256": "7c47d4dc9202569d85ef2cbe9203dd2e75c326f5085e3854487a740339a8bdcd"
     }
   },
-  "stable_schema_sha256": "2530e42f2b0f44bb14d2729069be94e5bd2d4a0c0e7a457323d25d41cac62faa",
-  "stable_schema_digest_method": "sha256 over the sorted list of `sha256(file)  ./relative/path` lines for every file under pins/codex-app-server-schema/, i.e. `find . -type f | sort | while read f; do shasum -a 256 \"$f\"; done | shasum -a 256`",
+  "stable_schema_sha256": "eb325d394d19f2f8d133203885b3d1c2f74dbc5a176f22078a4f99aae5926faa",
+  "stable_schema_digest_method": "scripts/verify_schema_pin.py — locale-independent: sha256 of newline-joined `<sha256(file)>  <posix relpath>` lines over pins/codex-app-server-schema/, files ordered by POSIX relative path. The script is the canonical implementation; run `python3 scripts/verify_schema_pin.py` to verify.",
   "schema_generation_command": "codex app-server generate-json-schema --out pins/codex-app-server-schema",
+  "schema_provenance": "Generated output verified byte-identical (diff -rq) between the local Homebrew codex 0.147.0 and the codex-aarch64-apple-darwin release asset for rust-v0.147.0, downloaded and digest-checked (sha256 75984b81f92a…) on 2026-08-09.",
   "adapter_revision": 1,
   "toolchain": {
     "rust": "1.96.0",

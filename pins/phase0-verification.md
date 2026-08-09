@@ -15,7 +15,7 @@
 | `externalSandbox` policy exists | **Confirmed** | `SandboxPolicy` oneOf: `dangerFullAccess`, `readOnly`, `externalSandbox`, `workspaceWrite` (v2 schema) |
 | `workspace-write` is broad-read by default with explicit restricted-read available | **Confirmed** | `WorkspaceWriteSandboxPolicy` has `writableRoots`/`networkAccess` but no read fields; restricted read is expressed via `AdditionalFileSystemPermissions.entries[]` (`FileSystemSandboxEntry { path, access: FileSystemAccessMode }`); legacy `read`/`write` arrays are marked "will be removed in favor of `entries`" |
 | `thread/shellCommand` is a user-initiated full-access command path | **Confirmed** | Method present in `ClientRequest.json` |
-| `process/spawn` is an unsandboxed host process API | **CORRECTED** | No `process/spawn` method exists in 0.147.0. The unsandboxed host-exec surface is the `command/exec` family: `command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`. `sandboxing.md` §8.4 updated in this commit |
+| `process/spawn` is an unsandboxed host process API | **CORRECTED** | No `process/spawn` method exists in 0.147.0. `thread/shellCommand` is the surface the schema explicitly documents as unsandboxed/full-access. The `command/exec` family runs "in the server sandbox" with per-request `sandboxPolicy`/`permissionProfile` (defaulting to configured policy) — sandboxed execution whose risk follows the effective policy, not host-privileged by construction. Direct host-privileged surfaces are the `fs/*` RPCs. `sandboxing.md` §8.4 updated in this commit |
 | Permission profiles exist alongside sandbox modes | **Confirmed (schema level)** | `permissionProfile/list` method; `RequestPermissionProfile` / `GrantedPermissionProfile` / `PermissionGrantScope` (`turn`\|`session`) definitions. The non-composition claim (profiles vs. legacy `sandbox_mode`) is a config-system behavior not expressible in the schema; keep version-gated per `sandboxing.md` §8.2 |
 | `shell_environment_policy` controls child-command env inheritance | **Confirmed (key exists)** | `codex exec --strict-config -c shell_environment_policy.inherit="core"` passes config validation (strict mode rejects unknown keys). Behavioral verification (exclusion actually applied to spawned commands) belongs to the phase-5 sandbox contract tests |
 | Native thread fork available | **Confirmed** | `thread/fork` method present |
@@ -28,9 +28,10 @@
 95 client-request methods. Groups relevant to YakShed v1: `account/*`,
 `thread/*` (start/resume/read/list/fork/archive/delete/rollback/inject_items/
 shellCommand), `turn/*` (start/steer/interrupt), `model/list`,
-`permissionProfile/list`, `config/*`, `command/exec*` (unsandboxed — treat as
-`HostPrivileged` per `sandboxing.md` §8.4), `fs/*` (host filesystem RPCs —
-same risk class; YakShed must not expose these), `review/start`,
+`permissionProfile/list`, `config/*`, `command/exec*` (sandboxed execution
+under the supplied or default policy; bypasses thread/turn approval semantics —
+see `sandboxing.md` §8.4), `fs/*` (direct host filesystem RPCs —
+host-privileged; YakShed must not expose these), `review/start`,
 `fuzzyFileSearch`, `windowsSandbox/*`.
 
 Methods that exist but are outside v1 scope and MUST NOT leak into the Tauri
@@ -42,8 +43,13 @@ surface: `plugin/*`, `marketplace/*`, `app/*`, `hooks/*`, `skills/*`,
 - `pins/codex-app-server-schema/` is the generated output, committed verbatim
   (285 files, including combined `codex_app_server_protocol.schemas.json` and
   `.v2.schemas.json`).
-- Aggregate digest and method recorded in `pins/codex-lock.json`
-  (`stable_schema_sha256`).
+- Provenance: the tree was verified byte-identical between the local Homebrew
+  0.147.0 binary and the `codex-aarch64-apple-darwin` asset from
+  `rust-v0.147.0`, downloaded and digest-checked against the lock record.
+- Aggregate digest recorded in `pins/codex-lock.json` (`stable_schema_sha256`);
+  `scripts/verify_schema_pin.py` is the canonical, locale-independent
+  recompute-and-compare check (wire it into CI's cheap lane when the workflow
+  lands).
 - Regenerating with a different codex version MUST update `codex-lock.json`
   and this document in the same commit.
 
