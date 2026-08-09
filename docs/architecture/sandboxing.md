@@ -410,7 +410,10 @@ Permissions
 
 ### 8.4 Some App Server process APIs are intentionally unsandboxed
 
-App Server documents `process/spawn` as an unsandboxed host process API and `thread/shellCommand` as a user-initiated full-access command path.[^codex-unsandboxed]
+App Server exposes `thread/shellCommand` as a user-initiated command path that the pinned 0.147.0 schema explicitly documents as running unsandboxed with full access.[^codex-unsandboxed] Earlier documentation described a `process/spawn` method; it does not exist in 0.147.0 (see `pins/phase0-verification.md`). Two adjacent surfaces need their own classifications rather than inheriting that one:
+
+- The `command/exec` family (`command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`) runs standalone commands **in the server sandbox**, accepting a per-request `sandboxPolicy` or `permissionProfile` and defaulting to the configured policy. It is sandboxed execution whose effective risk follows the supplied or default policy — which still means a permissive default policy makes it dangerous, and it bypasses thread/turn approval semantics.
+- The `fs/*` RPCs (`fs/readFile`, `fs/writeFile`, `fs/remove`, and related) are direct host filesystem operations and are classified host-privileged.
 
 Treat RPCs by risk class:
 
@@ -427,7 +430,7 @@ enum ProviderRpcRisk {
 For v1:
 
 - use normal turn APIs for agent work;
-- do not expose `process/spawn` through a generic frontend command;
+- do not expose `command/exec` or `fs/*` through a generic frontend command;
 - expose `thread/shellCommand` only from a clearly user-initiated terminal or `!` workflow;
 - visually distinguish user shell commands from agent commands;
 - never let model-generated content invoke an unsandboxed path indirectly.
