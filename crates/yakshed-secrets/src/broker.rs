@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     future::Future,
     sync::{
@@ -11,13 +11,13 @@ use std::{
 
 use secrecy::SecretString;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
-use yakshed_domain::{ConnectionId, CredentialSlot};
+use yakshed_domain::{Connection, CredentialBinding, CredentialBindingRecord};
 
 use crate::{
-    CredentialBinding, CredentialBindingRecord, CredentialDelivery, DelegatedAuthority,
     DeleteSecretOutcome, InvalidBindingReason, PutSecretOptions, PutSecretOutcome, ResolvedSecret,
     SecretAccessContext, SecretAuditEvent, SecretAuditOutcome, SecretAuditSink,
-    SecretBackendHandle, SecretBackendId, SecretError, SecretOperation, SecretReference,
+    SecretBackendHandle, SecretBackendId, SecretError, SecretLocator, SecretOperation,
+    SecretReference,
 };
 
 #[derive(Clone, Default)]
@@ -57,13 +57,13 @@ impl BrokerCancellation {
 pub enum CredentialStatus {
     Present,
     Missing,
-    Delegated(DelegatedAuthority),
+    Delegated(String),
     Disabled,
 }
 
 pub enum CredentialResolution {
     Secret(ResolvedSecret),
-    Delegated(DelegatedAuthority),
+    Delegated(String),
 }
 
 #[derive(Default)]
@@ -86,7 +86,6 @@ impl KeyedSecretLocks {
 
 pub struct CredentialBroker {
     backends: HashMap<SecretBackendId, SecretBackendHandle>,
-    bindings: HashMap<(ConnectionId, CredentialSlot), CredentialBindingRecord>,
     locks: KeyedSecretLocks,
     audit: Arc<dyn SecretAuditSink>,
     timeout: Duration,
@@ -94,49 +93,90 @@ pub struct CredentialBroker {
 
 impl CredentialBroker {
     pub fn new(
-        backends: HashMap<SecretBackendId, SecretBackendHandle>,
-        bindings: impl IntoIterator<Item = CredentialBindingRecord>,
+        backends: impl IntoIterator<Item = (SecretBackendId, SecretBackendHandle)>,
+        connections: &[Connection],
         audit: Arc<dyn SecretAuditSink>,
         timeout: Duration,
     ) -> Result<Self, SecretError> {
-        let mut indexed = HashMap::new();
-        for binding in bindings {
-            let key = (binding.connection_id.clone(), binding.slot.clone());
-            if indexed.insert(key, binding).is_some() {
+        Self::validate_bindings(connections)?;
+        let mut registry = HashMap::new();
+        for (registered_id, handle) in backends {
+            let descriptor_id = handle.resolver.descriptor().id;
+            if registered_id != descriptor_id {
                 return Err(SecretError::BackendFailure {
-                    backend: SecretBackendId::new("broker").unwrap(),
-                    redacted_message: "duplicate connection credential slot".into(),
+                    backend: registered_id,
+                    redacted_message: "backend registry key does not match descriptor".into(),
+                });
+            }
+            if registry.insert(descriptor_id.clone(), handle).is_some() {
+                return Err(SecretError::BackendFailure {
+                    backend: descriptor_id,
+                    redacted_message: "duplicate backend ID".into(),
                 });
             }
         }
         Ok(Self {
-            backends,
-            bindings: indexed,
+            backends: registry,
             locks: KeyedSecretLocks::default(),
             audit,
             timeout,
         })
     }
 
-    fn binding(
-        &self,
-        context: &SecretAccessContext,
-    ) -> Result<&CredentialBindingRecord, SecretError> {
-        if !self
-            .bindings
-            .keys()
-            .any(|(connection, _)| connection == &context.connection_id)
-        {
-            return Err(self.invalid(context, InvalidBindingReason::UnknownConnection));
+    pub fn validate_bindings(connections: &[Connection]) -> Result<(), SecretError> {
+        let mut references = HashSet::new();
+        for connection in connections {
+            connection
+                .validate()
+                .map_err(|_| SecretError::BackendFailure {
+                    backend: broker_id(),
+                    redacted_message: "invalid connection credential configuration".into(),
+                })?;
+            for binding in &connection.credentials {
+                if let Some(reference) = secret_reference(&binding.binding)?
+                    && !references.insert(reference)
+                {
+                    return Err(SecretError::BackendFailure {
+                        backend: broker_id(),
+                        redacted_message: "duplicate secret reference".into(),
+                    });
+                }
+            }
         }
-        self.bindings
-            .get(&(context.connection_id.clone(), context.slot.clone()))
-            .ok_or_else(|| self.invalid(context, InvalidBindingReason::UnknownSlot))
+        Ok(())
+    }
+
+    fn current_binding<'a>(
+        &self,
+        connections: &'a [Connection],
+        supplied: &'a CredentialBindingRecord,
+        context: &SecretAccessContext,
+        operation: SecretOperation,
+    ) -> Result<&'a CredentialBinding, SecretError> {
+        let result = (|| {
+            Self::validate_bindings(connections)?;
+            let connection = connections
+                .iter()
+                .find(|connection| connection.id == context.connection_id)
+                .ok_or_else(|| self.invalid(context, InvalidBindingReason::UnknownConnection))?;
+            let current = connection
+                .credentials
+                .iter()
+                .find(|binding| binding.slot == context.slot)
+                .ok_or_else(|| self.invalid(context, InvalidBindingReason::UnknownSlot))?;
+            if current != supplied {
+                return Err(self.invalid(context, InvalidBindingReason::StaleBinding));
+            }
+            Ok(&current.binding)
+        })();
+        result.inspect_err(|_| {
+            self.audit(context, None, operation, SecretAuditOutcome::Rejected);
+        })
     }
 
     fn invalid(&self, context: &SecretAccessContext, reason: InvalidBindingReason) -> SecretError {
         SecretError::InvalidBinding {
-            connection_id: context.connection_id.clone(),
+            connection_id: context.connection_id,
             slot: context.slot.clone(),
             reason,
         }
@@ -151,20 +191,10 @@ impl CredentialBroker {
             })
     }
 
-    fn audited_binding(
-        &self,
-        context: &SecretAccessContext,
-        operation: SecretOperation,
-    ) -> Result<&CredentialBindingRecord, SecretError> {
-        self.binding(context).inspect_err(|_| {
-            self.audit(context, None, operation, SecretAuditOutcome::Rejected);
-        })
-    }
-
     fn audited_backend(
         &self,
-        context: &SecretAccessContext,
         reference: &SecretReference,
+        context: &SecretAccessContext,
         operation: SecretOperation,
     ) -> Result<&SecretBackendHandle, SecretError> {
         self.backend(reference).inspect_err(|_| {
@@ -185,7 +215,7 @@ impl CredentialBroker {
         outcome: SecretAuditOutcome,
     ) {
         self.audit.record(SecretAuditEvent {
-            connection_id: context.connection_id.clone(),
+            connection_id: context.connection_id,
             slot: context.slot.clone(),
             purpose: context.purpose,
             request_id: context.request_id.clone(),
@@ -195,21 +225,34 @@ impl CredentialBroker {
         });
     }
 
-    async fn run<T>(
+    async fn run<T, F>(
         &self,
         context: &SecretAccessContext,
         reference: &SecretReference,
         operation: SecretOperation,
         cancellation: &BrokerCancellation,
-        action: impl Future<Output = Result<T, SecretError>>,
-    ) -> Result<T, SecretError> {
+        action: impl FnOnce() -> F,
+    ) -> Result<T, SecretError>
+    where
+        F: Future<Output = Result<T, SecretError>>,
+    {
         let backend = reference.backend_id.clone();
+        if cancellation.is_cancelled() {
+            self.audit(
+                context,
+                Some(backend.clone()),
+                operation,
+                SecretAuditOutcome::Cancelled,
+            );
+            return Err(SecretError::Cancelled { backend });
+        }
         let lock = self.locks.get(reference);
         let work = async {
             let _guard = lock.lock().await;
-            action.await
+            action().await
         };
         let result = tokio::select! {
+            biased;
             _ = cancellation.cancelled() => Err(SecretError::Cancelled { backend: backend.clone() }),
             result = tokio::time::timeout(self.timeout, work) => result.unwrap_or_else(|_| Err(SecretError::TimedOut { backend: backend.clone() })),
         };
@@ -226,11 +269,12 @@ impl CredentialBroker {
 
     pub async fn status(
         &self,
+        connections: &[Connection],
+        binding: &CredentialBindingRecord,
         context: &SecretAccessContext,
         cancellation: &BrokerCancellation,
     ) -> Result<CredentialStatus, SecretError> {
-        let binding = self.audited_binding(context, SecretOperation::Probe)?;
-        match &binding.binding {
+        match self.current_binding(connections, binding, context, SecretOperation::Probe)? {
             CredentialBinding::Delegated { authority } => {
                 self.audit(
                     context,
@@ -249,15 +293,17 @@ impl CredentialBroker {
                 );
                 Ok(CredentialStatus::Disabled)
             }
-            CredentialBinding::Secret { reference } => {
-                let backend = self.audited_backend(context, reference, SecretOperation::Resolve)?;
+            binding => {
+                let reference = required_reference(binding)?;
+                let backend =
+                    self.audited_backend(&reference, context, SecretOperation::Resolve)?;
                 match self
                     .run(
                         context,
-                        reference,
+                        &reference,
                         SecretOperation::Resolve,
                         cancellation,
-                        backend.resolver.resolve(&reference.locator, context),
+                        || backend.resolver.resolve(&reference.locator, context),
                     )
                     .await
                 {
@@ -274,11 +320,12 @@ impl CredentialBroker {
 
     pub async fn resolve(
         &self,
+        connections: &[Connection],
+        binding: &CredentialBindingRecord,
         context: &SecretAccessContext,
         cancellation: &BrokerCancellation,
     ) -> Result<CredentialResolution, SecretError> {
-        let binding = self.audited_binding(context, SecretOperation::Resolve)?;
-        match &binding.binding {
+        match self.current_binding(connections, binding, context, SecretOperation::Resolve)? {
             CredentialBinding::Delegated { authority } => {
                 self.audit(
                     context,
@@ -297,14 +344,16 @@ impl CredentialBroker {
                 );
                 Err(self.invalid(context, InvalidBindingReason::Disabled))
             }
-            CredentialBinding::Secret { reference } => {
-                let backend = self.audited_backend(context, reference, SecretOperation::Resolve)?;
+            binding => {
+                let reference = required_reference(binding)?;
+                let backend =
+                    self.audited_backend(&reference, context, SecretOperation::Resolve)?;
                 self.run(
                     context,
-                    reference,
+                    &reference,
                     SecretOperation::Resolve,
                     cancellation,
-                    backend.resolver.resolve(&reference.locator, context),
+                    || backend.resolver.resolve(&reference.locator, context),
                 )
                 .await
                 .map(CredentialResolution::Secret)
@@ -314,13 +363,15 @@ impl CredentialBroker {
 
     pub async fn put(
         &self,
+        connections: &[Connection],
+        binding: &CredentialBindingRecord,
         context: &SecretAccessContext,
         value: &SecretString,
         options: PutSecretOptions,
         cancellation: &BrokerCancellation,
     ) -> Result<PutSecretOutcome, SecretError> {
-        let binding = self.audited_binding(context, SecretOperation::Put)?;
-        let CredentialBinding::Secret { reference } = &binding.binding else {
+        let current = self.current_binding(connections, binding, context, SecretOperation::Put)?;
+        if !matches!(current, CredentialBinding::Secret { .. }) {
             self.audit(
                 context,
                 None,
@@ -329,43 +380,43 @@ impl CredentialBroker {
             );
             return Err(self.invalid(
                 context,
-                if matches!(binding.binding, CredentialBinding::Disabled) {
+                if matches!(current, CredentialBinding::Disabled) {
                     InvalidBindingReason::Disabled
                 } else {
                     InvalidBindingReason::NotSecretBacked
                 },
             ));
-        };
-        let backend = self.audited_backend(context, reference, SecretOperation::Put)?;
-        let administrator = backend.administrator.as_ref().ok_or_else(|| {
-            self.audit(
-                context,
-                Some(reference.backend_id.clone()),
-                SecretOperation::Put,
-                SecretAuditOutcome::Failed,
-            );
-            SecretError::UnsupportedOperation {
-                backend: reference.backend_id.clone(),
-                operation: SecretOperation::Put,
-            }
-        })?;
+        }
+        let reference = required_reference(current)?;
+        let backend = self.audited_backend(&reference, context, SecretOperation::Put)?;
+        let administrator =
+            backend
+                .administrator
+                .as_ref()
+                .ok_or_else(|| SecretError::UnsupportedOperation {
+                    backend: reference.backend_id.clone(),
+                    operation: SecretOperation::Put,
+                })?;
         self.run(
             context,
-            reference,
+            &reference,
             SecretOperation::Put,
             cancellation,
-            administrator.put(&reference.locator, value, options),
+            || administrator.put(&reference.locator, value, options),
         )
         .await
     }
 
     pub async fn delete(
         &self,
+        connections: &[Connection],
+        binding: &CredentialBindingRecord,
         context: &SecretAccessContext,
         cancellation: &BrokerCancellation,
     ) -> Result<DeleteSecretOutcome, SecretError> {
-        let binding = self.audited_binding(context, SecretOperation::Delete)?;
-        let CredentialBinding::Secret { reference } = &binding.binding else {
+        let current =
+            self.current_binding(connections, binding, context, SecretOperation::Delete)?;
+        if !matches!(current, CredentialBinding::Secret { .. }) {
             self.audit(
                 context,
                 None,
@@ -374,42 +425,62 @@ impl CredentialBroker {
             );
             return Err(self.invalid(
                 context,
-                if matches!(binding.binding, CredentialBinding::Disabled) {
+                if matches!(current, CredentialBinding::Disabled) {
                     InvalidBindingReason::Disabled
                 } else {
                     InvalidBindingReason::NotSecretBacked
                 },
             ));
-        };
-        let backend = self.audited_backend(context, reference, SecretOperation::Delete)?;
-        let administrator = backend.administrator.as_ref().ok_or_else(|| {
-            self.audit(
-                context,
-                Some(reference.backend_id.clone()),
-                SecretOperation::Delete,
-                SecretAuditOutcome::Failed,
-            );
-            SecretError::UnsupportedOperation {
-                backend: reference.backend_id.clone(),
-                operation: SecretOperation::Delete,
-            }
-        })?;
+        }
+        let reference = required_reference(current)?;
+        let backend = self.audited_backend(&reference, context, SecretOperation::Delete)?;
+        let administrator =
+            backend
+                .administrator
+                .as_ref()
+                .ok_or_else(|| SecretError::UnsupportedOperation {
+                    backend: reference.backend_id.clone(),
+                    operation: SecretOperation::Delete,
+                })?;
         self.run(
             context,
-            reference,
+            &reference,
             SecretOperation::Delete,
             cancellation,
-            administrator.delete(&reference.locator),
+            || administrator.delete(&reference.locator),
         )
         .await
     }
+}
 
-    pub fn delivery(
-        &self,
-        context: &SecretAccessContext,
-    ) -> Result<&CredentialDelivery, SecretError> {
-        Ok(&self.binding(context)?.delivery)
-    }
+fn broker_id() -> SecretBackendId {
+    SecretBackendId::new("broker").unwrap()
+}
+
+fn secret_reference(binding: &CredentialBinding) -> Result<Option<SecretReference>, SecretError> {
+    let CredentialBinding::Secret { backend, locator } = binding else {
+        return Ok(None);
+    };
+    let backend_id =
+        SecretBackendId::new(backend.clone()).map_err(|_| SecretError::ProtocolViolation {
+            backend: broker_id(),
+            reason: "invalid secret backend ID".into(),
+        })?;
+    let locator = SecretLocator::new(locator.clone()).map_err(|_| SecretError::InvalidLocator {
+        backend: backend_id.clone(),
+        reason: "invalid secret locator".into(),
+    })?;
+    Ok(Some(SecretReference {
+        backend_id,
+        locator,
+    }))
+}
+
+fn required_reference(binding: &CredentialBinding) -> Result<SecretReference, SecretError> {
+    secret_reference(binding)?.ok_or_else(|| SecretError::BackendFailure {
+        backend: broker_id(),
+        redacted_message: "credential is not secret-backed".into(),
+    })
 }
 
 pub struct ChildProcessEnvironment {
@@ -423,7 +494,7 @@ impl ChildProcessEnvironment {
 }
 
 pub fn shape_process_environment(
-    base: &HashMap<OsString, OsString>,
+    ambient: &HashMap<OsString, OsString>,
     variable: &str,
     secret: &ResolvedSecret,
 ) -> Result<ChildProcessEnvironment, &'static str> {
@@ -434,11 +505,20 @@ pub fn shape_process_environment(
     {
         return Err("invalid environment variable name");
     }
-    let mut environment = base.clone();
+    let mut variables = ambient
+        .iter()
+        .filter(|(name, _)| name.to_str().is_some_and(is_runtime_environment_variable))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
     secret.expose(|value| {
-        environment.insert(OsString::from(variable), OsString::from(value));
+        variables.insert(OsString::from(variable), OsString::from(value));
     });
-    Ok(ChildProcessEnvironment {
-        variables: environment,
-    })
+    Ok(ChildProcessEnvironment { variables })
+}
+
+fn is_runtime_environment_variable(name: &str) -> bool {
+    matches!(
+        name,
+        "PATH" | "HOME" | "LANG" | "LANGUAGE" | "TMPDIR" | "TMP" | "TEMP"
+    ) || name.starts_with("LC_")
 }

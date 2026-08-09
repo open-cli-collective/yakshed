@@ -8,7 +8,9 @@ use std::{error::Error, fmt, sync::Arc};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use time::OffsetDateTime;
-use yakshed_domain::{ConnectionId, CredentialSlot, OperationId};
+pub use yakshed_domain::{
+    ConnectionId, CredentialSlot, OperationId, SecretBackendId, SecretLocator, SecretReference,
+};
 
 pub use broker::{
     BrokerCancellation, ChildProcessEnvironment, CredentialBroker, CredentialResolution,
@@ -16,84 +18,19 @@ pub use broker::{
 };
 pub use memory::{MemorySecretBackend, MemorySecretFault};
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SecretBackendId(String);
-
-impl SecretBackendId {
-    pub fn new(value: impl Into<String>) -> Result<Self, SecretError> {
-        let value = value.into();
-        if value.is_empty()
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            return Err(SecretError::ProtocolViolation {
-                backend: Self("invalid".into()),
-                reason: "backend IDs use letters, digits, '.', '-', and '_'".into(),
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for SecretBackendId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SecretLocator(String);
-
-impl SecretLocator {
-    pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err("locator must not be empty");
-        }
-        if value.len() > 4096 {
-            return Err("locator exceeds 4096 bytes");
-        }
-        if value.chars().any(char::is_control) {
-            return Err("locator must not contain control characters");
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for SecretLocator {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct SecretReference {
-    pub backend_id: SecretBackendId,
-    pub locator: SecretLocator,
-}
-
-impl SecretReference {
-    pub fn summary(&self) -> SecretReferenceSummary {
-        SecretReferenceSummary {
-            backend: self.backend_id.clone(),
-            locator: self.locator.clone(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretReferenceSummary {
     pub backend: SecretBackendId,
     pub locator: SecretLocator,
+}
+
+impl From<&SecretReference> for SecretReferenceSummary {
+    fn from(reference: &SecretReference) -> Self {
+        Self {
+            backend: reference.backend_id.clone(),
+            locator: reference.locator.clone(),
+        }
+    }
 }
 
 impl fmt::Display for SecretReferenceSummary {
@@ -239,32 +176,6 @@ pub enum SecretAccessPurpose {
     ValidateCredential,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CredentialBinding {
-    Delegated { authority: DelegatedAuthority },
-    Secret { reference: SecretReference },
-    Disabled,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DelegatedAuthority(pub String);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CredentialBindingRecord {
-    pub connection_id: ConnectionId,
-    pub slot: CredentialSlot,
-    pub binding: CredentialBinding,
-    pub delivery: CredentialDelivery,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CredentialDelivery {
-    HarnessManaged,
-    ProcessEnvironment { variable: String },
-    HttpBearer,
-    ProviderNative,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthenticationAction {
     SignIn,
@@ -284,6 +195,7 @@ pub enum SecretOperation {
 pub enum InvalidBindingReason {
     UnknownConnection,
     UnknownSlot,
+    StaleBinding,
     Disabled,
     NotSecretBacked,
 }

@@ -11,10 +11,12 @@ use std::{
 use async_trait::async_trait;
 use secrecy::SecretString;
 use tokio::sync::Semaphore;
-use yakshed_domain::{ConnectionId, CredentialSlot, OperationId};
+use yakshed_domain::{
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
+    OperationId, ProviderStateRootId,
+};
 use yakshed_secrets::{
-    BrokerCancellation, CredentialBinding, CredentialBindingRecord, CredentialBroker,
-    CredentialDelivery, CredentialResolution, CredentialStatus, DelegatedAuthority,
+    BrokerCancellation, CredentialBroker, CredentialResolution, CredentialStatus,
     DeleteSecretOutcome, InvalidBindingReason, MemorySecretBackend, MemorySecretFault,
     PutSecretOptions, PutSecretOutcome, ResolvedSecret, SecretAccessContext, SecretAccessPurpose,
     SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackendDescriptor,
@@ -22,6 +24,8 @@ use yakshed_secrets::{
     SecretOperation, SecretReference, SecretResolver, shape_process_environment,
 };
 
+const CONNECTION_A: &str = "0193f26e-7a72-7d42-bf77-0de14c4cc111";
+const CONNECTION_B: &str = "0193f26e-7a72-7d42-bf77-0de14c4cc222";
 const CANARY: &str = "yakshed-canary-a7f91b3e-secret";
 
 fn backend_id(value: &str) -> SecretBackendId {
@@ -34,31 +38,31 @@ fn locator(value: &str) -> SecretLocator {
 
 fn context(connection: &str, slot: &str, request: &str) -> SecretAccessContext {
     SecretAccessContext {
-        connection_id: ConnectionId::new(connection).unwrap(),
+        connection_id: connection.parse().unwrap(),
         slot: CredentialSlot::new(slot).unwrap(),
         purpose: SecretAccessPurpose::StartHarness,
         request_id: OperationId::new(request).unwrap(),
     }
 }
 
-fn secret_binding(
-    connection: &str,
-    slot: &str,
-    backend: &str,
-    locator: &str,
-) -> CredentialBindingRecord {
+fn secret_binding(slot: &str, backend: &str, locator: &str) -> CredentialBindingRecord {
     CredentialBindingRecord {
-        connection_id: ConnectionId::new(connection).unwrap(),
         slot: CredentialSlot::new(slot).unwrap(),
         binding: CredentialBinding::Secret {
-            reference: SecretReference {
-                backend_id: backend_id(backend),
-                locator: self::locator(locator),
-            },
+            backend: backend.into(),
+            locator: locator.into(),
         },
-        delivery: CredentialDelivery::ProcessEnvironment {
-            variable: "TEST_API_KEY".into(),
-        },
+    }
+}
+
+fn connection(id: &str, state: &str, credentials: Vec<CredentialBindingRecord>) -> Connection {
+    Connection {
+        id: id.parse().unwrap(),
+        name: state.into(),
+        harness: "mock".into(),
+        model_provider: "test".into(),
+        provider_state: ProviderStateRootId::new(state).unwrap(),
+        credentials,
     }
 }
 
@@ -80,13 +84,13 @@ impl SecretAuditSink for AuditLog {
 
 fn build_broker(
     backend: Arc<MemorySecretBackend>,
-    bindings: Vec<CredentialBindingRecord>,
+    connections: &[Connection],
     audit: Arc<dyn SecretAuditSink>,
     timeout: Duration,
 ) -> CredentialBroker {
     CredentialBroker::new(
-        HashMap::from([(backend.descriptor().id, handle(backend))]),
-        bindings,
+        [(backend.descriptor().id, handle(backend))],
+        connections,
         audit,
         timeout,
     )
@@ -94,7 +98,7 @@ fn build_broker(
 }
 
 #[test]
-fn locator_and_backend_validation_rejects_unsafe_values() {
+fn domain_reference_values_reject_unsafe_input() {
     assert!(SecretLocator::new("").is_err());
     assert!(SecretLocator::new("line\nbreak").is_err());
     assert!(SecretLocator::new("x".repeat(4097)).is_err());
@@ -105,7 +109,7 @@ fn locator_and_backend_validation_rejects_unsafe_values() {
 #[tokio::test]
 async fn memory_backend_maps_faults_and_preserves_uncertain_write() {
     let backend = MemorySecretBackend::new(backend_id("memory"));
-    let ctx = context("connection-a", "provider.api_key", "request-a");
+    let ctx = context(CONNECTION_A, "provider.api_key", "request-a");
     let loc = locator("connection/a/key");
 
     assert_eq!(backend.descriptor().kind, "memory");
@@ -155,23 +159,146 @@ async fn memory_backend_maps_faults_and_preserves_uncertain_write() {
     assert_eq!(backend.remaining_faults(), 0);
 }
 
+#[test]
+fn duplicate_secret_references_are_rejected_across_bindings() {
+    let connections = vec![
+        connection(
+            CONNECTION_A,
+            "connection-a",
+            vec![secret_binding("provider.api_key", "memory", "shared/key")],
+        ),
+        connection(
+            CONNECTION_B,
+            "connection-b",
+            vec![secret_binding("provider.other_key", "memory", "shared/key")],
+        ),
+    ];
+    let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
+
+    assert!(
+        CredentialBroker::new(
+            [(backend_id("memory"), handle(backend))],
+            &connections,
+            Arc::new(AuditLog::default()),
+            Duration::from_secs(1),
+        )
+        .is_err()
+    );
+}
+
 #[tokio::test]
-async fn broker_maps_not_found_exists_unsupported_unavailable_timeout_and_cancellation() {
-    let id = backend_id("memory");
-    let backend = Arc::new(MemorySecretBackend::new(id.clone()));
-    let binding = secret_binding("connection-a", "provider.api_key", "memory", "a/key");
-    let ctx = context("connection-a", "provider.api_key", "request-a");
+async fn duplicate_reference_introduced_later_cannot_delete_shared_secret() {
+    let initial = vec![
+        connection(
+            CONNECTION_A,
+            "connection-a",
+            vec![secret_binding("provider.api_key", "memory", "a/key")],
+        ),
+        connection(
+            CONNECTION_B,
+            "connection-b",
+            vec![secret_binding("provider.other_key", "memory", "b/key")],
+        ),
+    ];
+    let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
+    let broker = build_broker(
+        backend.clone(),
+        &initial,
+        Arc::new(AuditLog::default()),
+        Duration::from_secs(1),
+    );
+    let ctx = context(CONNECTION_A, "provider.api_key", "request-delete");
+    broker
+        .put(
+            &initial,
+            &initial[0].credentials[0],
+            &ctx,
+            &SecretString::from(CANARY.to_owned()),
+            PutSecretOptions::NO_OVERWRITE,
+            &BrokerCancellation::default(),
+        )
+        .await
+        .unwrap();
+
+    let duplicated = vec![
+        initial[0].clone(),
+        connection(
+            CONNECTION_B,
+            "connection-b",
+            vec![secret_binding("provider.other_key", "memory", "a/key")],
+        ),
+    ];
+    assert!(
+        broker
+            .delete(
+                &duplicated,
+                &duplicated[0].credentials[0],
+                &ctx,
+                &BrokerCancellation::default(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .resolve(&locator("a/key"), &ctx)
+            .await
+            .unwrap()
+            .expose(|value| value == CANARY)
+    );
+}
+
+#[test]
+fn backend_registry_rejects_mismatched_keys_and_duplicate_descriptor_ids() {
+    let connections = [connection(CONNECTION_A, "connection-a", Vec::new())];
+    let actual = Arc::new(MemorySecretBackend::new(backend_id("actual")));
+    assert!(
+        CredentialBroker::new(
+            [(backend_id("registered"), handle(actual))],
+            &connections,
+            Arc::new(AuditLog::default()),
+            Duration::from_secs(1),
+        )
+        .is_err()
+    );
+
+    let first = Arc::new(MemorySecretBackend::new(backend_id("duplicate")));
+    let second = Arc::new(MemorySecretBackend::new(backend_id("duplicate")));
+    assert!(
+        CredentialBroker::new(
+            [
+                (backend_id("duplicate"), handle(first)),
+                (backend_id("duplicate"), handle(second)),
+            ],
+            &connections,
+            Arc::new(AuditLog::default()),
+            Duration::from_secs(1),
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn broker_maps_required_failures_and_uncertain_write_reconciliation() {
+    let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
+    let connections = vec![connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "memory", "a/key")],
+    )];
+    let binding = &connections[0].credentials[0];
+    let ctx = context(CONNECTION_A, "provider.api_key", "request-a");
     let audit = Arc::new(AuditLog::default());
     let broker = build_broker(
         backend.clone(),
-        vec![binding.clone()],
+        &connections,
         audit.clone(),
         Duration::from_millis(20),
     );
 
     assert_eq!(
         broker
-            .status(&ctx, &BrokerCancellation::default())
+            .status(&connections, binding, &ctx, &BrokerCancellation::default())
             .await
             .unwrap(),
         CredentialStatus::Missing
@@ -179,6 +306,8 @@ async fn broker_maps_not_found_exists_unsupported_unavailable_timeout_and_cancel
     assert_eq!(
         broker
             .put(
+                &connections,
+                binding,
                 &ctx,
                 &SecretString::from(CANARY.to_owned()),
                 PutSecretOptions::NO_OVERWRITE,
@@ -191,6 +320,8 @@ async fn broker_maps_not_found_exists_unsupported_unavailable_timeout_and_cancel
     assert!(matches!(
         broker
             .put(
+                &connections,
+                binding,
                 &ctx,
                 &SecretString::from("different-canary".to_owned()),
                 PutSecretOptions::NO_OVERWRITE,
@@ -201,13 +332,17 @@ async fn broker_maps_not_found_exists_unsupported_unavailable_timeout_and_cancel
     ));
     backend.plan_faults([MemorySecretFault::LockedOrDenied]);
     assert!(matches!(
-        broker.resolve(&ctx, &BrokerCancellation::default()).await,
+        broker
+            .resolve(&connections, binding, &ctx, &BrokerCancellation::default())
+            .await,
         Err(SecretError::LockedOrDenied { .. })
     ));
     backend.plan_faults([MemorySecretFault::UncertainWrite]);
     assert!(matches!(
         broker
             .put(
+                &connections,
+                binding,
                 &ctx,
                 &SecretString::from(CANARY.to_owned()),
                 PutSecretOptions::OVERWRITE,
@@ -218,21 +353,21 @@ async fn broker_maps_not_found_exists_unsupported_unavailable_timeout_and_cancel
     ));
     assert_eq!(
         broker
-            .status(&ctx, &BrokerCancellation::default())
+            .status(&connections, binding, &ctx, &BrokerCancellation::default())
             .await
             .unwrap(),
         CredentialStatus::Present
     );
 
     let read_only = CredentialBroker::new(
-        HashMap::from([(
-            id.clone(),
+        [(
+            backend_id("memory"),
             SecretBackendHandle {
                 resolver: backend.clone(),
                 administrator: None,
             },
-        )]),
-        [binding.clone()],
+        )],
+        &connections,
         Arc::new(AuditLog::default()),
         Duration::from_secs(1),
     )
@@ -240,6 +375,8 @@ async fn broker_maps_not_found_exists_unsupported_unavailable_timeout_and_cancel
     assert!(matches!(
         read_only
             .put(
+                &connections,
+                binding,
                 &ctx,
                 &SecretString::from(CANARY.to_owned()),
                 PutSecretOptions::OVERWRITE,
@@ -250,35 +387,25 @@ async fn broker_maps_not_found_exists_unsupported_unavailable_timeout_and_cancel
     ));
 
     let unavailable = CredentialBroker::new(
-        HashMap::new(),
-        [secret_binding(
-            "connection-a",
-            "provider.api_key",
-            "missing-backend",
-            "a/key",
-        )],
+        Vec::<(SecretBackendId, SecretBackendHandle)>::new(),
+        &connections,
         Arc::new(AuditLog::default()),
         Duration::from_secs(1),
     )
     .unwrap();
     assert!(matches!(
         unavailable
-            .resolve(&ctx, &BrokerCancellation::default())
+            .resolve(&connections, binding, &ctx, &BrokerCancellation::default())
             .await,
         Err(SecretError::BackendUnavailable { .. })
     ));
 
     backend.plan_faults([MemorySecretFault::Timeout]);
     assert!(matches!(
-        broker.resolve(&ctx, &BrokerCancellation::default()).await,
+        broker
+            .resolve(&connections, binding, &ctx, &BrokerCancellation::default())
+            .await,
         Err(SecretError::TimedOut { .. })
-    ));
-    backend.plan_faults([MemorySecretFault::Timeout]);
-    let cancellation = BrokerCancellation::default();
-    cancellation.cancel();
-    assert!(matches!(
-        broker.resolve(&ctx, &cancellation).await,
-        Err(SecretError::Cancelled { .. })
     ));
     assert!(!format!("{:?}", audit.0.lock().unwrap()).contains(CANARY));
 }
@@ -297,7 +424,7 @@ impl SecretResolver for PanicResolver {
 
     async fn probe(&self) -> Result<SecretBackendStatus, SecretError> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        panic!("delegated or rejected binding touched backend")
+        panic!("rejected binding touched backend")
     }
 
     async fn resolve(
@@ -306,45 +433,50 @@ impl SecretResolver for PanicResolver {
         _context: &SecretAccessContext,
     ) -> Result<ResolvedSecret, SecretError> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        panic!("delegated or rejected binding touched backend")
+        panic!("rejected binding touched backend")
     }
 }
 
 #[tokio::test]
-async fn delegated_disabled_and_invalid_bindings_fail_closed_without_backend_access() {
+async fn current_binding_changes_and_detaches_take_effect_immediately() {
+    let original = connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "panic", "a/key")],
+    );
     let resolver = Arc::new(PanicResolver(AtomicUsize::new(0)));
-    let delegated = CredentialBindingRecord {
-        connection_id: ConnectionId::new("delegated-connection").unwrap(),
-        slot: CredentialSlot::new("codex.account").unwrap(),
-        binding: CredentialBinding::Delegated {
-            authority: DelegatedAuthority("codex-app-server".into()),
-        },
-        delivery: CredentialDelivery::HarnessManaged,
-    };
-    let disabled = CredentialBindingRecord {
-        connection_id: ConnectionId::new("disabled-connection").unwrap(),
-        slot: CredentialSlot::new("provider.api_key").unwrap(),
-        binding: CredentialBinding::Disabled,
-        delivery: CredentialDelivery::ProviderNative,
-    };
     let broker = CredentialBroker::new(
-        HashMap::from([(
+        [(
             backend_id("panic"),
             SecretBackendHandle {
                 resolver: resolver.clone(),
                 administrator: None,
             },
-        )]),
-        [delegated, disabled],
+        )],
+        std::slice::from_ref(&original),
         Arc::new(AuditLog::default()),
         Duration::from_secs(1),
     )
     .unwrap();
+    let ctx = context(CONNECTION_A, "provider.api_key", "request-change");
+    let delegated_binding = CredentialBindingRecord {
+        slot: ctx.slot.clone(),
+        binding: CredentialBinding::Delegated {
+            authority: "provider-login".into(),
+        },
+    };
+    let changed = connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![delegated_binding.clone()],
+    );
 
     assert!(matches!(
         broker
             .resolve(
-                &context("delegated-connection", "codex.account", "request-d"),
+                std::slice::from_ref(&changed),
+                &delegated_binding,
+                &ctx,
                 &BrokerCancellation::default(),
             )
             .await
@@ -354,7 +486,60 @@ async fn delegated_disabled_and_invalid_bindings_fail_closed_without_backend_acc
     assert!(matches!(
         broker
             .resolve(
-                &context("disabled-connection", "provider.api_key", "request-x"),
+                std::slice::from_ref(&changed),
+                &original.credentials[0],
+                &ctx,
+                &BrokerCancellation::default(),
+            )
+            .await,
+        Err(SecretError::InvalidBinding {
+            reason: InvalidBindingReason::StaleBinding,
+            ..
+        })
+    ));
+    let detached = connection(CONNECTION_A, "connection-a", Vec::new());
+    assert!(matches!(
+        broker
+            .resolve(
+                std::slice::from_ref(&detached),
+                &original.credentials[0],
+                &ctx,
+                &BrokerCancellation::default(),
+            )
+            .await,
+        Err(SecretError::InvalidBinding {
+            reason: InvalidBindingReason::UnknownSlot,
+            ..
+        })
+    ));
+    assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn disabled_and_invalid_scopes_fail_before_backend_access() {
+    let disabled = CredentialBindingRecord {
+        slot: CredentialSlot::new("provider.api_key").unwrap(),
+        binding: CredentialBinding::Disabled,
+    };
+    let connections = [connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![disabled.clone()],
+    )];
+    let broker = CredentialBroker::new(
+        Vec::<(SecretBackendId, SecretBackendHandle)>::new(),
+        &connections,
+        Arc::new(AuditLog::default()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        broker
+            .resolve(
+                &connections,
+                &disabled,
+                &context(CONNECTION_A, "provider.api_key", "request-disabled"),
                 &BrokerCancellation::default(),
             )
             .await,
@@ -366,7 +551,9 @@ async fn delegated_disabled_and_invalid_bindings_fail_closed_without_backend_acc
     assert!(matches!(
         broker
             .resolve(
-                &context("unknown", "provider.api_key", "request-u"),
+                &connections,
+                &disabled,
+                &context(CONNECTION_B, "provider.api_key", "request-unknown"),
                 &BrokerCancellation::default(),
             )
             .await,
@@ -375,19 +562,47 @@ async fn delegated_disabled_and_invalid_bindings_fail_closed_without_backend_acc
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn pre_cancelled_put_never_mutates_an_immediately_completing_backend() {
+    let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
+    let connections = vec![connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "memory", "a/key")],
+    )];
+    let binding = &connections[0].credentials[0];
+    let ctx = context(CONNECTION_A, "provider.api_key", "request-cancelled");
+    let broker = build_broker(
+        backend,
+        &connections,
+        Arc::new(AuditLog::default()),
+        Duration::from_secs(1),
+    );
+    let cancellation = BrokerCancellation::default();
+    cancellation.cancel();
+
     assert!(matches!(
         broker
-            .resolve(
-                &context("delegated-connection", "wrong.slot", "request-s"),
-                &BrokerCancellation::default(),
+            .put(
+                &connections,
+                binding,
+                &ctx,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+                &cancellation,
             )
             .await,
-        Err(SecretError::InvalidBinding {
-            reason: InvalidBindingReason::UnknownSlot,
-            ..
-        })
+        Err(SecretError::Cancelled { .. })
     ));
-    assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        broker
+            .status(&connections, binding, &ctx, &BrokerCancellation::default())
+            .await
+            .unwrap(),
+        CredentialStatus::Missing
+    );
 }
 
 struct SequencedBackend {
@@ -417,11 +632,10 @@ impl SecretResolver for SequencedBackend {
         _context: &SecretAccessContext,
     ) -> Result<ResolvedSecret, SecretError> {
         Err(SecretError::NotFound {
-            reference: SecretReference {
+            reference: yakshed_secrets::SecretReferenceSummary::from(&SecretReference {
                 backend_id: backend_id("sequence"),
                 locator: locator.clone(),
-            }
-            .summary(),
+            }),
         })
     }
 }
@@ -459,30 +673,37 @@ async fn same_reference_operations_serialize_and_second_observes_first_completio
         first_started: Semaphore::new(0),
         release_first: Semaphore::new(0),
     });
-    let binding = secret_binding("connection-a", "provider.api_key", "sequence", "shared/key");
+    let connections = Arc::new(vec![connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "sequence", "shared/key")],
+    )]);
     let broker = Arc::new(
         CredentialBroker::new(
-            HashMap::from([(
+            [(
                 backend_id("sequence"),
                 SecretBackendHandle {
                     resolver: backend.clone(),
                     administrator: Some(backend.clone()),
                 },
-            )]),
-            [binding],
+            )],
+            &connections,
             Arc::new(AuditLog::default()),
             Duration::from_secs(1),
         )
         .unwrap(),
     );
-    let ctx = context("connection-a", "provider.api_key", "request-a");
+    let ctx = context(CONNECTION_A, "provider.api_key", "request-a");
 
     let first = {
         let broker = broker.clone();
+        let connections = connections.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
             broker
                 .put(
+                    &connections,
+                    &connections[0].credentials[0],
                     &ctx,
                     &SecretString::from("first-canary".to_owned()),
                     PutSecretOptions::NO_OVERWRITE,
@@ -494,9 +715,12 @@ async fn same_reference_operations_serialize_and_second_observes_first_completio
     backend.first_started.acquire().await.unwrap().forget();
     let second = {
         let broker = broker.clone();
+        let connections = connections.clone();
         tokio::spawn(async move {
             broker
                 .put(
+                    &connections,
+                    &connections[0].credentials[0],
                     &ctx,
                     &SecretString::from("second-canary".to_owned()),
                     PutSecretOptions::OVERWRITE,
@@ -513,35 +737,44 @@ async fn same_reference_operations_serialize_and_second_observes_first_completio
 }
 
 #[tokio::test]
-async fn independent_namespaces_support_lifecycle_and_memory_restart_semantics() {
-    let bindings = vec![
-        secret_binding("connection-a", "provider.api_key", "memory", "a/key"),
-        secret_binding("connection-b", "provider.api_key", "memory", "b/key"),
-        secret_binding(
+async fn connection_and_slot_namespaces_support_lifecycle_and_restart() {
+    let connections = vec![
+        connection(
+            CONNECTION_A,
             "connection-a",
-            "provider.secondary_key",
-            "memory",
-            "a/secondary-key",
+            vec![
+                secret_binding("provider.api_key", "memory", "a/key"),
+                secret_binding("provider.secondary_key", "memory", "a/secondary"),
+            ],
+        ),
+        connection(
+            CONNECTION_B,
+            "connection-b",
+            vec![secret_binding("provider.api_key", "memory", "b/key")],
         ),
     ];
     let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
     let broker = build_broker(
         backend,
-        bindings.clone(),
+        &connections,
         Arc::new(AuditLog::default()),
         Duration::from_secs(1),
     );
-    let a = context("connection-a", "provider.api_key", "request-a");
-    let b = context("connection-b", "provider.api_key", "request-b");
-    let secondary = context("connection-a", "provider.secondary_key", "request-c");
+    let contexts = [
+        context(CONNECTION_A, "provider.api_key", "request-a"),
+        context(CONNECTION_A, "provider.secondary_key", "request-b"),
+        context(CONNECTION_B, "provider.api_key", "request-c"),
+    ];
+    let locations = [(0, 0), (0, 1), (1, 0)];
+    let values = ["a-canary", "a-secondary-canary", "b-canary"];
 
-    for (context, value) in [
-        (&a, "connection-a-canary"),
-        (&b, "connection-b-canary"),
-        (&secondary, "connection-a-secondary-canary"),
-    ] {
+    for ((connection_index, binding_index), (context, value)) in
+        locations.into_iter().zip(contexts.iter().zip(values))
+    {
         broker
             .put(
+                &connections,
+                &connections[connection_index].credentials[binding_index],
                 context,
                 &SecretString::from(value.to_owned()),
                 PutSecretOptions::NO_OVERWRITE,
@@ -550,13 +783,16 @@ async fn independent_namespaces_support_lifecycle_and_memory_restart_semantics()
             .await
             .unwrap();
     }
-    for (context, expected) in [
-        (&a, "connection-a-canary"),
-        (&b, "connection-b-canary"),
-        (&secondary, "connection-a-secondary-canary"),
-    ] {
+    for ((connection_index, binding_index), (context, expected)) in
+        locations.into_iter().zip(contexts.iter().zip(values))
+    {
         let CredentialResolution::Secret(secret) = broker
-            .resolve(context, &BrokerCancellation::default())
+            .resolve(
+                &connections,
+                &connections[connection_index].credentials[binding_index],
+                context,
+                &BrokerCancellation::default(),
+            )
             .await
             .unwrap()
         else {
@@ -567,8 +803,10 @@ async fn independent_namespaces_support_lifecycle_and_memory_restart_semantics()
     assert_eq!(
         broker
             .put(
-                &a,
-                &SecretString::from("rotated-a-canary".to_owned()),
+                &connections,
+                &connections[0].credentials[0],
+                &contexts[0],
+                &SecretString::from("rotated-canary".to_owned()),
                 PutSecretOptions::OVERWRITE,
                 &BrokerCancellation::default(),
             )
@@ -578,28 +816,24 @@ async fn independent_namespaces_support_lifecycle_and_memory_restart_semantics()
     );
     assert_eq!(
         broker
-            .delete(&a, &BrokerCancellation::default())
+            .delete(
+                &connections,
+                &connections[0].credentials[0],
+                &contexts[0],
+                &BrokerCancellation::default(),
+            )
             .await
             .unwrap(),
         DeleteSecretOutcome::Deleted
     );
     assert_eq!(
         broker
-            .status(&a, &BrokerCancellation::default())
-            .await
-            .unwrap(),
-        CredentialStatus::Missing
-    );
-    assert_eq!(
-        broker
-            .status(&b, &BrokerCancellation::default())
-            .await
-            .unwrap(),
-        CredentialStatus::Present
-    );
-    assert_eq!(
-        broker
-            .status(&secondary, &BrokerCancellation::default())
+            .status(
+                &connections,
+                &connections[0].credentials[1],
+                &contexts[1],
+                &BrokerCancellation::default(),
+            )
             .await
             .unwrap(),
         CredentialStatus::Present
@@ -607,13 +841,18 @@ async fn independent_namespaces_support_lifecycle_and_memory_restart_semantics()
 
     let restarted = build_broker(
         Arc::new(MemorySecretBackend::new(backend_id("memory"))),
-        bindings,
+        &connections,
         Arc::new(AuditLog::default()),
         Duration::from_secs(1),
     );
     assert_eq!(
         restarted
-            .status(&b, &BrokerCancellation::default())
+            .status(
+                &connections,
+                &connections[1].credentials[0],
+                &contexts[2],
+                &BrokerCancellation::default(),
+            )
             .await
             .unwrap(),
         CredentialStatus::Missing
@@ -621,7 +860,7 @@ async fn independent_namespaces_support_lifecycle_and_memory_restart_semantics()
 }
 
 #[test]
-fn delivery_is_pure_and_includes_only_the_deliberate_environment_and_credential() {
+fn delivery_curates_runtime_environment_and_drops_ambient_credentials() {
     let resolved = ResolvedSecret::new(
         SecretString::from(CANARY.to_owned()),
         yakshed_secrets::ResolvedSecretSource {
@@ -629,17 +868,27 @@ fn delivery_is_pure_and_includes_only_the_deliberate_environment_and_credential(
         },
         None,
     );
-    let environment =
-        shape_process_environment(&HashMap::new(), "TEST_API_KEY", &resolved).unwrap();
+    let ambient = HashMap::from([
+        (OsString::from("PATH"), OsString::from("/usr/bin")),
+        (OsString::from("HOME"), OsString::from("/tmp/home")),
+        (OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+        (
+            OsString::from("OPENAI_API_KEY"),
+            OsString::from("ambient-secret"),
+        ),
+        (OsString::from("UNRELATED"), OsString::from("drop-me")),
+    ]);
+    let environment = shape_process_environment(&ambient, "TEST_API_KEY", &resolved).unwrap();
     environment.expose(|environment| {
-        assert_eq!(environment.len(), 1);
-        assert!(
-            environment
-                .get(&OsString::from("TEST_API_KEY"))
-                .is_some_and(|value| value == CANARY)
-        );
+        assert_eq!(environment.len(), 4);
+        assert!(environment.contains_key(&OsString::from("PATH")));
+        assert!(environment.contains_key(&OsString::from("HOME")));
+        assert!(environment.contains_key(&OsString::from("LANG")));
+        assert!(environment.contains_key(&OsString::from("TEST_API_KEY")));
+        assert!(!environment.contains_key(&OsString::from("OPENAI_API_KEY")));
+        assert!(!environment.contains_key(&OsString::from("UNRELATED")));
     });
-    assert!(shape_process_environment(&HashMap::new(), "BAD=NAME", &resolved).is_err());
+    assert!(shape_process_environment(&ambient, "BAD=NAME", &resolved).is_err());
 }
 
 #[test]
@@ -648,11 +897,10 @@ fn formatted_errors_and_audit_metadata_never_include_canary_material() {
         backend: backend_id("memory"),
         redacted_message: CANARY.into(),
     };
-    let rendered = format!("{error} {error:?}");
-    assert!(!rendered.contains(CANARY));
+    assert!(!format!("{error} {error:?}").contains(CANARY));
 
     let event = SecretAuditEvent {
-        connection_id: ConnectionId::new("connection-a").unwrap(),
+        connection_id: CONNECTION_A.parse::<ConnectionId>().unwrap(),
         slot: CredentialSlot::new("provider.api_key").unwrap(),
         purpose: SecretAccessPurpose::ValidateCredential,
         request_id: OperationId::new("request-a").unwrap(),
