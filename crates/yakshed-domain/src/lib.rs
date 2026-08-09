@@ -62,6 +62,18 @@ impl fmt::Display for ArtifactId {
 #[serde(try_from = "String", into = "String")]
 pub struct WorkItemId(Uuid);
 
+impl WorkItemId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl From<Uuid> for WorkItemId {
+    fn from(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
 impl FromStr for WorkItemId {
     type Err = ValidationError;
 
@@ -94,6 +106,18 @@ impl fmt::Display for WorkItemId {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct RunId(Uuid);
+
+impl RunId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl From<Uuid> for RunId {
+    fn from(value: Uuid) -> Self {
+        Self(value)
+    }
+}
 
 impl FromStr for RunId {
     type Err = ValidationError;
@@ -237,6 +261,200 @@ pub struct ArtifactRecord {
     pub byte_len: u64,
     pub media_type: String,
     pub provenance: ArtifactProvenance,
+}
+
+macro_rules! uuid_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(
+            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            pub fn new_v7() -> Self {
+                Self(Uuid::now_v7())
+            }
+        }
+
+        impl From<Uuid> for $name {
+            fn from(value: Uuid) -> Self {
+                Self(value)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(value).map(Self)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+    };
+}
+
+uuid_id!(ProjectId, "Stable identity of a YakShed project.");
+uuid_id!(TimelineItemId, "Stable identity of a timeline item.");
+uuid_id!(ApprovalRequestId, "Stable identity of an approval request.");
+uuid_id!(AuditEventId, "Stable identity of an audit event.");
+
+/// UTC instant represented durably as Unix epoch milliseconds.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct UtcTimestamp(i64);
+
+impl UtcTimestamp {
+    pub const fn from_unix_millis(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn unix_millis(self) -> i64 {
+        self.0
+    }
+}
+
+/// Monotonic per-projection stream revision.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProjectionRevision(u64);
+
+impl ProjectionRevision {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Monotonic revision of one durable application aggregate.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DataRevision(u64);
+
+impl DataRevision {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Opaque provider-owned identifier paired with its namespace.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NamespacedProviderId {
+    namespace: String,
+    value: String,
+}
+
+impl NamespacedProviderId {
+    pub fn new(
+        namespace: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, ValidationError> {
+        let namespace = namespace.into();
+        let value = value.into();
+        require_nonempty("provider namespace", &namespace)?;
+        require_nonempty("provider id", &value)?;
+        if namespace.len() > 128 || namespace.chars().any(char::is_control) {
+            return Err(ValidationError("invalid provider namespace".to_owned()));
+        }
+        if value.len() > 4096 || value.chars().any(char::is_control) {
+            return Err(ValidationError("invalid provider id".to_owned()));
+        }
+        Ok(Self { namespace, value })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectSnapshot {
+    pub id: ProjectId,
+    pub name: String,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkItemStatus {
+    Ready,
+    Archived,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemSnapshot {
+    pub id: WorkItemId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub status: WorkItemStatus,
+    pub parent_id: Option<WorkItemId>,
+    pub revision: DataRevision,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunStatus {
+    Running,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunSnapshot {
+    pub id: RunId,
+    pub work_item_id: WorkItemId,
+    pub status: RunStatus,
+    pub provider_id: Option<NamespacedProviderId>,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelineItemSnapshot {
+    pub id: TimelineItemId,
+    pub run_id: RunId,
+    pub revision: ProjectionRevision,
+    pub kind: String,
+    pub body: String,
+    pub provider_id: Option<NamespacedProviderId>,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecision {
+    Approved,
+    Denied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalStatus {
+    Pending,
+    Resolved(ApprovalDecision),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalSnapshot {
+    pub id: ApprovalRequestId,
+    pub run_id: RunId,
+    pub provider_id: NamespacedProviderId,
+    pub kind: String,
+    pub summary: String,
+    pub status: ApprovalStatus,
+    pub requested_at: UtcTimestamp,
+    pub resolved_at: Option<UtcTimestamp>,
 }
 
 /// A configured harness/model-provider trust boundary.
@@ -571,6 +789,12 @@ impl Error for ValidationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_owned_ids_are_uuid_v7() {
+        let parsed = Uuid::parse_str(&WorkItemId::new_v7().to_string()).unwrap();
+        assert_eq!(parsed.get_version_num(), 7);
+    }
 
     #[test]
     fn credential_binding_variants_enforce_their_reference_fields() {
