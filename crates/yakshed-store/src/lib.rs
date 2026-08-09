@@ -3,8 +3,5 @@
 mod config;
 mod paths;
 
-pub use config::{
-    AppConfig, ConfigChange, ConfigError, ConfigRevision, ConfigSnapshot, ConfigStore,
-    ConnectionConfig, CredentialBindingConfig, CredentialDelivery, SecretBackendConfig, UiConfig,
-};
+pub use config::{ConfigError, ConfigStore};
 pub use paths::{AppPaths, PathError};

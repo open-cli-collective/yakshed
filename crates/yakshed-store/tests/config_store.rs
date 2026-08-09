@@ -1,14 +1,14 @@
 use std::fs;
 
 use tempfile::tempdir;
-use yakshed_domain::ConnectionId;
-use yakshed_store::{
-    AppConfig, AppPaths, ConfigChange, ConfigError, ConfigRevision, ConfigStore, ConnectionConfig,
-    CredentialBindingConfig, CredentialDelivery, SecretBackendConfig,
+use yakshed_application::{AppConfig, ConfigChange, ConfigRevision};
+use yakshed_domain::{
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, SecretBackend,
 };
+use yakshed_store::{AppPaths, ConfigError, ConfigStore};
 
-fn connection() -> ConnectionConfig {
-    ConnectionConfig {
+fn connection() -> Connection {
+    Connection {
         id: "0193f26e-7a72-7d42-bf77-0de14c4cc222"
             .parse::<ConnectionId>()
             .unwrap(),
@@ -16,15 +16,12 @@ fn connection() -> ConnectionConfig {
         harness: "mock".into(),
         model_provider: "anthropic".into(),
         provider_state: "work-test".into(),
-        credentials: vec![CredentialBindingConfig {
+        credentials: vec![CredentialBindingRecord {
             slot: "anthropic.api_key".into(),
-            source: "secret".into(),
-            backend: Some("memory".into()),
-            locator: Some("connection/work/anthropic_api_key".into()),
-            delivery: Some(CredentialDelivery {
-                kind: "process_environment".into(),
-                variable: "ANTHROPIC_API_KEY".into(),
-            }),
+            binding: CredentialBinding::Secret {
+                backend: "memory".into(),
+                locator: "connection/work/anthropic_api_key".into(),
+            },
         }],
     }
 }
@@ -38,7 +35,7 @@ async fn config_round_trips_through_disk() {
     let updated = store
         .update(
             ConfigRevision::INITIAL,
-            ConfigChange::PutSecretBackend(SecretBackendConfig {
+            ConfigChange::PutSecretBackend(SecretBackend {
                 id: "memory".into(),
                 kind: "memory".into(),
                 account: None,
@@ -78,7 +75,7 @@ fn config_file_is_private() {
 fn newer_schema_is_rejected_without_rewrite() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    paths.create_dirs().unwrap();
+    paths.create_config_root().unwrap();
     let config_path = paths.config_root.join("config.toml");
     let bytes = b"schema_version = 999\n";
     fs::write(&config_path, bytes).unwrap();
@@ -97,7 +94,7 @@ fn newer_schema_is_rejected_without_rewrite() {
 fn malformed_config_has_a_parse_error() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    paths.create_dirs().unwrap();
+    paths.create_config_root().unwrap();
     fs::write(paths.config_root.join("config.toml"), "not = [toml").unwrap();
 
     assert!(matches!(
@@ -177,7 +174,7 @@ async fn remove_operations_are_persisted() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
     let store = ConfigStore::open(paths.clone()).unwrap();
-    let backend = SecretBackendConfig {
+    let backend = SecretBackend {
         id: "memory".into(),
         kind: "memory".into(),
         account: None,
@@ -218,7 +215,9 @@ async fn reset_only_recreates_config_toml() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
     let store = ConfigStore::open(paths.clone()).unwrap();
-    paths.create_dirs().unwrap();
+    paths.create_cache_root().unwrap();
+    paths.create_data_root().unwrap();
+    paths.create_runtime_root().unwrap();
     let durable = paths.data_root.join("keep-me");
     let cached = paths.cache_root.join("keep-me");
     let runtime = paths.runtime_root.join("keep-me");
@@ -238,22 +237,91 @@ async fn reset_only_recreates_config_toml() {
 }
 
 #[test]
-fn credential_binding_serialization_has_only_reference_fields() {
-    let binding = &connection().credentials[0];
-    let CredentialBindingConfig {
-        slot: _,
-        source: _,
-        backend: _,
-        locator: _,
-        delivery: _,
-    } = binding;
-    let value = serde_json::to_value(binding).unwrap();
-    let keys = value.as_object().unwrap().keys().map(String::as_str);
+fn opening_config_creates_only_the_config_root() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    ConfigStore::open(paths.clone()).unwrap();
 
+    assert!(paths.config_root.is_dir());
+    assert!(!paths.cache_root.exists());
+    assert!(!paths.data_root.exists());
+    assert!(!paths.runtime_root.exists());
+}
+
+#[tokio::test]
+async fn secrets_section_7_binding_shapes_round_trip_without_delivery_metadata() {
+    const EXAMPLE: &str = r#"schema_version = 1
+
+[[secret_backends]]
+id = "local-os"
+kind = "local-os"
+
+[[secret_backends]]
+id = "onepassword-work"
+kind = "onepassword-cli"
+account = "work"
+
+[[connections]]
+id = "0193f26e-7a72-7d42-bf77-0de14c4cc111"
+name = "Home"
+harness = "codex"
+model_provider = "openai"
+provider_state = "home-codex"
+
+[[connections.credentials]]
+slot = "codex.account"
+source = "delegated"
+authority = "codex-app-server"
+
+[[connections]]
+id = "0193f26e-7a72-7d42-bf77-0de14c4cc222"
+name = "Work"
+harness = "claude-code"
+model_provider = "anthropic"
+provider_state = "work-claude"
+
+[[connections.credentials]]
+slot = "anthropic.api_key"
+source = "secret"
+backend = "onepassword-work"
+locator = "op://Engineering/YakShed Work/Anthropic API Key"
+
+[[connections]]
+id = "0193f26e-7a72-7d42-bf77-0de14c4cc333"
+name = "Lab"
+harness = "codex"
+model_provider = "fireworks"
+provider_state = "lab-codex"
+
+[[connections.credentials]]
+slot = "fireworks.api_key"
+source = "secret"
+backend = "local-os"
+locator = "connection/0193f26e-7a72-7d42-bf77-0de14c4cc333/fireworks_api_key"
+"#;
+
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(paths.config_root.join("config.toml"), EXAMPLE).unwrap();
+    let store = ConfigStore::open(paths.clone()).unwrap();
+    let snapshot = store
+        .update(
+            ConfigRevision::INITIAL,
+            ConfigChange::SetUiTheme("system".into()),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        snapshot.config.connections[0].credentials[0].binding,
+        CredentialBinding::Delegated { ref authority } if authority == "codex-app-server"
+    ));
+    let written = fs::read_to_string(paths.config_root.join("config.toml")).unwrap();
+    assert!(written.contains("authority = \"codex-app-server\""));
+    assert!(!written.contains("delivery"));
     assert_eq!(
-        keys.collect::<std::collections::BTreeSet<_>>(),
-        ["backend", "delivery", "locator", "slot", "source"]
-            .into_iter()
-            .collect()
+        ConfigStore::open(paths).unwrap().snapshot().config,
+        snapshot.config
     );
 }

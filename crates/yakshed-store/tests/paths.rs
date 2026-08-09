@@ -25,7 +25,10 @@ fn created_directories_are_private() {
 
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    paths.create_dirs().unwrap();
+    paths.create_config_root().unwrap();
+    paths.create_cache_root().unwrap();
+    paths.create_data_root().unwrap();
+    paths.create_runtime_root().unwrap();
 
     for path in paths.roots() {
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o700);

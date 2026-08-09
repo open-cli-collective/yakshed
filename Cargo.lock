@@ -677,7 +677,6 @@ dependencies = [
  "atomic-write-file",
  "directories",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

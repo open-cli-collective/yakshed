@@ -82,22 +82,38 @@ impl AppPaths {
         ]
     }
 
-    /// Creates every root with private POSIX permissions.
-    pub fn create_dirs(&self) -> Result<(), PathError> {
-        for path in self.roots() {
-            fs::create_dir_all(path).map_err(|source| PathError::Io {
-                path: path.to_owned(),
-                source,
-            })?;
-            set_private_directory_permissions(path)?;
-        }
-        Ok(())
+    /// Creates only the config root with private POSIX permissions.
+    pub fn create_config_root(&self) -> Result<(), PathError> {
+        create_private_directory(&self.config_root)
+    }
+
+    /// Creates only the cache root with private POSIX permissions.
+    pub fn create_cache_root(&self) -> Result<(), PathError> {
+        create_private_directory(&self.cache_root)
+    }
+
+    /// Creates only the durable-data root with private POSIX permissions.
+    pub fn create_data_root(&self) -> Result<(), PathError> {
+        create_private_directory(&self.data_root)
+    }
+
+    /// Creates only the runtime root with private POSIX permissions.
+    pub fn create_runtime_root(&self) -> Result<(), PathError> {
+        create_private_directory(&self.runtime_root)
     }
 
     /// Formats the resolved roots for diagnostics and support output.
     pub fn diagnostics(&self) -> String {
         self.to_string()
     }
+}
+
+fn create_private_directory(path: &Path) -> Result<(), PathError> {
+    fs::create_dir_all(path).map_err(|source| PathError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    set_private_directory_permissions(path)
 }
 
 impl fmt::Display for AppPaths {
