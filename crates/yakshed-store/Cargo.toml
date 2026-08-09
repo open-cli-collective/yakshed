@@ -5,5 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+atomic-write-file.workspace = true
+directories.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
 yakshed-application.workspace = true
 yakshed-domain.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
