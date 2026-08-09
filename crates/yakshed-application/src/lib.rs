@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use thiserror::Error as ThisError;
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, AuditEventId, Connection, ConnectionId,
-    CredentialBinding, NamespacedProviderId, ProjectId, ProjectSnapshot, ProjectionRevision, RunId,
-    RunSnapshot, SecretBackend, SecretBackendId, TimelineItemId, TimelineItemSnapshot,
-    UtcTimestamp, WorkItemId, WorkItemSnapshot,
+    CredentialBinding, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
+    SecretBackend, SecretBackendId, StreamCursor, TimelineBatchId, TimelineItemId,
+    TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
 /// Canonical non-secret application configuration.
@@ -148,6 +148,7 @@ pub trait IdGenerator: Send + Sync {
     fn next_project_id(&self) -> ProjectId;
     fn next_work_item_id(&self) -> WorkItemId;
     fn next_run_id(&self) -> RunId;
+    fn next_timeline_batch_id(&self) -> TimelineBatchId;
     fn next_timeline_item_id(&self) -> TimelineItemId;
     fn next_approval_request_id(&self) -> ApprovalRequestId;
     fn next_audit_event_id(&self) -> AuditEventId;
@@ -166,6 +167,10 @@ impl IdGenerator for SystemIdGenerator {
 
     fn next_run_id(&self) -> RunId {
         RunId::new_v7()
+    }
+
+    fn next_timeline_batch_id(&self) -> TimelineBatchId {
+        TimelineBatchId::new_v7()
     }
 
     fn next_timeline_item_id(&self) -> TimelineItemId {
@@ -249,24 +254,38 @@ pub struct NewTimelineItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelineBatch {
+    pub batch_id: TimelineBatchId,
     pub run_id: RunId,
     pub source_namespace: String,
     pub stream_id: String,
-    pub expected_stream_revision: ProjectionRevision,
+    pub expected_stream_revision: StreamCursor,
     pub items: Vec<NewTimelineItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListTimeline {
     pub run_id: RunId,
-    pub after: Option<ProjectionRevision>,
+    pub after: Option<TimelineRevision>,
     pub limit: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelinePage {
     pub items: Vec<TimelineItemSnapshot>,
-    pub next_after: Option<ProjectionRevision>,
+    pub next_after: Option<TimelineRevision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetStreamCursor {
+    pub run_id: RunId,
+    pub source_namespace: String,
+    pub stream_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamCursorState {
+    pub cursor: StreamCursor,
+    pub last_batch_id: TimelineBatchId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -340,10 +359,12 @@ pub trait AppStore: Send + Sync {
         after: Option<RunId>,
         limit: u32,
     ) -> Result<RunPage, StoreError>;
-    async fn append_timeline_batch(
+    async fn append_timeline_batch(&self, batch: TimelineBatch)
+    -> Result<StreamCursor, StoreError>;
+    async fn get_stream_cursor(
         &self,
-        batch: TimelineBatch,
-    ) -> Result<ProjectionRevision, StoreError>;
+        query: GetStreamCursor,
+    ) -> Result<Option<StreamCursorState>, StoreError>;
     async fn list_timeline_page(&self, query: ListTimeline) -> Result<TimelinePage, StoreError>;
     async fn record_pending_approval(
         &self,

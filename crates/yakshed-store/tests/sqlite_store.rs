@@ -3,12 +3,13 @@ use std::{fs, sync::Arc};
 use tempfile::TempDir;
 use yakshed_application::{
     AppStore, BeginApprovalResponse, Clock, ConfigChange, ConfigRevision, ConfirmApprovalResponse,
-    CreateProject, CreateRun, CreateWorkItem, IdGenerator, ListTimeline, ListWorkItems,
-    NewTimelineItem, PendingApproval, StoreError, TimelineBatch,
+    CreateProject, CreateRun, CreateWorkItem, GetStreamCursor, IdGenerator, ListTimeline,
+    ListWorkItems, NewTimelineItem, PendingApproval, StoreError, TimelineBatch,
 };
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalStatus, AuditEventId, NamespacedProviderId,
-    ProjectId, RunId, TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
+    ProjectId, RunId, StreamCursor, TimelineBatchId, TimelineItemId, UtcTimestamp, WorkItemId,
+    WorkItemStatus,
 };
 use yakshed_store::{AppPaths, ConfigStore, SqliteStore};
 
@@ -39,6 +40,10 @@ impl IdGenerator for TestIds {
     }
 
     fn next_timeline_item_id(&self) -> TimelineItemId {
+        self.next_uuid().into()
+    }
+
+    fn next_timeline_batch_id(&self) -> TimelineBatchId {
         self.next_uuid().into()
     }
 
@@ -503,7 +508,7 @@ async fn archive_subtree_preserves_archived_records() {
 }
 
 #[tokio::test]
-async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
+async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_cursors() {
     let context = Context::open().await;
     let project_id = context.project().await;
     for title in ["one", "two", "three"] {
@@ -548,38 +553,49 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         })
         .await
         .unwrap();
-    let revision_two = context
+    let first_batch = TimelineBatch {
+        batch_id: context.ids.next_timeline_batch_id(),
+        run_id: run.id,
+        source_namespace: "mock".into(),
+        stream_id: "session/opaque".into(),
+        expected_stream_revision: StreamCursor::INITIAL,
+        items: vec![
+            NewTimelineItem {
+                id: context.ids.next_timeline_item_id(),
+                kind: "message".into(),
+                body: "first".into(),
+                provider_id: None,
+            },
+            NewTimelineItem {
+                id: context.ids.next_timeline_item_id(),
+                kind: "message".into(),
+                body: "second".into(),
+                provider_id: None,
+            },
+        ],
+    };
+    let cursor_two = context
         .store
-        .append_timeline_batch(TimelineBatch {
-            run_id: run.id,
-            source_namespace: "mock".into(),
-            stream_id: "session/opaque".into(),
-            expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
-            items: vec![
-                NewTimelineItem {
-                    id: context.ids.next_timeline_item_id(),
-                    kind: "message".into(),
-                    body: "first".into(),
-                    provider_id: None,
-                },
-                NewTimelineItem {
-                    id: context.ids.next_timeline_item_id(),
-                    kind: "message".into(),
-                    body: "second".into(),
-                    provider_id: None,
-                },
-            ],
-        })
+        .append_timeline_batch(first_batch.clone())
         .await
         .unwrap();
+    assert_eq!(
+        context
+            .store
+            .append_timeline_batch(first_batch)
+            .await
+            .unwrap(),
+        cursor_two
+    );
     assert!(matches!(
         context
             .store
             .append_timeline_batch(TimelineBatch {
+                batch_id: context.ids.next_timeline_batch_id(),
                 run_id: run.id,
                 source_namespace: "mock".into(),
                 stream_id: "session/opaque".into(),
-                expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
+                expected_stream_revision: StreamCursor::INITIAL,
                 items: vec![NewTimelineItem {
                     id: context.ids.next_timeline_item_id(),
                     kind: "message".into(),
@@ -603,10 +619,11 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         context
             .store
             .append_timeline_batch(TimelineBatch {
+                batch_id: context.ids.next_timeline_batch_id(),
                 run_id: other_run.id,
                 source_namespace: "mock".into(),
                 stream_id: "session/opaque".into(),
-                expected_stream_revision: revision_two,
+                expected_stream_revision: cursor_two,
                 items: vec![NewTimelineItem {
                     id: context.ids.next_timeline_item_id(),
                     kind: "message".into(),
@@ -618,13 +635,14 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         Err(StoreError::Conflict(_))
     ));
     let opaque = NamespacedProviderId::new("mock", "turn/α:opaque").unwrap();
-    let revision_three = context
+    let cursor_three = context
         .store
         .append_timeline_batch(TimelineBatch {
+            batch_id: context.ids.next_timeline_batch_id(),
             run_id: run.id,
             source_namespace: "mock".into(),
             stream_id: "session/opaque".into(),
-            expected_stream_revision: revision_two,
+            expected_stream_revision: cursor_two,
             items: vec![NewTimelineItem {
                 id: context.ids.next_timeline_item_id(),
                 kind: "provider_event".into(),
@@ -637,10 +655,11 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
     let other_cursor = context
         .store
         .append_timeline_batch(TimelineBatch {
+            batch_id: context.ids.next_timeline_batch_id(),
             run_id: run.id,
             source_namespace: "other-provider".into(),
             stream_id: "other-stream".into(),
-            expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
+            expected_stream_revision: StreamCursor::INITIAL,
             items: vec![NewTimelineItem {
                 id: context.ids.next_timeline_item_id(),
                 kind: "message".into(),
@@ -650,8 +669,8 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         })
         .await
         .unwrap();
-    assert_eq!(revision_two.get(), 2);
-    assert_eq!(revision_three.get(), 3);
+    assert_eq!(cursor_two.get(), 2);
+    assert_eq!(cursor_three.get(), 3);
     assert_eq!(other_cursor.get(), 1);
     let timeline = context
         .store
@@ -663,6 +682,14 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         .await
         .unwrap();
     assert_eq!(timeline.items.len(), 4);
+    assert_eq!(
+        timeline
+            .items
+            .iter()
+            .map(|item| item.revision.get())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
     assert_eq!(timeline.items[2].provider_id.as_ref(), Some(&opaque));
 }
 
@@ -865,29 +892,36 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
         })
         .await
         .unwrap();
-    let cursor = store
-        .append_timeline_batch(TimelineBatch {
-            run_id: run.id,
-            source_namespace: "mock".into(),
-            stream_id: "restart-stream".into(),
-            expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
-            items: vec![
-                NewTimelineItem {
-                    id: ids.next_timeline_item_id(),
-                    kind: "message".into(),
-                    body: "one".into(),
-                    provider_id: None,
-                },
-                NewTimelineItem {
-                    id: ids.next_timeline_item_id(),
-                    kind: "message".into(),
-                    body: "two".into(),
-                    provider_id: None,
-                },
-            ],
-        })
-        .await
-        .unwrap();
+    let first_batch_id = ids.next_timeline_batch_id();
+    let restart_batch = TimelineBatch {
+        batch_id: first_batch_id,
+        run_id: run.id,
+        source_namespace: "mock".into(),
+        stream_id: "restart-stream".into(),
+        expected_stream_revision: StreamCursor::INITIAL,
+        items: vec![
+            NewTimelineItem {
+                id: ids.next_timeline_item_id(),
+                kind: "message".into(),
+                body: "one".into(),
+                provider_id: None,
+            },
+            NewTimelineItem {
+                id: ids.next_timeline_item_id(),
+                kind: "message".into(),
+                body: "two".into(),
+                provider_id: None,
+            },
+        ],
+    };
+    assert_eq!(
+        store
+            .append_timeline_batch(restart_batch.clone())
+            .await
+            .unwrap()
+            .get(),
+        2
+    );
     let pending = store
         .record_pending_approval(PendingApproval {
             id: ids.next_approval_request_id(),
@@ -974,13 +1008,46 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
         .unwrap();
     assert_eq!(first_page.items[0].body, "one");
     assert_eq!(second_page.items[0].body, "two");
+    let recovered_cursor = reopened
+        .get_stream_cursor(GetStreamCursor {
+            run_id: run.id,
+            source_namespace: "mock".into(),
+            stream_id: "restart-stream".into(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_cursor.cursor.get(), 2);
+    assert_eq!(recovered_cursor.last_batch_id, first_batch_id);
+    assert_eq!(
+        reopened
+            .append_timeline_batch(restart_batch)
+            .await
+            .unwrap()
+            .get(),
+        2
+    );
+    assert_eq!(
+        reopened
+            .list_timeline_page(ListTimeline {
+                run_id: run.id,
+                after: None,
+                limit: 10,
+            })
+            .await
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
     assert_eq!(
         reopened
             .append_timeline_batch(TimelineBatch {
+                batch_id: ids.next_timeline_batch_id(),
                 run_id: run.id,
                 source_namespace: "mock".into(),
                 stream_id: "restart-stream".into(),
-                expected_stream_revision: cursor,
+                expected_stream_revision: recovered_cursor.cursor,
                 items: vec![NewTimelineItem {
                     id: ids.next_timeline_item_id(),
                     kind: "message".into(),

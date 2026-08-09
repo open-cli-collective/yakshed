@@ -66,6 +66,10 @@ impl WorkItemId {
     pub fn new_v7() -> Self {
         Self(Uuid::now_v7())
     }
+
+    pub fn is_v7(self) -> bool {
+        self.0.get_version_num() == 7
+    }
 }
 
 impl From<Uuid> for WorkItemId {
@@ -110,6 +114,10 @@ pub struct RunId(Uuid);
 impl RunId {
     pub fn new_v7() -> Self {
         Self(Uuid::now_v7())
+    }
+
+    pub fn is_v7(self) -> bool {
+        self.0.get_version_num() == 7
     }
 }
 
@@ -305,6 +313,10 @@ macro_rules! uuid_id {
 }
 
 uuid_id!(ProjectId, "Stable identity of a YakShed project.");
+uuid_id!(
+    TimelineBatchId,
+    "Stable identity of a timeline ingestion batch."
+);
 uuid_id!(TimelineItemId, "Stable identity of a timeline item.");
 uuid_id!(ApprovalRequestId, "Stable identity of an approval request.");
 uuid_id!(AuditEventId, "Stable identity of an audit event.");
@@ -323,11 +335,27 @@ impl UtcTimestamp {
     }
 }
 
-/// Monotonic per-projection stream revision.
+/// Monotonic cursor for one provider-owned source stream.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProjectionRevision(u64);
+pub struct StreamCursor(u64);
 
-impl ProjectionRevision {
+impl StreamCursor {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Monotonic display ordinal within one run timeline.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TimelineRevision(u64);
+
+impl TimelineRevision {
     pub const INITIAL: Self = Self(0);
 
     pub const fn new(value: u64) -> Self {
@@ -430,7 +458,7 @@ pub struct RunSnapshot {
 pub struct TimelineItemSnapshot {
     pub id: TimelineItemId,
     pub run_id: RunId,
-    pub revision: ProjectionRevision,
+    pub revision: TimelineRevision,
     pub kind: String,
     pub body: String,
     pub provider_id: Option<NamespacedProviderId>,

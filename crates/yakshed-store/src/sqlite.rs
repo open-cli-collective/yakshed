@@ -14,13 +14,14 @@ use rusqlite_migration::{M, Migrations};
 use tokio::sync::oneshot;
 use yakshed_application::{
     AppStore, ApprovalPage, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateProject,
-    CreateRun, CreateWorkItem, ListTimeline, ListWorkItems, PendingApproval, ProjectPage, RunPage,
-    StoreError, TimelineBatch, TimelinePage, WorkItemPage,
+    CreateRun, CreateWorkItem, GetStreamCursor, ListTimeline, ListWorkItems, PendingApproval,
+    ProjectPage, RunPage, StoreError, StreamCursorState, TimelineBatch, TimelinePage, WorkItemPage,
 };
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, DataRevision,
-    NamespacedProviderId, ProjectId, ProjectSnapshot, ProjectionRevision, RunId, RunSnapshot,
-    RunStatus, TimelineItemSnapshot, UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus, StreamCursor,
+    TimelineBatchId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId,
+    WorkItemSnapshot, WorkItemStatus,
 };
 
 use crate::AppPaths;
@@ -105,7 +106,8 @@ CREATE TABLE projection_cursors (
     source_namespace TEXT NOT NULL,
     stream_id TEXT NOT NULL,
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-    revision INTEGER NOT NULL CHECK (revision >= 0),
+    cursor INTEGER NOT NULL CHECK (cursor >= 0),
+    last_batch_id TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     PRIMARY KEY (source_namespace, stream_id)
 );
@@ -584,6 +586,45 @@ fn list_approval_page(
     Ok(ApprovalPage { items, next_after })
 }
 
+struct PersistedStreamCursor {
+    run_id: RunId,
+    cursor: StreamCursor,
+    last_batch_id: TimelineBatchId,
+}
+
+fn find_stream_cursor(
+    connection: &Connection,
+    source_namespace: &str,
+    stream_id: &str,
+) -> Result<Option<PersistedStreamCursor>, StoreError> {
+    connection
+        .query_row(
+            "SELECT run_id, cursor, last_batch_id FROM projection_cursors
+             WHERE source_namespace = ?1 AND stream_id = ?2",
+            params![source_namespace, stream_id],
+            |row| {
+                let cursor = u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?;
+                let last_batch_id: TimelineBatchId = parse_column(row, 2)?;
+                if !last_batch_id.is_v7() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok(PersistedStreamCursor {
+                    run_id: parse_column(row, 0)?,
+                    cursor: StreamCursor::new(cursor),
+                    last_batch_id,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_database_error)
+}
+
 #[async_trait]
 impl AppStore for SqliteStore {
     async fn create_project(&self, command: CreateProject) -> Result<ProjectSnapshot, StoreError> {
@@ -977,7 +1018,8 @@ impl AppStore for SqliteStore {
     async fn append_timeline_batch(
         &self,
         batch: TimelineBatch,
-    ) -> Result<ProjectionRevision, StoreError> {
+    ) -> Result<StreamCursor, StoreError> {
+        validate_app_id("timeline batch id", batch.batch_id.is_v7())?;
         validate_text("projection source namespace", &batch.source_namespace)?;
         validate_text("projection stream id", &batch.stream_id)?;
         for item in &batch.items {
@@ -1007,24 +1049,24 @@ impl AppStore for SqliteStore {
             }
             let expected = i64::try_from(batch.expected_stream_revision.get())
                 .map_err(|error| StoreError::Conflict(error.to_string()))?;
-            let cursor: Option<(String, i64)> = transaction
-                .query_row(
-                    "SELECT run_id, revision FROM projection_cursors
-                     WHERE source_namespace = ?1 AND stream_id = ?2",
-                    params![batch.source_namespace, batch.stream_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(map_database_error)?;
+            let cursor =
+                find_stream_cursor(&transaction, &batch.source_namespace, &batch.stream_id)?;
             match cursor {
-                Some((run_id, _)) if run_id != batch.run_id.to_string() => {
+                Some(cursor) if cursor.run_id != batch.run_id => {
                     return Err(StoreError::Conflict(
                         "projection stream is already bound to a different run".to_owned(),
                     ));
                 }
-                Some((_, current)) if current != expected => {
+                Some(cursor)
+                    if cursor.last_batch_id == batch.batch_id
+                        && cursor.cursor.get() >= batch.expected_stream_revision.get() =>
+                {
+                    return Ok(cursor.cursor);
+                }
+                Some(cursor) if cursor.cursor.get() != batch.expected_stream_revision.get() => {
                     return Err(StoreError::Conflict(format!(
-                        "projection cursor conflict: expected {expected}, current {current}"
+                        "projection cursor conflict: expected {expected}, current {}",
+                        cursor.cursor.get()
                     )));
                 }
                 None if expected != 0 => {
@@ -1044,9 +1086,9 @@ impl AppStore for SqliteStore {
                 )
                 .map_err(map_database_error)?;
             for item in batch.items {
-                timeline_revision = timeline_revision.checked_add(1).ok_or_else(|| {
-                    StoreError::Conflict("projection revision overflow".to_owned())
-                })?;
+                timeline_revision = timeline_revision
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::Conflict("timeline revision overflow".to_owned()))?;
                 let (namespace, provider_item_id) =
                     item.provider_id.as_ref().map_or((None, None), |provider| {
                         (
@@ -1079,25 +1121,53 @@ impl AppStore for SqliteStore {
             transaction
                 .execute(
                     "INSERT INTO projection_cursors
-                     (source_namespace, stream_id, run_id, revision, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     (source_namespace, stream_id, run_id, cursor, last_batch_id, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(source_namespace, stream_id) DO UPDATE SET
-                         revision = excluded.revision,
+                         cursor = excluded.cursor,
+                         last_batch_id = excluded.last_batch_id,
                          updated_at_ms = excluded.updated_at_ms",
                     params![
                         batch.source_namespace,
                         batch.stream_id,
                         batch.run_id.to_string(),
                         stream_revision,
+                        batch.batch_id.to_string(),
                         now.unix_millis()
                     ],
                 )
                 .map_err(map_database_error)?;
             transaction.commit().map_err(map_database_error)?;
-            Ok(ProjectionRevision::new(
+            Ok(StreamCursor::new(
                 u64::try_from(stream_revision)
                     .map_err(|error| StoreError::Backend(error.to_string()))?,
             ))
+        })
+        .await
+    }
+
+    async fn get_stream_cursor(
+        &self,
+        query: GetStreamCursor,
+    ) -> Result<Option<StreamCursorState>, StoreError> {
+        validate_text("projection source namespace", &query.source_namespace)?;
+        validate_text("projection stream id", &query.stream_id)?;
+        self.call(move |worker| {
+            let cursor = find_stream_cursor(
+                &worker.connection,
+                &query.source_namespace,
+                &query.stream_id,
+            )?;
+            match cursor {
+                Some(cursor) if cursor.run_id != query.run_id => Err(StoreError::Conflict(
+                    "projection stream is bound to a different run".to_owned(),
+                )),
+                Some(cursor) => Ok(Some(StreamCursorState {
+                    cursor: cursor.cursor,
+                    last_batch_id: cursor.last_batch_id,
+                })),
+                None => Ok(None),
+            }
         })
         .await
     }
@@ -1131,7 +1201,7 @@ impl AppStore for SqliteStore {
                         Ok(TimelineItemSnapshot {
                             id: parse_column(row, 0)?,
                             run_id: parse_column(row, 1)?,
-                            revision: ProjectionRevision::new(u64::try_from(revision).map_err(
+                            revision: TimelineRevision::new(u64::try_from(revision).map_err(
                                 |error| {
                                     rusqlite::Error::FromSqlConversionFailure(
                                         2,
