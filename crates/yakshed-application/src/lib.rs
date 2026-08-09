@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, error::Error, fmt};
 
-use yakshed_domain::{Connection, ConnectionId, CredentialBinding, SecretBackend};
+use yakshed_domain::{Connection, ConnectionId, CredentialBinding, SecretBackend, SecretBackendId};
 
 /// Canonical non-secret application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -23,7 +23,7 @@ impl AppConfig {
             backend
                 .validate()
                 .map_err(|error| ConfigValidationError(error.to_string()))?;
-            if !backend_ids.insert(backend.id.as_str()) {
+            if !backend_ids.insert(&backend.id) {
                 return Err(ConfigValidationError(format!(
                     "duplicate secret backend id: {}",
                     backend.id
@@ -50,11 +50,12 @@ impl AppConfig {
                 )));
             }
             for credential in &connection.credentials {
-                if let CredentialBinding::Secret { backend, .. } = &credential.binding
-                    && !backend_ids.contains(backend.as_str())
+                if let CredentialBinding::Secret { reference } = &credential.binding
+                    && !backend_ids.contains(&reference.backend_id)
                 {
                     return Err(ConfigValidationError(format!(
-                        "credential references unknown secret backend: {backend}"
+                        "credential references unknown secret backend: {}",
+                        reference.backend_id
                     )));
                 }
             }
@@ -106,7 +107,7 @@ pub enum ConfigChange {
     PutConnection(Connection),
     RemoveConnection(ConnectionId),
     PutSecretBackend(SecretBackend),
-    RemoveSecretBackend(String),
+    RemoveSecretBackend(SecretBackendId),
     SetUiTheme(String),
     Reset,
 }

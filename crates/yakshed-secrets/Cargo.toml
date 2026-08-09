@@ -5,5 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-yakshed-application.workspace = true
+async-trait.workspace = true
+secrecy.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 yakshed-domain.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

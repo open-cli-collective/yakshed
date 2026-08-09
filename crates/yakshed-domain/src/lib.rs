@@ -71,7 +71,7 @@ impl CredentialBindingRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CredentialBinding {
     Delegated { authority: String },
-    Secret { backend: String, locator: String },
+    Secret { reference: SecretReference },
     Disabled,
 }
 
@@ -81,11 +81,7 @@ impl CredentialBinding {
             Self::Delegated { authority } => {
                 require_nonempty("delegated credential authority", authority)
             }
-            Self::Secret { backend, locator } => {
-                require_nonempty("secret credential backend", backend)?;
-                require_nonempty("secret credential locator", locator)
-            }
-            Self::Disabled => Ok(()),
+            Self::Secret { .. } | Self::Disabled => Ok(()),
         }
     }
 }
@@ -122,6 +118,28 @@ impl From<CredentialSlot> for String {
 }
 
 impl fmt::Display for CredentialSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Correlates one application operation without exposing provider wire IDs.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperationId(String);
+
+impl OperationId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        require_identifier("operation id", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OperationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
@@ -179,17 +197,107 @@ impl fmt::Display for ProviderStateRootId {
     }
 }
 
+/// Stable identity of a configured secret backend.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SecretBackendId(String);
+
+impl SecretBackendId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        require_identifier("secret backend id", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SecretBackendId {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<SecretBackendId> for String {
+    fn from(value: SecretBackendId) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for SecretBackendId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Opaque backend-owned locator with only universal safety validation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SecretLocator(String);
+
+impl SecretLocator {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        require_nonempty("secret locator", &value)?;
+        if value.len() > 4096 {
+            return Err(ValidationError(
+                "secret locator exceeds 4096 bytes".to_owned(),
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ValidationError(
+                "secret locator cannot contain control characters".to_owned(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SecretLocator {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<SecretLocator> for String {
+    fn from(value: SecretLocator) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for SecretLocator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// One normalized non-secret reference to backend-owned secret material.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SecretReference {
+    pub backend_id: SecretBackendId,
+    pub locator: SecretLocator,
+}
+
 /// Configuration for a secret-reference backend, never a secret value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretBackend {
-    pub id: String,
+    pub id: SecretBackendId,
     pub kind: String,
     pub account: Option<String>,
 }
 
 impl SecretBackend {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        require_nonempty("secret backend id", &self.id)?;
         require_nonempty("secret backend kind", &self.kind)
     }
 }
@@ -250,14 +358,7 @@ mod tests {
             .validate()
             .is_err()
         );
-        assert!(
-            CredentialBinding::Secret {
-                backend: "memory".to_owned(),
-                locator: String::new()
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(SecretLocator::new(String::new()).is_err());
     }
 
     #[test]
@@ -278,8 +379,10 @@ mod tests {
                 CredentialBindingRecord {
                     slot: CredentialSlot::new("codex.account").unwrap(),
                     binding: CredentialBinding::Secret {
-                        backend: "local-os".to_owned(),
-                        locator: "connection/work/codex_account".to_owned(),
+                        reference: SecretReference {
+                            backend_id: SecretBackendId::new("local-os").unwrap(),
+                            locator: SecretLocator::new("connection/work/codex_account").unwrap(),
+                        },
                     },
                 },
             ],
