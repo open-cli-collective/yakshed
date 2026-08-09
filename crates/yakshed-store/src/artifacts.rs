@@ -1,9 +1,12 @@
 use std::{
-    collections::{BTreeSet, HashSet},
-    fs::{self, File, OpenOptions},
+    collections::{BTreeSet, HashMap},
+    fs::{self, File, FileTimes, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -16,6 +19,25 @@ use yakshed_domain::{
 use crate::AppPaths;
 
 static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
+static NEXT_QUARANTINE_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct KeyedArtifactLocks {
+    locks: Mutex<HashMap<ContentDigest, Weak<Mutex<()>>>>,
+}
+
+impl KeyedArtifactLocks {
+    fn get(&self, digest: &ContentDigest) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(digest).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(digest.clone(), Arc::downgrade(&lock));
+        lock
+    }
+}
 
 /// Caller-owned metadata needed to publish one artifact body.
 pub struct ArtifactMetadata {
@@ -45,8 +67,10 @@ impl Clock for SystemClock {
 pub struct ArtifactStore<C = SystemClock> {
     sha256_root: PathBuf,
     staging_root: PathBuf,
+    quarantine_root: PathBuf,
     max_size: u64,
     clock: C,
+    locks: KeyedArtifactLocks,
 }
 
 impl ArtifactStore {
@@ -60,22 +84,31 @@ impl<C: Clock> ArtifactStore<C> {
         let artifacts_root = paths.data_root.join("artifacts");
         let sha256_root = artifacts_root.join("sha256");
         let staging_root = artifacts_root.join("staging");
+        let quarantine_root = artifacts_root.join("quarantine");
         for directory in [
             &paths.data_root,
             &artifacts_root,
             &sha256_root,
             &staging_root,
+            &quarantine_root,
         ] {
             create_private_directory(directory)?;
         }
         Ok(Self {
             sha256_root,
             staging_root,
+            quarantine_root,
             max_size,
             clock,
+            locks: KeyedArtifactLocks::default(),
         })
     }
 
+    /// Publishes a durable blob before returning its caller-committable metadata record.
+    ///
+    /// The destination directory entry is synced before return. Publication also renews
+    /// the blob's mtime lease; callers must commit the returned record within the grace
+    /// period supplied to garbage collection.
     pub fn publish(
         &self,
         mut source: impl Read,
@@ -116,21 +149,34 @@ impl<C: Clock> ArtifactStore<C> {
 
         let digest = digest_from_hasher(hasher);
         let destination = self.path_for_digest(&digest);
-        create_private_directory(destination.parent().expect("digest path has a parent"))?;
+        let shard = destination.parent().expect("digest path has a parent");
+        let digest_lock = self.locks.get(&digest);
+        let _guard = digest_lock.lock().unwrap();
+        create_private_directory(shard)?;
 
         if destination.try_exists()? {
-            self.verify(&digest)?;
-            fs::remove_file(&staging_path)?;
-        } else {
-            match fs::rename(&staging_path, &destination) {
-                Ok(()) => set_private_file_permissions(&destination)?,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    self.verify(&digest)?;
-                    fs::remove_file(&staging_path)?;
+            match self.verify_file(&digest) {
+                Ok(()) => fs::remove_file(&staging_path)?,
+                Err(ArtifactError::DigestMismatch { .. }) => {
+                    self.quarantine_corrupt(&digest, &destination)?;
+                    promote_staging(
+                        &staging_path,
+                        &destination,
+                        &self.sha256_root,
+                        sync_directory,
+                    )?;
                 }
-                Err(error) => return Err(ArtifactError::Io(error)),
+                Err(error) => return Err(error),
             }
+        } else {
+            promote_staging(
+                &staging_path,
+                &destination,
+                &self.sha256_root,
+                sync_directory,
+            )?;
         }
+        self.refresh_lease(&destination)?;
 
         Ok(ArtifactRecord {
             id: metadata.id,
@@ -163,6 +209,12 @@ impl<C: Clock> ArtifactStore<C> {
     }
 
     pub fn verify(&self, expected: &ContentDigest) -> Result<(), ArtifactError> {
+        let digest_lock = self.locks.get(expected);
+        let _guard = digest_lock.lock().unwrap();
+        self.verify_file(expected)
+    }
+
+    fn verify_file(&self, expected: &ContentDigest) -> Result<(), ArtifactError> {
         let mut file = self.open_file(expected)?;
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; 8192];
@@ -183,19 +235,51 @@ impl<C: Clock> ArtifactStore<C> {
         Ok(())
     }
 
+    /// Removes old unreferenced blobs while honoring publish's mtime lease.
+    ///
+    /// `grace` is also the metadata-commit lease: callers must commit a record within this
+    /// duration after `publish` returns. Age is re-read under the digest lock immediately
+    /// before deletion, so a concurrent successful publish renews the lease.
     pub fn collect_unreferenced(
         &self,
         referenced: &BTreeSet<ContentDigest>,
         grace: Duration,
     ) -> Result<usize, ArtifactError> {
         let now = self.clock.now();
-        let mut removed = collect_old_files(&self.staging_root, now, grace, &HashSet::new())?;
-        let referenced: HashSet<_> = referenced.iter().map(ContentDigest::as_str).collect();
+        let mut removed = collect_old_staging(&self.staging_root, now, grace)?;
 
         for shard in fs::read_dir(&self.sha256_root)? {
             let shard = shard?;
-            if shard.file_type()?.is_dir() {
-                removed += collect_old_files(&shard.path(), now, grace, &referenced)?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(shard.path())? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let Ok(digest) = entry.file_name().to_string_lossy().parse::<ContentDigest>()
+                else {
+                    continue;
+                };
+                if referenced.contains(&digest) {
+                    continue;
+                }
+                let digest_lock = self.locks.get(&digest);
+                let _guard = digest_lock.lock().unwrap();
+                let path = self.path_for_digest(&digest);
+                let metadata = match fs::metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(ArtifactError::Io(error)),
+                };
+                if now
+                    .duration_since(metadata.modified()?)
+                    .is_ok_and(|age| age >= grace)
+                {
+                    fs::remove_file(path)?;
+                    removed += 1;
+                }
             }
         }
         Ok(removed)
@@ -240,6 +324,38 @@ impl<C: Clock> ArtifactStore<C> {
             Err(error) => Err(ArtifactError::Io(error)),
         }
     }
+
+    fn refresh_lease(&self, path: &Path) -> Result<(), ArtifactError> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        file.set_times(FileTimes::new().set_modified(self.clock.now()))?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn quarantine_corrupt(
+        &self,
+        digest: &ContentDigest,
+        canonical: &Path,
+    ) -> Result<(), ArtifactError> {
+        loop {
+            let sequence = NEXT_QUARANTINE_FILE.fetch_add(1, Ordering::Relaxed);
+            let quarantine =
+                self.quarantine_root
+                    .join(format!("{}-{}-{sequence}", digest, std::process::id()));
+            if quarantine.try_exists()? {
+                continue;
+            }
+            match fs::rename(canonical, quarantine) {
+                Ok(()) => {
+                    sync_directory(&self.quarantine_root)?;
+                    sync_directory(canonical.parent().expect("digest path has a parent"))?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(ArtifactError::Io(error)),
+            }
+        }
+    }
 }
 
 /// Reader that cannot consume more bytes than the bound accepted by `ArtifactStore::open`.
@@ -253,20 +369,15 @@ impl Read for BoundedArtifactReader {
     }
 }
 
-fn collect_old_files(
+fn collect_old_staging(
     root: &Path,
     now: SystemTime,
     grace: Duration,
-    referenced: &HashSet<&str>,
 ) -> Result<usize, ArtifactError> {
     let mut removed = 0;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        if referenced.contains(name.to_string_lossy().as_ref()) {
             continue;
         }
         let modified = entry.metadata()?.modified()?;
@@ -276,6 +387,24 @@ fn collect_old_files(
         }
     }
     Ok(removed)
+}
+
+fn promote_staging(
+    staging: &Path,
+    destination: &Path,
+    sha256_root: &Path,
+    mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    fs::rename(staging, destination)?;
+    set_private_file_permissions(destination)?;
+    sync(destination.parent().expect("digest path has a parent"))?;
+    sync(sha256_root)?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 fn digest_from_hasher(hasher: Sha256) -> ContentDigest {
@@ -339,4 +468,39 @@ pub enum ArtifactError {
     InvalidInput(&'static str),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[test]
+    fn sync_directory_syncs_an_open_directory_handle() {
+        let temp = tempfile::tempdir().unwrap();
+
+        sync_directory(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn promotion_syncs_directory_entries_after_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let sha256_root = temp.path().join("sha256");
+        let shard = sha256_root.join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        let staging = temp.path().join("staging");
+        let destination = shard.join("abcdef");
+        fs::write(&staging, b"blob").unwrap();
+        let synced = RefCell::new(Vec::new());
+
+        promote_staging(&staging, &destination, &sha256_root, |directory| {
+            assert!(destination.exists(), "sync ran before rename");
+            synced.borrow_mut().push(directory.to_owned());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(*synced.borrow(), [shard, sha256_root]);
+    }
 }

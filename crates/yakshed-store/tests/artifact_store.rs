@@ -3,6 +3,8 @@ use std::{
     fs::{self, File, FileTimes},
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::{Arc, Barrier},
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -110,6 +112,122 @@ fn identical_content_is_deduplicated() {
 
     assert_eq!(first.digest, second.digest);
     assert_eq!(file_count(&paths.data_root.join("artifacts/sha256")), 1);
+}
+
+#[test]
+fn dedup_reuse_refreshes_mtime() {
+    let (_temp, paths, store) = fixture(1024);
+    let first = store
+        .publish(
+            &b"leased"[..],
+            metadata("0193f26e-7a72-7d42-bf77-0de14c4cc233"),
+        )
+        .unwrap();
+    let path = blob_path(&paths, &first.digest);
+    let old = SystemTime::now() - Duration::from_secs(7200);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old))
+        .unwrap();
+
+    store
+        .publish(
+            &b"leased"[..],
+            metadata("0193f26e-7a72-7d42-bf77-0de14c4cc234"),
+        )
+        .unwrap();
+
+    assert!(fs::metadata(path).unwrap().modified().unwrap() > old);
+}
+
+#[test]
+fn republishing_over_corrupt_blob_quarantines_and_repairs() {
+    let (_temp, paths, store) = fixture(1024);
+    let original = store
+        .publish(
+            &b"repairable"[..],
+            metadata("0193f26e-7a72-7d42-bf77-0de14c4cc235"),
+        )
+        .unwrap();
+    let canonical = blob_path(&paths, &original.digest);
+    fs::write(&canonical, b"corrupted!").unwrap();
+    let references = BTreeSet::from([original.digest.clone()]);
+    assert_eq!(
+        store
+            .collect_unreferenced(&references, Duration::ZERO)
+            .unwrap(),
+        0
+    );
+
+    let repaired = store
+        .publish(
+            &b"repairable"[..],
+            metadata("0193f26e-7a72-7d42-bf77-0de14c4cc236"),
+        )
+        .unwrap();
+
+    assert_eq!(repaired.digest, original.digest);
+    assert_eq!(fs::read(&canonical).unwrap(), b"repairable");
+    store.verify(&repaired.digest).unwrap();
+    let quarantined: Vec<_> = fs::read_dir(paths.data_root.join("artifacts/quarantine"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(fs::read(&quarantined[0]).unwrap(), b"corrupted!");
+    assert!(
+        quarantined[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(original.digest.as_str())
+    );
+}
+
+#[test]
+fn concurrent_republish_of_old_orphan_survives_collection() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let store = Arc::new(ArtifactStore::new(&paths, 1024).unwrap());
+    let record = store
+        .publish(
+            &b"raced"[..],
+            metadata("0193f26e-7a72-7d42-bf77-0de14c4cc237"),
+        )
+        .unwrap();
+    let path = blob_path(&paths, &record.digest);
+
+    for _ in 0..64 {
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old))
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let publisher = Arc::clone(&store);
+        let publish_barrier = Arc::clone(&barrier);
+        let publish = thread::spawn(move || {
+            publish_barrier.wait();
+            publisher.publish(
+                &b"raced"[..],
+                metadata("0193f26e-7a72-7d42-bf77-0de14c4cc238"),
+            )
+        });
+        let collector = Arc::clone(&store);
+        let collect = thread::spawn(move || {
+            barrier.wait();
+            collector.collect_unreferenced(&BTreeSet::new(), Duration::from_secs(3600))
+        });
+
+        publish.join().unwrap().unwrap();
+        collect.join().unwrap().unwrap();
+        assert!(path.exists());
+        store.verify(&record.digest).unwrap();
+    }
 }
 
 #[test]
@@ -305,6 +423,7 @@ fn artifact_files_and_directories_are_private() {
         paths.data_root.clone(),
         paths.data_root.join("artifacts"),
         paths.data_root.join("artifacts/staging"),
+        paths.data_root.join("artifacts/quarantine"),
         paths.data_root.join("artifacts/sha256"),
         blob_path(&paths, &record.digest)
             .parent()
