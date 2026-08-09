@@ -136,9 +136,19 @@ impl ProviderStateRootId {
     pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
         let value = value.into();
         require_identifier("provider state root id", &value)?;
-        if matches!(value.as_str(), "." | "..") {
+        if value != value.to_ascii_lowercase() {
+            return Err(ValidationError(
+                "provider state root id must already be lowercase".to_owned(),
+            ));
+        }
+        if matches!(value.as_str(), "." | "..") || value.ends_with(['.', ' ']) {
             return Err(ValidationError(
                 "provider state root id must be one safe path component".to_owned(),
+            ));
+        }
+        if is_windows_reserved_name(&value) {
+            return Err(ValidationError(
+                "provider state root id cannot be a Windows reserved device name".to_owned(),
             ));
         }
         Ok(Self(value))
@@ -204,6 +214,14 @@ fn require_identifier(field: &'static str, value: &str) -> Result<(), Validation
             "{field} may contain only ASCII letters, digits, '.', '-' and '_'"
         )))
     }
+}
+
+fn is_windows_reserved_name(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value);
+    matches!(stem, "con" | "prn" | "aux" | "nul")
+        || ((stem.starts_with("com") || stem.starts_with("lpt"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 /// A violated domain value invariant.
@@ -275,5 +293,15 @@ mod tests {
         assert!(ProviderStateRootId::new("").is_err());
         assert!(ProviderStateRootId::new("../shared-codex").is_err());
         assert!(ProviderStateRootId::new("work-codex").is_ok());
+        assert!(ProviderStateRootId::new("WORK-CODEX").is_err());
+        assert!(ProviderStateRootId::new("work.").is_err());
+        assert!(ProviderStateRootId::new("work ").is_err());
+        for reserved in [
+            "CON", "con.txt", "prn", "aux.log", "nul", "com1", "com9.txt", "lpt1", "lpt9.log",
+        ] {
+            assert!(ProviderStateRootId::new(reserved).is_err(), "{reserved}");
+        }
+        assert!(ProviderStateRootId::new("com0").is_ok());
+        assert!(ProviderStateRootId::new("com10").is_ok());
     }
 }
