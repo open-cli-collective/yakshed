@@ -1,0 +1,3 @@
+name: architecture
+description: Review agents for YakShed responsibility ownership, dependency seams, lifecycle boundaries, and evolutionary design.
+owner: yakshed

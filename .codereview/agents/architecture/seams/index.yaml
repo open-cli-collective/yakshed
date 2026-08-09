@@ -1,0 +1,22 @@
+name: seams
+description: Reviews YakShed changes for separation of concerns, dependency direction, source-of-truth ownership, provider isolation, recovery seams, and proportionate abstraction.
+model_tier: large
+effort: high
+file_globs:
+  - "Cargo.toml"
+  - "crates/**/Cargo.toml"
+  - "crates/yakshed-domain/**"
+  - "crates/yakshed-application/**"
+  - "crates/yakshed-store/**"
+  - "crates/yakshed-secrets/**"
+  - "crates/yakshed-harness/**"
+  - "crates/provider-*/**"
+  - "crates/yakshed-desktop-api/**"
+  - "src-tauri/src/**"
+  - "migrations/**"
+  - "docs/architecture/**"
+  - "docs/standards/**"
+applies_when:
+  - A change adds, removes, or moves a responsibility across layers; adds a durable concept; changes persistence or lifecycle ownership; introduces a provider/runtime/auth abstraction; or creates a pattern likely to compound across future work.
+  - Do not select for localized implementation, formatting, prompt-only, test-only, or narrow Tauri configuration changes when no architectural boundary changes.
+needs_full_file_content: true

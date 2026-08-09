@@ -1,0 +1,4 @@
+# Adapted for YakShed from open-cli-collective/codereview-cli.
+name: rust
+description: Review agents for Rust implementation correctness, concurrency, idioms, and behavioral test coverage.
+owner: yakshed

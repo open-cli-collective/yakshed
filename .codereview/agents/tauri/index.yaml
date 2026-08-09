@@ -1,0 +1,4 @@
+# Adapted for YakShed from open-cli-collective/codereview-cli.
+name: tauri
+description: Review agents for YakShed Tauri configuration, IPC, capabilities, and desktop security boundaries.
+owner: yakshed

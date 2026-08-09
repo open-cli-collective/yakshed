@@ -1,0 +1,24 @@
+# Rust
+/target/
+crates/**/target/
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# macOS
+.DS_Store
+
+# Editors / local agent state
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# Test scratch
+/tmp/
+*.log

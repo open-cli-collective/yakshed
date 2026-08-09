@@ -1,0 +1,1410 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+:root,[data-theme="og-light"]{
+  --bg:#FDFDFC; --panel:#F0F0EE; --panel2:#E7E7E4; --reader:#DEDEDA; --readerCard:#FFFFFF;
+  --edge:#DEDEDA; --edge2:#C3C3BC; --text:#1B1B19; --muted:#6E6E67; --faint:#9A9A92;
+  --sel:#DCDCD6; --hover:#E6E6E2; --code:#EFEFEC; --accent:oklch(0.52 0.15 264); --live:oklch(0.55 0.13 155);
+  --add:oklch(0.94 0.05 155); --addT:oklch(0.42 0.10 155); --del:oklch(0.94 0.04 24); --delT:oklch(0.46 0.12 24);
+  --ring:oklch(0.52 0.15 264 / 0.45);
+}
+[data-theme="og-dark"]{
+  --bg:#191A1D; --panel:#0D0E10; --panel2:#232529; --reader:#2A2D33; --readerCard:#1C1E21;
+  --edge:#2B2E33; --edge2:#41454D; --text:#EBEBE8; --muted:#9B9B94; --faint:#71716A;
+  --sel:#2E3238; --hover:#222427; --code:#232529; --accent:oklch(0.76 0.13 264); --live:oklch(0.78 0.14 155);
+  --add:oklch(0.30 0.06 155); --addT:oklch(0.84 0.12 155); --del:oklch(0.29 0.06 24); --delT:oklch(0.82 0.11 24);
+  --ring:oklch(0.76 0.13 264 / 0.5);
+}
+[data-theme="ledger-light"]{
+  --bg:#FBF8F1; --panel:#EEE8DA; --panel2:#E5DDCB; --reader:#DED5C0; --readerCard:#FFFDF8;
+  --edge:#DFD7C5; --edge2:#C1B69C; --text:#221E17; --muted:#6D6453; --faint:#9A9080;
+  --sel:#DED4BE; --hover:#E8E1D0; --code:#EFE9DA; --accent:oklch(0.48 0.11 52); --live:oklch(0.50 0.10 150);
+  --add:oklch(0.93 0.05 150); --addT:oklch(0.40 0.09 150); --del:oklch(0.92 0.05 30); --delT:oklch(0.46 0.13 30);
+  --ring:oklch(0.48 0.11 52 / 0.45);
+}
+[data-theme="ledger-dark"]{
+  --bg:#1B1813; --panel:#100E0A; --panel2:#252118; --reader:#2C271D; --readerCard:#1E1B15;
+  --edge:#2E291F; --edge2:#4A4234; --text:#EFE8D9; --muted:#A2977F; --faint:#786E5B;
+  --sel:#332C20; --hover:#241F17; --code:#241F17; --accent:oklch(0.79 0.11 68); --live:oklch(0.76 0.11 150);
+  --add:oklch(0.30 0.06 150); --addT:oklch(0.83 0.11 150); --del:oklch(0.30 0.07 30); --delT:oklch(0.81 0.12 30);
+  --ring:oklch(0.79 0.11 68 / 0.5);
+}
+[data-theme="mithril-light"]{
+  --bg:#FBFCFD; --panel:#EEF0F3; --panel2:#E4E7EC; --reader:#F1F3F6; --readerCard:#FFFFFF;
+  --edge:#E4E7EC; --edge2:#B9BFC8; --text:#1A1E22; --muted:#5B6470; --faint:#9AA1AC;
+  --sel:#E2ECFD; --hover:#EDF1F6; --code:#EEF0F3; --accent:#2563EB; --live:#1D7A3C;
+  --add:#E6F4EA; --addT:#135D2A; --del:#FDEAEC; --delT:#9A1D2B;
+  --ring:oklch(0.55 0.20 262 / 0.5);
+}
+[data-theme="mithril-dark"]{
+  --bg:#15181D; --panel:#101216; --panel2:#1D2027; --reader:#1D2027; --readerCard:#232730;
+  --edge:#232730; --edge2:#3A414B; --text:#D8DDE4; --muted:#8A929E; --faint:#5E6773;
+  --sel:#1E3A5F; --hover:#1A1E25; --code:#101216; --accent:#6EA8FF; --live:#6AD177;
+  --add:#16301C; --addT:#8EE29A; --del:#3A1C22; --delT:#FF8A96;
+  --ring:oklch(0.74 0.13 262 / 0.55);
+}
+[data-theme="basalt-light"]{
+  --bg:#FAFBFB; --panel:#E9EDEE; --panel2:#DEE3E5; --reader:#D4DADC; --readerCard:#FFFFFF;
+  --edge:#D8DEE0; --edge2:#B3BCBF; --text:#12181A; --muted:#5D686B; --faint:#8B9497;
+  --sel:#D2DADC; --hover:#E1E6E8; --code:#EAEEEF; --accent:oklch(0.50 0.10 210); --live:oklch(0.54 0.11 170);
+  --add:oklch(0.94 0.04 170); --addT:oklch(0.42 0.09 170); --del:oklch(0.94 0.04 18); --delT:oklch(0.47 0.13 18);
+  --ring:oklch(0.50 0.10 210 / 0.45);
+}
+[data-theme="basalt-dark"]{
+  --bg:#14181A; --panel:#090C0D; --panel2:#1E2325; --reader:#252B2E; --readerCard:#171B1D;
+  --edge:#262C2F; --edge2:#3D4548; --text:#E6ECEE; --muted:#939EA1; --faint:#6B7679;
+  --sel:#293034; --hover:#1D2224; --code:#1E2325; --accent:oklch(0.80 0.10 208); --live:oklch(0.80 0.12 170);
+  --add:oklch(0.29 0.05 170); --addT:oklch(0.84 0.11 170); --del:oklch(0.29 0.06 18); --delT:oklch(0.82 0.11 18);
+  --ring:oklch(0.80 0.10 208 / 0.5);
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;background:var(--bg)}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+textarea::placeholder{color:var(--faint)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--edge2);border-radius:9px}
+::-webkit-scrollbar-track{background:transparent}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.78)}}
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+@keyframes slidein{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+</style>
+</helmet>
+
+<div style="position:relative;display:flex;height:100vh;width:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:'Instrument Sans',system-ui,sans-serif;font-size:15px;-webkit-font-smoothing:antialiased">
+
+  <div onClick="{{ focusThreads }}" style="{{ sidebarStyle }}">
+    <div style="display:flex;align-items:center;gap:9px;padding:15px 15px 11px 15px">
+      <div style="width:19px;height:19px;border-radius:5px;background:var(--accent)"></div>
+      <div style="font-weight:600;letter-spacing:-0.01em;font-size:15.5px">harness</div>
+      <div style="flex:1"></div>
+      <div style="position:relative">
+        <div onClick="{{ toggleThemeMenu }}" title="Palette · t to cycle, d for light/dark" style="cursor:pointer;color:var(--muted);font-size:12px;font-family:'JetBrains Mono',monospace;padding:3px 7px;border:1px solid var(--edge2);border-radius:5px">{{ themeGlyph }}</div>
+        <sc-if value="{{ themeMenu }}" hint-placeholder-val="{{ false }}">
+          <div style="position:absolute;right:0;top:26px;z-index:45;width:216px;background:var(--bg);border:1px solid var(--edge2);border-radius:10px;box-shadow:0 18px 44px rgba(0,0,0,0.24);padding:6px">
+            <sc-for list="{{ themeList }}" as="th" hint-placeholder-count="3">
+              <div onClick="{{ th.pick }}" style="{{ th.style }}">
+                <div style="{{ th.swatch }}"></div>
+                <span style="flex:1">{{ th.name }}</span>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--faint)">{{ th.mark }}</span>
+              </div>
+            </sc-for>
+            <div onClick="{{ toggleTheme }}" style="display:flex;align-items:center;gap:8px;margin-top:4px;padding:7px 9px;border-top:1px solid var(--edge);cursor:pointer;font-size:13px;color:var(--muted)">
+              <span style="flex:1">{{ modeLabel }}</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--faint)">d</span>
+            </div>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <div style="padding:0 12px 10px 12px;display:flex;flex-direction:column;gap:6px">
+      <div style="display:flex;align-items:center;gap:9px;padding:7px 10px;background:var(--bg);border:1px solid var(--edge);border-radius:7px;color:var(--faint)">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:12px">/</span>
+        <span style="font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Search everything, archived too</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;font-weight:500;cursor:pointer" style-hover="background:var(--hover)">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--muted)">c</span>
+        <span style="white-space:nowrap">New task</span>
+        <span style="flex:1"></span>
+        <span style="font-size:12px;color:var(--faint);white-space:nowrap">⇧c yak</span>
+      </div>
+    </div>
+
+    <div style="flex:1;overflow-y:auto;overflow-x:hidden;padding:2px 8px 10px 8px">
+      <sc-for list="{{ sections }}" as="sec" hint-placeholder-count="3">
+        <div style="margin-top:13px">
+          <div style="display:flex;align-items:center;gap:8px;padding:4px 6px 6px 6px">
+            <span style="font-size:11.5px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600;white-space:nowrap">{{ sec.title }}</span>
+            <span style="font-size:11.5px;color:var(--faint);font-family:'JetBrains Mono',monospace">{{ sec.count }}</span>
+            <span style="flex:1;height:1px;background:var(--edge)"></span>
+          </div>
+          <sc-for list="{{ sec.items }}" as="row" hint-placeholder-count="4">
+            <div onClick="{{ row.open }}" style="{{ row.rowStyle }}" style-hover="background:var(--hover)">
+              <div onClick="{{ row.toggleSelect }}" style="{{ row.checkStyle }}">{{ row.checkGlyph }}</div>
+              <div onClick="{{ row.toggleFold }}" style="{{ row.foldStyle }}">{{ row.foldGlyph }}</div>
+              <div style="{{ row.dotStyle }}"></div>
+              <div style="flex:1;min-width:0">
+                <div style="{{ row.titleStyle }}">{{ row.title }}</div>
+                <div style="{{ row.subStyle }}">{{ row.sub }}</div>
+              </div>
+              <sc-for list="{{ row.chips }}" as="chip" hint-placeholder-count="0">
+                <div style="{{ chip.style }}">{{ chip.name }}</div>
+              </sc-for>
+            </div>
+          </sc-for>
+        </div>
+      </sc-for>
+
+      <div style="margin-top:18px">
+        <div style="display:flex;align-items:center;gap:8px;padding:4px 6px 6px 6px">
+          <span style="font-size:11.5px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600">Labels</span>
+          <span style="flex:1;height:1px;background:var(--edge)"></span>
+        </div>
+        <sc-for list="{{ labelList }}" as="lab" hint-placeholder-count="5">
+          <div style="display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:6px;cursor:pointer" style-hover="background:var(--hover)">
+            <span style="{{ lab.swatch }}"></span>
+            <span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ lab.name }}</span>
+            <span style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--faint)">{{ lab.count }}</span>
+          </div>
+        </sc-for>
+        <div onClick="{{ showArchive }}" style="display:flex;align-items:center;gap:10px;padding:8px;margin-top:6px;border-radius:6px;cursor:pointer;color:var(--muted)" style-hover="background:var(--hover)">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px">▤</span>
+          <span style="flex:1;white-space:nowrap">Archived</span>
+          <span style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--faint)">{{ archivedCount }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="position:relative;border-top:1px solid var(--edge);padding:10px 15px;display:flex;align-items:center;gap:10px;color:var(--muted)">
+      <div onClick="{{ toggleAcct }}" style="display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer;margin:-4px -6px;padding:4px 6px;border-radius:7px" style-hover="background:var(--hover)">
+        <div style="width:21px;height:21px;border-radius:50%;background:var(--panel2);border:1px solid var(--edge2);flex:0 0 21px;display:flex;align-items:center;justify-content:center;font-size:9.5px;font-weight:600;color:var(--muted)">RS</div>
+        <span style="color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Rian Stockbower</span>
+      </div>
+      <span onClick="{{ openKeys }}" title="Keys" style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:12px;border:1px solid var(--edge2);border-radius:4px;padding:1px 6px;flex:0 0 auto">?</span>
+      <sc-if value="{{ acctMenu }}" hint-placeholder-val="{{ false }}">
+        <div style="position:absolute;left:11px;bottom:46px;z-index:46;width:238px;background:var(--bg);border:1px solid var(--edge2);border-radius:10px;box-shadow:0 20px 48px rgba(0,0,0,0.26);padding:6px">
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 9px 10px 9px">
+            <div style="width:26px;height:26px;border-radius:50%;background:var(--panel2);border:1px solid var(--edge2);flex:0 0 26px;display:flex;align-items:center;justify-content:center;font-size:10.5px;font-weight:600;color:var(--muted)">RS</div>
+            <div style="min-width:0">
+              <div style="color:var(--text);font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Rian Stockbower</div>
+              <div style="font-size:12px;color:var(--faint)">@rianjs · Pro</div>
+            </div>
+          </div>
+          <div style="height:1px;background:var(--edge);margin:2px 0 4px 0"></div>
+          <sc-for list="{{ acctItems }}" as="a" hint-placeholder-count="4">
+            <div onClick="{{ a.go }}" style="display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:7px;cursor:pointer;font-size:13.5px;color:var(--text)" style-hover="background:var(--hover)">
+              <span style="flex:1">{{ a.name }}</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--faint)">{{ a.hint }}</span>
+            </div>
+          </sc-for>
+          <div style="padding:7px 9px 4px 9px;margin-top:3px;border-top:1px solid var(--edge);font-size:12.5px;color:var(--faint);line-height:1.5">{{ usageLine }}</div>
+        </div>
+      </sc-if>
+    </div>
+
+    <div onMouseDown="{{ startResize }}" title="Drag to resize" style="position:absolute;top:0;right:-3px;width:7px;height:100%;cursor:col-resize;z-index:15"></div>
+  </div>
+
+  <div ref="{{ centerRef }}" style="{{ centerStyle }}">
+    <div onClick="{{ focusThreads }}" style="display:flex;align-items:center;gap:11px;padding:12px 18px;border-bottom:1px solid var(--edge);flex-wrap:nowrap;overflow:hidden">
+      <sc-for list="{{ crumbs }}" as="cr" hint-placeholder-count="1">
+        <div style="display:flex;align-items:center;gap:10px;color:var(--muted);flex:0 1 auto;min-width:0">
+          <span onClick="{{ cr.open }}" style="cursor:pointer;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" style-hover="color:var(--text)">{{ cr.title }}</span>
+          <span style="color:var(--faint);font-size:12px">›</span>
+        </div>
+      </sc-for>
+      <div style="font-weight:600;letter-spacing:-0.01em;font-size:15.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;min-width:60px">{{ thread.title }}</div>
+      <sc-for list="{{ thread.chips }}" as="chip" hint-placeholder-count="2">
+        <div style="{{ chip.style }}">{{ chip.name }}</div>
+      </sc-for>
+      <div onClick="{{ toggleLabels }}" style="cursor:pointer;color:var(--faint);border:1px dashed var(--edge2);border-radius:20px;padding:2px 8px;font-size:12px;white-space:nowrap;flex:0 100 auto;min-width:0;overflow:hidden" style-hover="color:var(--text)">{{ labelChipText }}</div>
+      <div style="flex:1 1 4px;min-width:4px"></div>
+      <div style="{{ statusStyle }}">{{ statusText }}</div>
+      <div onClick="{{ archiveCurrent }}" style="cursor:pointer;color:var(--muted);padding:4px 9px;border-radius:6px;font-size:13.5px;white-space:nowrap;flex:0 0 auto" style-hover="background:var(--hover);color:var(--text)">{{ archiveText }}<span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--faint)">e</span></div>
+      <div onClick="{{ toggleRail }}" style="cursor:pointer;color:var(--muted);padding:4px 9px;border-radius:6px;font-size:13.5px;white-space:nowrap;flex:0 0 auto" style-hover="background:var(--hover);color:var(--text)">{{ todosText }}<span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--faint)">]</span></div>
+      <div onClick="{{ toggleReader }}" style="cursor:pointer;color:var(--muted);padding:4px 9px;border-radius:6px;font-size:13.5px;white-space:nowrap;flex:0 0 auto" style-hover="background:var(--hover);color:var(--text)">{{ readerText }}<span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--faint)">\</span></div>
+    </div>
+
+    <div style="flex:1;overflow-y:auto;padding:28px 0 8px 0">
+      <div style="max-width:740px;margin:0 auto;padding:0 30px;display:flex;flex-direction:column;gap:22px">
+        <sc-for list="{{ messages }}" as="m" hint-placeholder-count="5">
+          <div style="{{ m.wrapStyle }}">
+            <div style="{{ m.bodyStyle }}">
+              <sc-if value="{{ m.isMeta }}" hint-placeholder-val="{{ false }}">
+                <div style="display:flex;align-items:center;gap:10px;padding-bottom:3px">
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--muted)">{{ m.meta }}</span>
+                  <span style="flex:1;height:1px;background:var(--edge)"></span>
+                </div>
+              </sc-if>
+              <sc-if value="{{ m.isPlan }}" hint-placeholder-val="{{ false }}">
+                <div onClick="{{ m.openInReader }}" style="cursor:pointer;border:1px solid var(--edge);background:var(--panel);border-radius:10px;padding:13px 15px">
+                  <div style="color:var(--muted);font-size:12px;font-family:'JetBrains Mono',monospace">PLAN · click to read →</div>
+                  <div style="font-family:'Newsreader',Georgia,serif;font-size:21px;margin-top:7px">{{ m.title }}</div>
+                  <div style="color:var(--muted);margin-top:5px;line-height:1.55;-webkit-mask-image:linear-gradient(to bottom,#000 40%,transparent);max-height:46px;overflow:hidden">{{ m.text }}</div>
+                </div>
+              </sc-if>
+              <sc-if value="{{ m.isText }}" hint-placeholder-val="{{ true }}">
+                <div style="{{ m.textStyle }}">{{ m.text }}</div>
+              </sc-if>
+              <sc-for list="{{ m.bullets }}" as="b" hint-placeholder-count="0">
+                <div style="display:flex;gap:10px;margin-top:6px;line-height:1.62">
+                  <span style="color:var(--faint)">·</span>
+                  <span>{{ b }}</span>
+                </div>
+              </sc-for>
+              <sc-if value="{{ m.isFile }}" hint-placeholder-val="{{ false }}">
+                <div onClick="{{ m.openInReader }}" style="display:inline-flex;align-items:center;gap:9px;margin-top:10px;cursor:pointer;border:1px solid var(--edge);border-radius:7px;padding:7px 11px;background:var(--panel)" style-hover="border-color:var(--edge2)">
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent)">{{ m.fileKind }}</span>
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:13px">{{ m.fileName }}</span>
+                  <span style="color:var(--faint);font-size:12.5px">open in reader</span>
+                </div>
+              </sc-if>
+            </div>
+          </div>
+        </sc-for>
+
+        <sc-if value="{{ isWaiting }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;align-items:center;gap:11px;border:1px solid var(--edge2);border-left:2px solid var(--accent);background:var(--panel);border-radius:8px;padding:11px 14px">
+            <span style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--accent);white-space:nowrap">WAITING ON YOU</span>
+            <span style="color:var(--muted)">Sat here 41m — it needs an approval to continue.</span>
+          </div>
+        </sc-if>
+        <div style="height:8px"></div>
+      </div>
+    </div>
+
+    <div style="padding:0 30px 22px 30px">
+      <div style="position:relative;max-width:740px;margin:0 auto">
+        <div style="display:flex;align-items:center;gap:12px;padding:0 4px 9px 4px;overflow:hidden">
+          <div style="{{ clockDotStyle }}"></div>
+          <div style="display:flex;align-items:baseline;gap:7px;flex:0 0 auto">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:14px;letter-spacing:-0.01em;color:var(--text);white-space:nowrap">{{ clockOwn }}</span>
+            <span style="font-size:12.5px;color:var(--faint);white-space:nowrap">{{ clockOwnLabel }}</span>
+          </div>
+          <sc-if value="{{ hasYakTime }}" hint-placeholder-val="{{ false }}">
+            <div onClick="{{ toggleClock }}" style="display:flex;align-items:baseline;gap:7px;cursor:pointer;flex:0 1 auto;min-width:0;padding-left:12px;border-left:1px solid var(--edge)" style-hover="opacity:.75">
+              <span style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--accent);white-space:nowrap;flex:0 0 auto">{{ clockTotal }}</span>
+              <span style="font-size:12.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ clockTotalLabel }}</span>
+            </div>
+          </sc-if>
+          <div style="flex:1"></div>
+          <div style="position:relative;flex:0 0 auto">
+            <div onClick="{{ toggleLeash }}" title="What this yak is allowed to do — p" style="{{ leashChipStyle }}" style-hover="border-color:var(--edge2)">
+              <span style="{{ leashDotStyle }}"></span>
+              <span>{{ leashName }}</span>
+              <sc-if value="{{ leashInherited }}" hint-placeholder-val="{{ false }}">
+                <span style="color:var(--faint);font-size:12px">inherited</span>
+              </sc-if>
+            </div>
+          </div>
+          <div onClick="{{ toggleBig }}" title="Expand the composer" style="cursor:pointer;color:var(--muted);font-size:15px;line-height:1;padding:4px 7px;border:1px solid var(--edge);border-radius:6px;flex:0 0 auto" style-hover="color:var(--text);border-color:var(--edge2)">{{ bigGlyph }}</div>
+        </div>
+        <sc-if value="{{ leashMenu }}" hint-placeholder-val="{{ false }}">
+          <div style="position:absolute;right:4px;bottom:100%;margin-bottom:9px;z-index:44;width:330px;background:var(--bg);border:1px solid var(--edge2);border-radius:11px;box-shadow:0 22px 54px rgba(0,0,0,0.26);padding:7px">
+            <div style="padding:7px 10px 9px 10px;font-size:12.5px;color:var(--muted);line-height:1.5">{{ leashHeader }}</div>
+            <sc-for list="{{ leashOptions }}" as="o" hint-placeholder-count="3">
+              <div onClick="{{ o.pick }}" style="{{ o.style }}" style-hover="background:var(--hover)">
+                <span style="{{ o.dot }}"></span>
+                <div style="flex:1;min-width:0">
+                  <div style="{{ o.nameStyle }}">{{ o.name }}</div>
+                  <div style="font-size:12.5px;color:var(--muted);line-height:1.45;margin-top:2px">{{ o.sub }}</div>
+                </div>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent)">{{ o.mark }}</span>
+              </div>
+            </sc-for>
+            <div onClick="{{ resetLeash }}" style="{{ leashResetStyle }}" style-hover="color:var(--text)">{{ leashResetText }}</div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ clockOpen }}" hint-placeholder-val="{{ false }}">
+          <div style="border:1px solid var(--edge);background:var(--panel);border-radius:10px;padding:11px 14px;margin-bottom:10px">
+            <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600;margin-bottom:8px">Where the time went</div>
+            <sc-for list="{{ clockRows }}" as="c" hint-placeholder-count="3">
+              <div onClick="{{ c.open }}" style="{{ c.rowStyle }}" style-hover="background:var(--hover)">
+                <span style="{{ c.nameStyle }}">{{ c.name }}</span>
+                <span style="flex:1;height:1px;background:var(--edge)"></span>
+                <span style="{{ c.timeStyle }}">{{ c.time }}</span>
+              </div>
+            </sc-for>
+            <div style="margin-top:11px;padding-top:10px;border-top:1px solid var(--edge)">
+              <div style="display:flex;align-items:baseline;gap:9px">
+                <span style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600">Weekly budget</span>
+                <span style="flex:1"></span>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--text)">{{ usagePct }}</span>
+                <span style="font-size:12.5px;color:var(--faint);white-space:nowrap">{{ usageReset }}</span>
+              </div>
+              <div style="margin-top:7px;height:4px;border-radius:3px;background:var(--panel2);overflow:hidden">
+                <div style="{{ usageBarStyle }}"></div>
+              </div>
+              <div style="margin-top:7px;font-size:12.5px;color:var(--faint);line-height:1.5">{{ usageNote }}</div>
+            </div>
+          </div>
+        </sc-if>
+        <div style="{{ composerStyle }}">
+          <sc-if value="{{ codeMode }}" hint-placeholder-val="{{ false }}">
+            <div style="display:flex;align-items:center;gap:9px;padding:0 2px 8px 2px;color:var(--muted)">
+              <span style="font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--code);border:1px solid var(--edge);border-radius:4px;padding:1px 6px">```{{ codeLang }}</span>
+              <span style="font-size:12.5px">code block — ⇧⏎ newline, ⏎ sends</span>
+            </div>
+          </sc-if>
+          <textarea onInput="{{ onDraft }}" onChange="{{ onDraft }}" onKeyDown="{{ onComposerKey }}" value="{{ draft }}" onFocus="{{ focusThreads }}" placeholder="{{ composerPlaceholder }}" style="{{ inputStyle }}"></textarea>
+          <div style="display:flex;align-items:center;gap:11px;padding-top:9px;color:var(--muted);font-size:13px">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:12px;border:1px solid var(--edge2);border-radius:5px;padding:1px 7px;white-space:nowrap">{{ sendHint }}</span>
+            <span style="white-space:nowrap">{{ thread.model }}</span>
+            <span style="flex:1"></span>
+            <span style="font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ composerFoot }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <sc-if value="{{ railOpen }}" hint-placeholder-val="{{ true }}">
+    <div onClick="{{ focusTodos }}" style="{{ railStyle }}">
+      <div style="padding:14px 16px 9px 16px;display:flex;align-items:center;gap:9px">
+        <span style="font-size:11.5px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600">Todo</span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--faint)">{{ todoCount }}</span>
+        <span style="flex:1"></span>
+        <span style="{{ zoneBadgeStyle }}">{{ zoneBadge }}</span>
+      </div>
+
+      <div style="padding:0 10px">
+        <sc-for list="{{ todos }}" as="t" hint-placeholder-count="4">
+          <div onClick="{{ t.focus }}" style="{{ t.rowStyle }}" style-hover="background:var(--hover)">
+            <div onClick="{{ t.togglePick }}" style="{{ t.pickStyle }}">{{ t.pickGlyph }}</div>
+            <div onClick="{{ t.toggle }}" style="{{ t.boxStyle }}">{{ t.glyph }}</div>
+            <div style="flex:1;min-width:0">
+              <div style="{{ t.textStyle }}">{{ t.text }}</div>
+              <sc-if value="{{ t.hasNote }}" hint-placeholder-val="{{ false }}">
+                <div style="{{ t.noteStyle }}">{{ t.note }}</div>
+              </sc-if>
+            </div>
+          </div>
+        </sc-for>
+        <sc-if value="{{ todosEmpty }}" hint-placeholder-val="{{ false }}">
+          <div style="padding:8px 8px 4px 8px;color:var(--faint);font-size:13.5px;line-height:1.5">Nothing here — this yak doesn't need a list. Start typing if it does.</div>
+        </sc-if>
+      </div>
+
+      <div style="padding:8px 10px 0 10px">
+        <div style="{{ todoInputWrapStyle }}">
+          <textarea onInput="{{ onTodoDraft }}" onChange="{{ onTodoDraft }}" onKeyDown="{{ onTodoKey }}" onFocus="{{ focusTodos }}" ref="{{ todoRef }}" value="{{ todoDraft }}" placeholder="Add a todo — ⏎ for the next one" style="{{ todoInputStyle }}"></textarea>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:5px 10px;padding:8px 4px 0 4px;color:var(--faint);font-size:12px">
+          <span>⏎ next item</span>
+          <span>⇧⏎ freeform under it</span>
+          <span style="{{ sendHintStyle }}">⌘⏎ send list to the agent</span>
+        </div>
+      </div>
+
+      <div style="height:1px;background:var(--edge);margin:16px 16px"></div>
+      <div style="padding:0 16px 9px 16px;display:flex;align-items:center;gap:9px">
+        <span style="font-size:11.5px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600">Notes</span>
+        <span style="flex:1"></span>
+        <span onClick="{{ toggleNotesEdit }}" style="cursor:pointer;font-size:12.5px;color:var(--muted)" style-hover="color:var(--text)">{{ notesAction }}</span>
+      </div>
+      <div style="padding:0 16px 26px 16px">
+        <sc-if value="{{ notesEditing }}" hint-placeholder-val="{{ false }}">
+          <textarea onInput="{{ onNotes }}" onChange="{{ onNotes }}" value="{{ notesRaw }}" placeholder="Markdown. ## headings, - bullets." style="width:100%;min-height:150px;resize:vertical;background:var(--code);color:var(--text);border:1px solid var(--edge2);border-radius:8px;padding:11px 12px;outline:none;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.6"></textarea>
+        </sc-if>
+        <sc-if value="{{ notesReading }}" hint-placeholder-val="{{ true }}">
+          <div onClick="{{ toggleNotesEdit }}" style="cursor:text">
+            <sc-for list="{{ noteBlocks }}" as="n" hint-placeholder-count="4">
+              <div style="{{ n.style }}">{{ n.text }}</div>
+            </sc-for>
+            <sc-if value="{{ notesEmpty }}" hint-placeholder-val="{{ false }}">
+              <div style="color:var(--faint);font-size:13.5px;line-height:1.5">No notes on this one. Click to write some.</div>
+            </sc-if>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ readerOpen }}" hint-placeholder-val="{{ true }}">
+    <div style="{{ readerStyle }}">
+      <div style="display:flex;align-items:center;gap:2px;padding:9px 11px 0 11px">
+        <sc-for list="{{ readerTabs }}" as="tab" hint-placeholder-count="2">
+          <div onClick="{{ tab.open }}" style="{{ tab.style }}">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent)">{{ tab.kind }}</span>
+            <span>{{ tab.name }}</span>
+          </div>
+        </sc-for>
+        <div style="flex:1"></div>
+        <div onClick="{{ toggleReader }}" style="cursor:pointer;color:var(--muted);padding:5px 9px;font-size:13.5px" style-hover="color:var(--text)">close \</div>
+      </div>
+      <div style="flex:1;overflow-y:auto;padding:15px 13px 32px 13px">
+        <div style="background:var(--readerCard);border:1px solid var(--edge);border-radius:10px;padding:28px 32px">
+          <sc-for list="{{ readerBlocks }}" as="b" hint-placeholder-count="8">
+            <div style="{{ b.style }}">{{ b.text }}</div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ showLabels }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;left:310px;top:56px;z-index:40;width:272px;background:var(--bg);border:1px solid var(--edge2);border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,0.22);padding:8px">
+      <div style="padding:6px 9px 9px 9px;color:var(--muted);font-size:12.5px">Label <span style="color:var(--text)">{{ labelTargetText }}</span> — children inherit</div>
+      <sc-for list="{{ labelList }}" as="lab" hint-placeholder-count="5">
+        <div onClick="{{ lab.toggle }}" style="display:flex;align-items:center;gap:10px;padding:7px 9px;border-radius:6px;cursor:pointer" style-hover="background:var(--hover)">
+          <span style="{{ lab.swatch }}"></span>
+          <span style="flex:1">{{ lab.name }}</span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent)">{{ lab.mark }}</span>
+        </div>
+      </sc-for>
+      <div style="display:flex;align-items:center;gap:9px;padding:8px 9px;margin-top:4px;border-top:1px solid var(--edge);color:var(--faint);font-size:13px">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:12px">↵</span> create new label
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:50;display:flex;align-items:center;gap:15px;background:var(--text);color:var(--bg);border-radius:9px;padding:11px 17px;box-shadow:0 16px 38px rgba(0,0,0,0.28);font-size:13.5px;max-width:640px">
+      <span>{{ toast }}</span>
+      <span onClick="{{ undo }}" style="cursor:pointer;text-decoration:underline;opacity:.75;white-space:nowrap">Undo · z</span>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ settingsOpen }}" hint-placeholder-val="{{ false }}">
+    <div onClick="{{ closeSettings }}" style="position:fixed;inset:0;z-index:60;background:rgba(10,11,14,0.44);display:flex;align-items:center;justify-content:center;padding:38px;animation:fadein .12s ease-out">
+      <div onClick="{{ stop }}" style="width:min(960px,100%);height:min(680px,100%);display:flex;background:var(--bg);border:1px solid var(--edge2);border-radius:14px;box-shadow:0 40px 92px rgba(0,0,0,0.42);overflow:hidden">
+
+        <div style="width:206px;flex:0 0 206px;background:var(--panel);border-right:1px solid var(--edge);display:flex;flex-direction:column;padding:14px 10px">
+          <div style="padding:2px 8px 12px 8px;font-size:11.5px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600">Settings</div>
+          <sc-for list="{{ settingsNav }}" as="n" hint-placeholder-count="5">
+            <div onClick="{{ n.go }}" style="{{ n.style }}" style-hover="background:var(--hover)">{{ n.name }}</div>
+          </sc-for>
+          <div style="flex:1"></div>
+          <div style="padding:9px 8px;color:var(--faint);font-size:12.5px;line-height:1.5">This is a layer, not a place. <span style="color:var(--muted)">esc</span> puts it away — nothing behind it moved.</div>
+        </div>
+
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+          <div style="display:flex;align-items:baseline;gap:12px;padding:20px 26px 14px 26px;border-bottom:1px solid var(--edge)">
+            <div style="font-family:'Newsreader',Georgia,serif;font-size:23px">{{ settingsTitle }}</div>
+            <div style="flex:1"></div>
+            <div onClick="{{ closeSettings }}" style="cursor:pointer;color:var(--muted);font-size:13px;display:flex;align-items:center;gap:8px" style-hover="color:var(--text)">Close <span style="font-family:'JetBrains Mono',monospace;font-size:11.5px;border:1px solid var(--edge2);border-radius:4px;padding:1px 6px">esc</span></div>
+          </div>
+          <div style="flex:1;overflow-y:auto;padding:22px 26px 30px 26px">
+
+            <sc-if value="{{ isGeneral }}" hint-placeholder-val="{{ false }}">
+              <div>
+                <sc-for list="{{ generalRows }}" as="g" hint-placeholder-count="5">
+                  <div style="display:flex;align-items:center;gap:20px;padding:13px 2px;border-bottom:1px solid var(--edge)">
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:14px">{{ g.name }}</div>
+                      <div style="font-size:13px;color:var(--muted);line-height:1.5;margin-top:2px">{{ g.sub }}</div>
+                    </div>
+                    <sc-if value="{{ g.isToggle }}" hint-placeholder-val="{{ true }}">
+                      <div onClick="{{ g.toggle }}" style="{{ g.trackStyle }}"><div style="{{ g.knobStyle }}"></div></div>
+                    </sc-if>
+                    <sc-if value="{{ g.isChoice }}" hint-placeholder-val="{{ false }}">
+                      <div style="display:flex;gap:3px;background:var(--panel2);border-radius:7px;padding:3px;flex:0 0 auto">
+                        <sc-for list="{{ g.options }}" as="o" hint-placeholder-count="2">
+                          <div onClick="{{ o.pick }}" style="{{ o.style }}">{{ o.name }}</div>
+                        </sc-for>
+                      </div>
+                    </sc-if>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ isAppearance }}" hint-placeholder-val="{{ false }}">
+              <div>
+                <div style="display:flex;align-items:center;gap:20px;padding:0 2px 15px 2px;border-bottom:1px solid var(--edge)">
+                  <div style="flex:1">
+                    <div style="font-size:14px">Mode</div>
+                    <div style="font-size:13px;color:var(--muted);margin-top:2px">Follows your system at launch. <span style="font-family:'JetBrains Mono',monospace;font-size:12px">d</span> flips it anywhere.</div>
+                  </div>
+                  <div style="display:flex;gap:3px;background:var(--panel2);border-radius:7px;padding:3px">
+                    <sc-for list="{{ modeOptions }}" as="o" hint-placeholder-count="2">
+                      <div onClick="{{ o.pick }}" style="{{ o.style }}">{{ o.name }}</div>
+                    </sc-for>
+                  </div>
+                </div>
+                <div style="padding:18px 2px 10px 2px;font-size:14px">Palette</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:11px">
+                  <sc-for list="{{ paletteCards }}" as="p" hint-placeholder-count="4">
+                    <div onClick="{{ p.pick }}" style="{{ p.style }}" style-hover="border-color:var(--edge2)">
+                      <div style="display:flex;gap:0;height:38px;border-radius:7px;overflow:hidden;border:1px solid var(--edge)">
+                        <div style="{{ p.sw1 }}"></div>
+                        <div style="{{ p.sw2 }}"></div>
+                        <div style="{{ p.sw3 }}"></div>
+                        <div style="{{ p.sw4 }}"></div>
+                      </div>
+                      <div style="display:flex;align-items:baseline;gap:8px;margin-top:9px">
+                        <span style="font-size:13.5px">{{ p.name }}</span>
+                        <span style="flex:1"></span>
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent)">{{ p.mark }}</span>
+                      </div>
+                      <div style="font-size:12.5px;color:var(--muted);line-height:1.45;margin-top:3px">{{ p.sub }}</div>
+                    </div>
+                  </sc-for>
+                </div>
+                <div style="margin-top:14px;font-size:12.5px;color:var(--faint);line-height:1.55">Palettes are token sets, not skins — every surface, border and status colour has a counterpart in both modes. <span style="font-family:'JetBrains Mono',monospace;font-size:12px">t</span> cycles them without opening this.</div>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ isPermissions }}" hint-placeholder-val="{{ false }}">
+              <div>
+                <div style="font-size:13.5px;color:var(--muted);line-height:1.6;max-width:600px">A leash belongs to a thread, not to the app. New top-level threads start here; every yak inherits its parent until you say otherwise — the same way labels work.</div>
+                <div style="padding:20px 2px 10px 2px;font-size:14px">New top-level threads start at</div>
+                <div style="display:flex;flex-direction:column;gap:9px">
+                  <sc-for list="{{ defaultLeashOptions }}" as="o" hint-placeholder-count="3">
+                    <div onClick="{{ o.pick }}" style="{{ o.cardStyle }}" style-hover="border-color:var(--edge2)">
+                      <span style="{{ o.dot }}"></span>
+                      <div style="flex:1;min-width:0">
+                        <div style="{{ o.nameStyle }}">{{ o.name }}</div>
+                        <div style="font-size:12.5px;color:var(--muted);line-height:1.45;margin-top:2px">{{ o.sub }}</div>
+                      </div>
+                      <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent)">{{ o.mark }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+                <div style="padding:24px 2px 4px 2px;font-size:14px">Threads that set their own</div>
+                <div style="font-size:12.5px;color:var(--muted);padding:0 2px 10px 2px">{{ overrideSummary }}</div>
+                <sc-for list="{{ overrideRows }}" as="o" hint-placeholder-count="0">
+                  <div style="display:flex;align-items:center;gap:12px;padding:11px 2px;border-bottom:1px solid var(--edge)">
+                    <span style="{{ o.dot }}"></span>
+                    <span onClick="{{ o.open }}" style="cursor:pointer;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" style-hover="color:var(--accent)">{{ o.title }}</span>
+                    <span style="font-size:12.5px;color:var(--muted);white-space:nowrap">{{ o.detail }}</span>
+                    <span style="flex:1"></span>
+                    <span onClick="{{ o.clear }}" style="cursor:pointer;font-size:12.5px;color:var(--faint)" style-hover="color:var(--text)">clear</span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ isKeys }}" hint-placeholder-val="{{ false }}">
+              <div>
+                <div style="font-size:13.5px;color:var(--muted);line-height:1.6;max-width:600px;margin-bottom:18px">Gmail muscle memory, pointed at agent sessions. Tab moves between the thread list and the todo list.</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 30px">
+                  <sc-for list="{{ keys }}" as="k" hint-placeholder-count="12">
+                    <div style="display:flex;align-items:baseline;gap:11px;border-bottom:1px solid var(--edge);padding-bottom:8px">
+                      <span style="font-family:'JetBrains Mono',monospace;font-size:12.5px;border:1px solid var(--edge2);border-radius:5px;padding:1px 7px;white-space:nowrap">{{ k.k }}</span>
+                      <span style="color:var(--muted);font-size:13px">{{ k.d }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ isAccount }}" hint-placeholder-val="{{ false }}">
+              <div>
+                <div style="display:flex;align-items:center;gap:15px">
+                  <div style="width:54px;height:54px;border-radius:50%;background:var(--panel2);border:1px solid var(--edge2);flex:0 0 54px;display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:600;color:var(--muted)">RS</div>
+                  <div>
+                    <div style="font-family:'Newsreader',Georgia,serif;font-size:22px">Rian Stockbower</div>
+                    <div style="font-size:13px;color:var(--muted);margin-top:2px">@rianjs · Pro · {{ planLine }}</div>
+                  </div>
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--edge);border:1px solid var(--edge);border-radius:10px;overflow:hidden;margin-top:20px">
+                  <sc-for list="{{ stats }}" as="s" hint-placeholder-count="4">
+                    <div style="background:var(--bg);padding:13px 15px">
+                      <div style="font-family:'JetBrains Mono',monospace;font-size:17px;letter-spacing:-0.01em">{{ s.v }}</div>
+                      <div style="font-size:12.5px;color:var(--muted);margin-top:3px">{{ s.k }}</div>
+                    </div>
+                  </sc-for>
+                </div>
+                <div style="display:flex;align-items:baseline;gap:10px;margin:24px 0 9px 0">
+                  <span style="font-size:14px">Agent hours</span>
+                  <span style="font-size:12.5px;color:var(--faint)">last 40 weeks, by day</span>
+                </div>
+                <div style="display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,9px);gap:3px;overflow:hidden">
+                  <sc-for list="{{ grid }}" as="c" hint-placeholder-count="0">
+                    <div style="{{ c.style }}"></div>
+                  </sc-for>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:34px;margin-top:26px">
+                  <div>
+                    <div style="font-size:14px;margin-bottom:8px">Where the year went</div>
+                    <sc-for list="{{ topYaks }}" as="y" hint-placeholder-count="4">
+                      <div style="display:flex;align-items:baseline;gap:10px;padding:7px 0;border-bottom:1px solid var(--edge)">
+                        <span style="font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ y.name }}</span>
+                        <span style="flex:1"></span>
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--muted)">{{ y.v }}</span>
+                      </div>
+                    </sc-for>
+                  </div>
+                  <div>
+                    <div style="font-size:14px;margin-bottom:8px">Habits</div>
+                    <sc-for list="{{ habits }}" as="h" hint-placeholder-count="4">
+                      <div style="display:flex;align-items:baseline;gap:10px;padding:7px 0;border-bottom:1px solid var(--edge)">
+                        <span style="font-size:13.5px">{{ h.name }}</span>
+                        <span style="flex:1"></span>
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--muted)">{{ h.v }}</span>
+                      </div>
+                    </sc-for>
+                  </div>
+                </div>
+                <div style="margin-top:26px;font-size:12.5px;color:var(--faint);line-height:1.55">Billing lives on the web. Usage against your weekly budget sits on the clock above the composer, where you are already looking at time.</div>
+              </div>
+            </sc-if>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{}">
+class Component extends DCLogic {
+  LABELS = [
+    { id: 'infosec', name: 'infosec', hue: 264 },
+    { id: 'devserver', name: 'devserver', hue: 155 },
+    { id: 'q3', name: 'q3-commit', hue: 40 },
+    { id: 'research', name: 'research', hue: 320 },
+    { id: 'chore', name: 'chore', hue: 210 }
+  ];
+
+  THREADS = [
+    { id: 'infosec', parent: null, title: 'Find 2026 infosec signoff gaps', state: 'waiting', unread: true, labels: ['infosec', 'q3'], sub: 'needs approval to read Confluence · 41m', model: '5.6 Luna Max' },
+    { id: 'scan', parent: 'infosec', title: 'cloud-container-scanning', state: 'active', unread: false, labels: [], sub: 'working 1m 9s', model: '5.6 Luna Max' },
+    { id: 'slack', parent: 'infosec', title: 'slack-administrivia', state: 'idle', unread: true, labels: ['chore'], sub: 'finished · 3 files changed', model: '5.6 Sol' },
+    { id: 'migrate', parent: null, title: 'migrate-q2-devserver-cli', state: 'active', unread: false, labels: ['devserver', 'q3'], sub: 'working 4m 12s · 2 yaks open', model: '5.6 Sol High' },
+    { id: 'mcp', parent: 'migrate', title: 'harness-eng-desktop-mcp', state: 'waiting', unread: true, labels: [], sub: 'asked you a question · 6m', model: '5.6 Sol' },
+    { id: 'patterns', parent: 'migrate', title: 'devserver-patterns-true-up', state: 'idle', unread: false, labels: [], sub: 'plan ready to review', model: '5.6 Sol' },
+    { id: 'csv', parent: 'patterns', title: 'locations-in-csv-exports', state: 'idle', unread: false, labels: [], sub: 'yak of a yak · 1 file left', model: '5.6 Sol' },
+    { id: 'socket', parent: 'migrate', title: 'darwin-socket-path', state: 'idle', unread: false, labels: [], sub: 'closed loop', model: '5.6 Sol' },
+    { id: 'bai', parent: null, title: 'bai-location-data-centralbanc', state: 'idle', unread: false, labels: ['research'], sub: '72,598 rows mapped · yesterday', model: '5.6 Sol High' }
+  ];
+
+  TRANSCRIPTS = {
+    migrate: [
+      { kind: 'user', text: 'Move the devserver CLI off the Q2 shim. Anything that turns into its own rabbit hole, spawn a yak \u2014 don\u2019t inline it here.' },
+      { kind: 'meta', meta: 'Worked for 2m 04s  \u203a  14 files read, 3 written' },
+      { kind: 'agent', text: 'The shim only leaks in two places: argument parsing and the region lookup. Parsing is a contained rename. The region lookup is not \u2014 it reaches into the CSV export path, so I opened that as a yak rather than dragging it in here.' },
+      { kind: 'agent', text: 'Three yaks hang off this thread and inherit devserver and q3-commit:', bullets: ['harness-eng-desktop-mcp \u2014 waiting on you, the MCP socket name changed', 'devserver-patterns-true-up \u2014 plan ready, spawned locations-in-csv-exports beneath it', 'darwin-socket-path \u2014 closed, archived out of the way'] },
+      { kind: 'plan', title: 'Retire the Q2 devserver shim', text: 'Replace shim-owned arg parsing with the native parser, keep the region lookup behind its current interface until the CSV yak lands, then delete the shim module in one commit so bisect stays clean.' },
+      { kind: 'user', text: 'Good. Land parsing now, hold the lookup until the yak closes.' },
+      { kind: 'meta', meta: 'Worked for 4m 12s' },
+      { kind: 'agent', text: 'Parsing is migrated and the suite is green. Diff is in the reader \u2014 the shim delete is staged but not committed, since it would break the two open yaks.', file: 'cli.rs', fileKind: 'DIFF', tab: 1 }
+    ],
+    infosec: [
+      { kind: 'user', text: 'What is outstanding on the 2026 infosec calendar signoff?' },
+      { kind: 'meta', meta: 'Worked for 1m 09s' },
+      { kind: 'agent', text: 'I can reach the signoff page but the quarterly attestation child pages are in a restricted space. Approving the read once will let me trace every linked action item and owner.' },
+      { kind: 'agent', text: 'Approve the Confluence read for INFOSEC, or should I work from the exported PDF you dropped last week instead?' }
+    ],
+    fallback: [
+      { kind: 'user', text: 'Pick this back up where we left it.' },
+      { kind: 'meta', meta: 'Worked for 44s' },
+      { kind: 'agent', text: 'Loop is closed on my side \u2014 nothing pending. Archiving keeps it out of your way and it stays fully readable and searchable; nothing moves off disk, nothing needs unarchiving to reference.' }
+    ]
+  };
+
+  SEED_TODOS = {
+    migrate: [
+      { id: 1, text: 'Native arg parser replaces shim parsing', done: true, note: '' },
+      { id: 2, text: 'Suite green on linux + darwin', done: true, note: '' },
+      { id: 3, text: 'Hold shim delete until CSV yak closes', done: false, note: 'It is load-bearing for two open yaks.\nOne commit, so a bisect never lands mid-migration.' },
+      { id: 4, text: 'Answer the MCP socket-name question', done: false, note: '' },
+      { id: 5, text: 'Re-run the two internal scripts using -w', done: false, note: '' }
+    ],
+    infosec: [
+      { id: 1, text: 'Approve restricted-space read', done: false, note: '' },
+      { id: 2, text: 'Trace owners per quarterly attestation', done: false, note: '' },
+      { id: 3, text: 'Flag schedule mismatches vs 2025', done: false, note: '' }
+    ]
+  };
+
+  SEED_NOTES = {
+    migrate: '## Why this is open\nThe shim delete is the last step, but it is load-bearing for two yaks. Both inherit devserver, so they surface together in the label view.\n- close the MCP question first, it is cheap\n- the CSV yak is the real blocker\n## After landing\nArchive this thread and every yak under it in one keystroke.',
+    infosec: '## Blocked\nRestricted space read. Ask Dana whether the PDF export is authoritative.\n- 2025 signoff had four quarterly gaps\n- watch the yearly/quarterly overlap'
+  };
+
+  PLAN_MD = '# Retire the Q2 devserver shim\n## Summary\nThe shim was a bridge for one quarter and now owns two responsibilities it should not: CLI argument parsing and the region lookup. Parsing moves cleanly. The lookup does not, so it stays behind its current interface until the CSV export yak resolves.\n## Sequence\n- Swap shim parsing for the native parser, preserving flag order and the two undocumented aliases.\n- Keep region::lookup calling through the shim facade so no yak breaks mid-flight.\n- Delete the shim module in a single commit once both yaks close, so a bisect never lands inside a half-migrated tree.\n## Risks\n- The undocumented aliases are used by two internal scripts and are not covered by tests.\n- Darwin builds resolve the socket path differently, which is what the MCP yak is about.\n## Not doing\n- Touching the CSV export path from this thread. That is the yak, and it has its own labels and todo list.';
+
+  DIFF = [
+    { t: 'crates/devserver-cli/src/cli.rs', k: 'file' },
+    { t: '@@ -18,11 +18,9 @@ pub fn parse(args: &[String]) -> Result<Opts>', k: 'hunk' },
+    { t: '     let mut opts = Opts::default();', k: 'ctx' },
+    { t: '-    let shim = q2shim::Compat::new(args);', k: 'del' },
+    { t: '-    opts.port = shim.port_or_default(8787);', k: 'del' },
+    { t: '-    opts.watch = shim.flag("watch");', k: 'del' },
+    { t: '+    let mut p = Parser::new(args);', k: 'add' },
+    { t: '+    opts.port = p.u16("--port").unwrap_or(8787);', k: 'add' },
+    { t: '+    opts.watch = p.flag("--watch") || p.flag("-w");', k: 'add' },
+    { t: '     // region lookup still goes through the facade until', k: 'ctx' },
+    { t: '     // locations-in-csv-exports lands (yak of devserver-patterns)', k: 'ctx' },
+    { t: '     opts.region = q2shim::region::lookup(&opts.zip)?;', k: 'ctx' },
+    { t: '@@ -41,6 +39,7 @@ mod tests', k: 'hunk' },
+    { t: '+    #[test] fn accepts_legacy_w_alias() { assert!(parse(&sv(["-w"])).unwrap().watch); }', k: 'add' }
+  ];
+
+  KEYS = [
+    { k: 'x', d: 'select thread, or todo' }, { k: 'l', d: 'label (children inherit)' },
+    { k: 'e', d: 'archive thread / mark todo done' }, { k: '\u232b', d: 'delete selected todos' },
+    { k: '\u2192 \u2190', d: 'unfold / fold a thread\u2019s yaks' }, { k: '\u2191 \u2193 or j k', d: 'move in the focused list' },
+    { k: 'tab', d: 'threads \u21c4 todos' }, { k: 'z', d: 'undo last archive' },
+    { k: 'c / \u21e7c', d: 'new task / new yak here' }, { k: '/', d: 'search, archived included' },
+    { k: '\u21e7\u21b5 in todos', d: 'freeform text under the item' }, { k: '\u2318\u21b5 in todos', d: 'send the whole list as the next prompt' },
+    { k: ']  \\', d: 'todo rail · reading pane' }, { k: 'd', d: 'dark / light (follows OS at launch)' },
+    { k: 't', d: 'cycle palette (\u21e7t goes back)' },
+    { k: 'p', d: 'this thread\u2019s leash \u2014 what the agent may do' },
+    { k: ', / \u2318,', d: 'settings, as a layer over the app' }, { k: '?', d: 'this list' }
+  ];
+
+  SECONDS = { infosec: 69, scan: 71, slack: 302, migrate: 1452, mcp: 385, patterns: 1120, csv: 643, socket: 241, bai: 3624 };
+
+  fmt(n) {
+    const h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60), sec = n % 60;
+    if (h) return h + 'h ' + (m < 10 ? '0' : '') + m + 'm';
+    if (m) return m + 'm ' + (sec < 10 ? '0' : '') + sec + 's';
+    return sec + 's';
+  }
+
+  state = {
+    clock: null, clockOpen: false, composerBig: false, lastPane: 'reader',
+    sel: 'migrate', picked: {}, collapsed: {}, railOpen: true, readerOpen: true, tab: 0,
+    showLabels: false, showHelp: false, settings: null, acctMenu: false, leashMenu: false,
+    leash: { infosec: 'ask', scan: 'full' }, defaultLeash: 'edit',
+    gen: { sleep: true, menubar: true, clockIdle: false, suggest: false, send: 'Enter' },
+    toast: null, draft: '', theme: 'light', palette: 'og', themeMenu: false,
+    archived: { socket: true }, sidebarW: 306, zone: 'threads',
+    todoStore: {}, noteStore: {}, todoDraft: '', todoFocus: 2, todoPicked: {},
+    notesEditing: false, undoList: null
+  };
+
+  componentDidMount() {
+    const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    this.setTheme(dark ? 'dark' : 'light');
+    this.setState({ clock: Object.assign({}, this.SECONDS) });
+    this._tick = setInterval(() => {
+      const c = Object.assign({}, this.state.clock || this.SECONDS);
+      this.THREADS.forEach(t => { if (t.state === 'active' && !this.state.archived[t.id]) c[t.id] = (c[t.id] || 0) + 1; });
+      this.setState({ clock: c });
+    }, 1000);
+    this._key = (e) => {
+      const tag = (e.target.tagName || '').toLowerCase();
+      const typing = tag === 'textarea' || tag === 'input';
+      if ((e.metaKey || e.ctrlKey) && e.key === ',') { e.preventDefault(); this.setState({ settings: this.state.settings ? null : 'general', acctMenu: false }); return; }
+      if (e.key === 'Escape') { this.setState({ showLabels: false, settings: null, acctMenu: false, leashMenu: false, clockOpen: false, themeMenu: false }); if (typing) e.target.blur(); return; }
+      if (this.state.settings && !typing) { if (e.key === 'Tab') return; }
+      if (e.key === 'Tab' && !typing) { e.preventDefault(); this.setState({ zone: this.state.zone === 'todos' ? 'threads' : 'todos' }); return; }
+      if (typing) return;
+      const k = e.key;
+      const zone = this.state.zone;
+      if (k === ']') this.setState({ railOpen: !(this.state.railOpen && this.state.lastPane !== 'reader'), lastPane: 'rail' });
+      else if (k === '\\') this.setState({ readerOpen: !(this.state.readerOpen && this.state.lastPane !== 'rail'), lastPane: 'reader' });
+      else if (k === '?') this.setState({ settings: this.state.settings === 'keys' ? null : 'keys' });
+      else if (k === ',') this.setState({ settings: this.state.settings ? null : 'general' });
+      else if (k === 'p') this.setState({ leashMenu: !this.state.leashMenu });
+      else if (k === 'd') this.setTheme(this.state.theme === 'dark' ? 'light' : 'dark');
+      else if (k === 't') this.cyclePalette(e.shiftKey ? -1 : 1);
+      else if (k === 'z') this.undo();
+      else if (zone === 'todos') {
+        if (k === 'ArrowDown' || k === 'j') this.moveTodo(1);
+        else if (k === 'ArrowUp' || k === 'k') this.moveTodo(-1);
+        else if (k === 'x') this.pickTodo();
+        else if (k === 'e') this.doneTodos();
+        else if (k === 'Backspace' || k === 'Delete') this.deleteTodos();
+        else if (k === 'Enter') { if (this._todoEl) this._todoEl.focus(); }
+        else return;
+      } else {
+        if (k === 'ArrowDown' || k === 'j') this.step(1);
+        else if (k === 'ArrowUp' || k === 'k') this.step(-1);
+        else if (k === 'ArrowRight') this.fold(false);
+        else if (k === 'ArrowLeft') this.fold(true);
+        else if (k === 'x') this.togglePick(this.state.sel);
+        else if (k === 'l') this.setState({ showLabels: !this.state.showLabels });
+        else if (k === 'e') this.archive(this.state.sel);
+        else return;
+      }
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', this._key);
+    this._resize = () => this.setState({ winW: window.innerWidth });
+    this._resize();
+    window.addEventListener('resize', this._resize);
+  }
+  componentWillUnmount() {
+    clearInterval(this._tick);
+    window.removeEventListener('keydown', this._key);
+    window.removeEventListener('mousemove', this._move);
+    window.removeEventListener('mouseup', this._up);
+    window.removeEventListener('resize', this._resize);
+    if (this._ro) this._ro.disconnect();
+  }
+
+  PALETTES = [
+    { id: 'og', name: 'Original', hue: 264, chipC: 0.13 },
+    { id: 'ledger', name: 'Ledger', hue: 58, chipC: 0.11 },
+    { id: 'basalt', name: 'Basalt', hue: 209, chipC: 0.10 },
+    { id: 'mithril', name: 'Mithril', darkName: 'Ithildin', hue: 262, chipC: 0.14 }
+  ];
+
+  setTheme(t, p) {
+    const pal = p || this.state.palette;
+    document.documentElement.setAttribute('data-theme', pal + '-' + t);
+    this.setState({ theme: t, palette: pal });
+  }
+
+  cyclePalette = (dir) => {
+    const ids = this.PALETTES.map(p => p.id);
+    const i = (ids.indexOf(this.state.palette) + (dir || 1) + ids.length) % ids.length;
+    this.setTheme(this.state.theme, ids[i]);
+    this.setState({ toast: 'Palette \u2014 ' + ((this.state.theme === 'dark' && this.PALETTES[i].darkName) || this.PALETTES[i].name) + ' \u00b7 t cycles, \u21e7t back' });
+    clearTimeout(this._t); this._t = setTimeout(() => this.setState({ toast: null }), 4000);
+  };
+
+  startResize = (e) => {
+    e.preventDefault();
+    const x0 = e.clientX, w0 = this.state.sidebarW;
+    this._move = (ev) => this.setState({ sidebarW: Math.max(230, Math.min(480, w0 + ev.clientX - x0)) });
+    this._up = () => { window.removeEventListener('mousemove', this._move); window.removeEventListener('mouseup', this._up); };
+    window.addEventListener('mousemove', this._move);
+    window.addEventListener('mouseup', this._up);
+  };
+
+  kids(id) { return this.THREADS.filter(t => t.parent === id); }
+  descendants(id) {
+    let out = [id], added = true;
+    while (added) { added = false; this.THREADS.forEach(t => { if (t.parent && out.indexOf(t.parent) > -1 && out.indexOf(t.id) < 0) { out.push(t.id); added = true; } }); }
+    return out;
+  }
+  ancestors(t) {
+    const out = []; let cur = t;
+    while (cur && cur.parent) { cur = this.THREADS.find(x => x.id === cur.parent); if (cur) out.unshift(cur); }
+    return out;
+  }
+  visible() {
+    const rows = [];
+    const walk = (parent, depth) => {
+      const group = this.kids(parent).filter(t => !(parent === null && this.state.archived[t.id]));
+      group.sort((a, b) => (this.state.archived[a.id] ? 1 : 0) - (this.state.archived[b.id] ? 1 : 0));
+      group.forEach(t => {
+        rows.push({ t: t, depth: depth });
+        if (!this.state.collapsed[t.id]) walk(t.id, depth + 1);
+      });
+    };
+    walk(null, 0);
+    return rows;
+  }
+  step(d) {
+    const rows = this.visible();
+    const i = rows.findIndex(r => r.t.id === this.state.sel);
+    const n = rows[Math.min(rows.length - 1, Math.max(0, i + d))];
+    if (n) this.setState({ sel: n.t.id, todoFocus: 0, todoPicked: {} });
+  }
+  fold(shut) {
+    const c = Object.assign({}, this.state.collapsed);
+    const cur = this.THREADS.find(t => t.id === this.state.sel);
+    if (shut) {
+      if (this.kids(this.state.sel).length && !c[this.state.sel]) c[this.state.sel] = true;
+      else if (cur && cur.parent) { this.setState({ sel: cur.parent }); return; }
+    } else { delete c[this.state.sel]; }
+    this.setState({ collapsed: c });
+  }
+  togglePick(id) {
+    const p = Object.assign({}, this.state.picked);
+    if (p[id]) delete p[id]; else p[id] = true;
+    this.setState({ picked: p });
+  }
+  archive(id) {
+    const ids = this.descendants(id);
+    const a = Object.assign({}, this.state.archived); ids.forEach(i => a[i] = true);
+    const next = this.visible().find(r => ids.indexOf(r.t.id) < 0);
+    this.setState({
+      archived: a, undoList: ids, picked: {},
+      sel: next ? next.t.id : this.state.sel,
+      toast: ids.length > 1 ? 'Archived ' + ids.length + ' threads \u2014 parent and its yaks. Still readable, still searchable.' : 'Archived \u2014 still readable, still searchable.'
+    });
+    clearTimeout(this._t); this._t = setTimeout(() => this.setState({ toast: null }), 6000);
+  }
+  undo() {
+    if (!this.state.undoList) return;
+    const a = Object.assign({}, this.state.archived); this.state.undoList.forEach(i => delete a[i]);
+    this.setState({ archived: a, toast: null, undoList: null });
+  }
+  LEASH = [
+    { id: 'ask', name: 'Ask first', sub: 'Every write and every network call waits for you.', hue: null },
+    { id: 'edit', name: 'Edit in the workspace', sub: 'Writes inside this repo without asking. Network still asks.', hue: 'accent' },
+    { id: 'full', name: 'Full access', sub: 'Any file on the machine, any network call, no approvals.', hue: 'warn' }
+  ];
+  leashColor(id) {
+    const dark = this.state.theme === 'dark';
+    if (id === 'full') return dark ? 'oklch(0.82 0.13 72)' : 'oklch(0.56 0.13 62)';
+    if (id === 'edit') return 'var(--accent)';
+    return 'var(--muted)';
+  }
+  effLeash(t) {
+    if (this.state.leash[t.id]) return { level: this.state.leash[t.id], own: true, from: null };
+    const chain = this.ancestors(t);
+    for (let i = 0; i < chain.length; i++) {
+      const a = chain[i];
+      if (this.state.leash[a.id]) return { level: this.state.leash[a.id], own: false, from: a };
+    }
+    return { level: this.state.defaultLeash, own: false, from: null };
+  }
+  setLeash(id, level) {
+    const l = Object.assign({}, this.state.leash);
+    if (level) l[id] = level; else delete l[id];
+    this.setState({ leash: l, leashMenu: false });
+  }
+  effLabels(t) {
+    const own = t.labels.map(id => ({ id, own: true }));
+    const inh = [];
+    this.ancestors(t).forEach(a => a.labels.forEach(id => {
+      if (!own.find(o => o.id === id) && !inh.find(o => o.id === id)) inh.push({ id, own: false });
+    }));
+    return own.concat(inh);
+  }
+  chip(l, dim) {
+    const def = this.LABELS.find(x => x.id === l.id); if (!def) return null;
+    const c = 'oklch(' + (this.state.theme === 'dark' ? '0.78 0.11 ' : '0.50 0.13 ') + def.hue + ')';
+    const base = 'font-size:11.5px;padding:2px 8px;border-radius:20px;white-space:nowrap;flex:0 0 auto;color:' + c + ';' + (dim ? 'opacity:.4;' : '');
+    return { name: def.name, style: l.own ? base + 'border:1px solid ' + c + '55;background:' + c + '1c' : base + 'border:1px dashed ' + c + '66;opacity:' + (dim ? '.3' : '.7') };
+  }
+  toggleLabel(id) {
+    const targets = Object.keys(this.state.picked).length ? Object.keys(this.state.picked) : [this.state.sel];
+    targets.forEach(tid => {
+      const th = this.THREADS.find(x => x.id === tid); if (!th) return;
+      const i = th.labels.indexOf(id);
+      if (i > -1) th.labels.splice(i, 1); else th.labels.push(id);
+    });
+    this.forceUpdate();
+  }
+
+  getTodos(id) {
+    if (this.state.todoStore[id]) return this.state.todoStore[id];
+    return this.SEED_TODOS[id] ? this.SEED_TODOS[id].slice() : [];
+  }
+  setTodos(id, arr, extra) {
+    const s = Object.assign({}, this.state.todoStore); s[id] = arr;
+    this.setState(Object.assign({ todoStore: s }, extra || {}));
+  }
+  moveTodo(d) {
+    const n = this.getTodos(this.state.sel).length;
+    if (!n) return;
+    this.setState({ todoFocus: Math.max(0, Math.min(n - 1, this.state.todoFocus + d)) });
+  }
+  targetIdx() {
+    const picked = Object.keys(this.state.todoPicked).map(Number);
+    return picked.length ? picked : [this.state.todoFocus];
+  }
+  pickTodo() {
+    const p = Object.assign({}, this.state.todoPicked);
+    const i = this.state.todoFocus;
+    if (p[i]) delete p[i]; else p[i] = true;
+    this.setState({ todoPicked: p });
+  }
+  doneTodos() {
+    const arr = this.getTodos(this.state.sel).slice();
+    const idx = this.targetIdx();
+    idx.forEach(i => { if (arr[i]) arr[i] = Object.assign({}, arr[i], { done: !arr[i].done }); });
+    this.setTodos(this.state.sel, arr, { todoPicked: {} });
+  }
+  deleteTodos() {
+    const idx = this.targetIdx();
+    const arr = this.getTodos(this.state.sel).filter((t, i) => idx.indexOf(i) < 0);
+    this.setTodos(this.state.sel, arr, { todoPicked: {}, todoFocus: Math.max(0, Math.min(arr.length - 1, this.state.todoFocus)) });
+  }
+  commitTodo() {
+    const raw = this.state.todoDraft.trim();
+    if (!raw) return;
+    const lines = this.state.todoDraft.split('\n');
+    const arr = this.getTodos(this.state.sel).slice();
+    arr.push({ id: Date.now(), text: lines[0].trim(), done: false, note: lines.slice(1).join('\n').trim() });
+    this.setTodos(this.state.sel, arr, { todoDraft: '', todoFocus: arr.length - 1 });
+  }
+  sendList() {
+    const arr = this.getTodos(this.state.sel);
+    const pending = arr.filter(t => !t.done);
+    const draftLine = this.state.todoDraft.trim();
+    const lines = pending.map(t => '- ' + t.text + (t.note ? '\n  ' + t.note.split('\n').join('\n  ') : ''));
+    if (draftLine) lines.push('- ' + draftLine.split('\n').join('\n  '));
+    if (!lines.length) return;
+    this.setState({
+      draft: 'Next, in this order:\n' + lines.join('\n'),
+      todoDraft: '',
+      toast: 'Queued ' + lines.length + ' items into the prompt \u2014 edit before you send.'
+    });
+    clearTimeout(this._t); this._t = setTimeout(() => this.setState({ toast: null }), 6000);
+  }
+  onTodoKey = (e) => {
+    const meta = e.metaKey || e.ctrlKey;
+    if (e.key === 'Enter' && meta) { e.preventDefault(); this.sendList(); }
+    else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.commitTodo(); }
+  };
+
+  md(src, small) {
+    return src.split('\n').filter(l => l.trim()).map(line => {
+      if (line.indexOf('# ') === 0) return { text: line.slice(2), style: "font-family:'Newsreader',Georgia,serif;font-size:30px;line-height:1.18;margin:2px 0 14px 0;letter-spacing:-0.01em" };
+      if (line.indexOf('## ') === 0) return { text: line.slice(3), style: "font-family:'Newsreader',Georgia,serif;font-size:" + (small ? '17px' : '20px') + ";margin:20px 0 8px 0" };
+      if (line.indexOf('- ') === 0) return { text: '\u2014  ' + line.slice(2), style: 'line-height:1.68;margin:6px 0 6px 4px;padding-left:16px;text-indent:-16px;font-size:' + (small ? '13.5px' : '15.5px') };
+      return { text: line, style: 'line-height:1.72;margin:9px 0;text-wrap:pretty;font-size:' + (small ? '13.5px' : '15.5px') };
+    });
+  }
+
+  renderVals() {
+    const s = this.state;
+    const thread = this.THREADS.find(t => t.id === s.sel) || this.THREADS[0];
+    const threadsFocused = s.zone === 'threads';
+
+    const mkRow = (t, depth) => {
+      const isSel = t.id === s.sel, picked = !!s.picked[t.id], arch = !!s.archived[t.id];
+      const kids = this.kids(t.id).length, folded = !!s.collapsed[t.id];
+      const dotBase = 'width:7px;height:7px;border-radius:50%;flex:0 0 7px;margin-top:7px;';
+      const dot = arch ? dotBase + 'background:transparent;border:1px solid var(--edge2);opacity:.5'
+        : t.state === 'active' ? dotBase + 'background:var(--live);animation:pulse 1.4s ease-in-out infinite'
+        : t.state === 'waiting' ? dotBase + 'background:var(--accent)'
+        : dotBase + 'background:transparent;border:1px solid var(--edge2)';
+      return {
+        title: t.title, sub: arch ? '' : t.sub,
+        open: () => this.setState({ sel: t.id, zone: 'threads', todoFocus: 0, todoPicked: {}, notesEditing: false }),
+        toggleSelect: (e) => { e.stopPropagation(); this.togglePick(t.id); },
+        toggleFold: (e) => {
+          e.stopPropagation();
+          if (!kids) return;
+          const c = Object.assign({}, s.collapsed);
+          if (c[t.id]) delete c[t.id]; else c[t.id] = true;
+          this.setState({ collapsed: c });
+        },
+        foldGlyph: kids ? (folded ? '\u25b8 ' + kids : '\u25be') : '',
+        foldStyle: 'flex:0 0 auto;font-size:10px;color:var(--faint);margin-top:4px;font-family:\'JetBrains Mono\',monospace;cursor:' + (kids ? 'pointer' : 'default') + ';min-width:11px',
+        rowStyle: 'display:flex;align-items:flex-start;gap:8px;padding:7px 8px 7px ' + (8 + depth * 15) + 'px;border-radius:6px;cursor:pointer;' +
+          (isSel ? 'background:var(--sel);' + (threadsFocused ? 'box-shadow:inset 0 0 0 1px var(--ring);' : '') : '') +
+          (depth ? 'border-left:1px solid var(--edge);margin-left:' + (6 + depth * 5) + 'px;' : '') + (arch ? 'opacity:.44;' : ''),
+        checkStyle: 'width:14px;height:14px;flex:0 0 14px;margin-top:4px;border-radius:3px;border:1px solid ' + (picked ? 'var(--accent)' : 'var(--edge2)') + ';background:' + (picked ? 'var(--accent)' : 'transparent') + ';color:var(--bg);font-size:10px;display:flex;align-items:center;justify-content:center',
+        checkGlyph: picked ? '\u2713' : '',
+        dotStyle: dot,
+        titleStyle: 'font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' + (arch ? 'color:var(--muted);' : 'color:var(--text);') + (t.unread && !arch ? 'font-weight:600' : 'font-weight:400'),
+        subStyle: arch ? 'display:none' : 'font-size:12px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px',
+        chips: this.effLabels(t).map(l => this.chip(l, arch)).filter(Boolean).slice(0, 1)
+      };
+    };
+
+    const openThreads = this.THREADS.filter(t => !s.archived[t.id]);
+    const active = openThreads.filter(t => t.state === 'active');
+    const waiting = openThreads.filter(t => t.state === 'waiting');
+    const sections = [
+      { title: 'Active', count: active.length, items: active.map(t => mkRow(t, 0)) },
+      { title: 'Waiting on you', count: waiting.length, items: waiting.map(t => mkRow(t, 0)) },
+      { title: 'Inbox', count: openThreads.length, items: this.visible().map(r => mkRow(r.t, r.depth)) }
+    ];
+
+    const raw = this.TRANSCRIPTS[thread.id] || this.TRANSCRIPTS.fallback;
+    const messages = raw.map(m => ({
+      isMeta: m.kind === 'meta', isPlan: m.kind === 'plan', isText: m.kind !== 'meta' && m.kind !== 'plan',
+      isFile: !!m.file, fileName: m.file, fileKind: m.fileKind,
+      openInReader: () => this.setState({ readerOpen: true, lastPane: 'reader', tab: m.tab != null ? m.tab : 0 }),
+      meta: m.meta, title: m.title, text: m.text, bullets: m.bullets || [],
+      wrapStyle: m.kind === 'user' ? 'display:flex;justify-content:flex-end' : 'display:block',
+      bodyStyle: m.kind === 'user'
+        ? 'max-width:82%;background:var(--panel);border:1px solid var(--edge);border-radius:12px 12px 4px 12px;padding:12px 16px;line-height:1.62'
+        : 'display:block',
+      textStyle: m.kind === 'meta' ? 'display:none' : 'line-height:1.72;text-wrap:pretty;font-size:15.5px'
+    }));
+
+    const todoArr = this.getTodos(thread.id);
+    const todos = todoArr.map((t, i) => {
+      const focused = s.zone === 'todos' && i === s.todoFocus, picked = !!s.todoPicked[i];
+      return {
+        text: t.text, note: t.note, hasNote: !!t.note, glyph: t.done ? '\u2713' : '', pickGlyph: picked ? '\u2713' : '',
+        focus: () => this.setState({ zone: 'todos', todoFocus: i }),
+        togglePick: (e) => { e.stopPropagation(); this.setState({ zone: 'todos', todoFocus: i }, () => this.pickTodo()); },
+        toggle: (e) => {
+          e.stopPropagation();
+          const arr = this.getTodos(thread.id).slice();
+          arr[i] = Object.assign({}, arr[i], { done: !arr[i].done });
+          this.setTodos(thread.id, arr, { zone: 'todos', todoFocus: i });
+        },
+        rowStyle: 'display:flex;gap:9px;padding:7px 8px;border-radius:7px;cursor:pointer;line-height:1.5;' + (focused ? 'background:var(--sel);box-shadow:inset 0 0 0 1px var(--ring);' : ''),
+        pickStyle: 'width:13px;height:13px;flex:0 0 13px;margin-top:4px;border-radius:3px;border:1px solid ' + (picked ? 'var(--accent)' : 'var(--edge)') + ';background:' + (picked ? 'var(--accent)' : 'transparent') + ';color:var(--bg);font-size:9px;display:flex;align-items:center;justify-content:center',
+        boxStyle: 'width:15px;height:15px;flex:0 0 15px;margin-top:3px;border-radius:4px;border:1px solid ' + (t.done ? 'var(--live)' : 'var(--edge2)') + ';background:' + (t.done ? 'var(--live)' : 'transparent') + ';color:var(--bg);font-size:10px;display:flex;align-items:center;justify-content:center',
+        textStyle: 'font-size:14px;' + (t.done ? 'color:var(--faint);text-decoration:line-through' : 'color:var(--text)'),
+        noteStyle: 'margin-top:4px;font-family:\'JetBrains Mono\',monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;color:var(--muted);border-left:2px solid var(--edge2);padding-left:9px'
+      };
+    });
+
+    const notesRaw = s.noteStore[thread.id] != null ? s.noteStore[thread.id] : (this.SEED_NOTES[thread.id] || '');
+    const codeMode = s.draft.indexOf('```') > -1;
+    const todoMulti = s.todoDraft.indexOf('\n') > -1;
+    const tabs = [{ kind: 'MD', name: 'plan.md' }, { kind: 'DIFF', name: 'cli.rs' }];
+    const readerBlocks = s.tab === 0 ? this.md(this.PLAN_MD) : this.DIFF.map(l => {
+      const mono = "font-family:'JetBrains Mono',monospace;font-size:12.8px;line-height:1.74;white-space:pre;padding:0 8px;border-radius:3px;";
+      const styles = {
+        file: mono + 'color:var(--muted);border-bottom:1px solid var(--edge);padding-bottom:9px;margin-bottom:9px',
+        hunk: mono + 'color:var(--muted);background:var(--code);margin:11px 0 5px 0;padding:3px 8px',
+        add: mono + 'background:var(--add);color:var(--addT)',
+        del: mono + 'background:var(--del);color:var(--delT)',
+        ctx: mono + 'color:var(--text);opacity:.78'
+      };
+      return { text: l.t, style: styles[l.k] };
+    });
+
+    const clock = s.clock || this.SECONDS;
+    const kidIds = this.descendants(thread.id).filter(i => i !== thread.id);
+    const eff = this.effLeash(thread);
+    const leashDef = this.LEASH.find(l => l.id === eff.level) || this.LEASH[0];
+    const own = clock[thread.id] || 0;
+    const yakSecs = kidIds.reduce((a, i) => a + (clock[i] || 0), 0);
+    const clockRows = [{ id: thread.id, name: thread.title, secs: own, self: true }]
+      .concat(kidIds.map(i => {
+        const t = this.THREADS.find(x => x.id === i);
+        return { id: i, name: t.title, secs: clock[i] || 0, arch: !!s.archived[i] };
+      }))
+      .concat([{ id: null, name: 'Total in this branch', secs: own + yakSecs, total: true }]);
+
+    const winW = s.winW || 1400;
+    const readerFloats = winW < 1120;
+    const railFloats = winW < 1340;
+    const compact = (s.centerW || 900) < 640;
+    const pickedCount = Object.keys(s.picked).length;
+    const pendingCount = todoArr.filter(t => !t.done).length;
+
+    return {
+      sidebarStyle: 'position:relative;width:' + s.sidebarW + 'px;flex:0 0 ' + s.sidebarW + 'px;background:var(--panel);border-right:1px solid ' + (threadsFocused ? 'var(--edge2)' : 'var(--edge)') + ';display:flex;flex-direction:column;overflow:visible',
+      railStyle: (railFloats ? 'position:absolute;top:50px;bottom:0;right:0;z-index:24;width:min(340px,86vw);box-shadow:-16px 0 40px rgba(0,0,0,0.24);animation:slidein .16s ease-out;' : 'width:320px;flex:0 1 320px;min-width:250px;') + 'border-left:1px solid ' + (s.zone === 'todos' ? 'var(--edge2)' : 'var(--edge)') + ';background:' + (railFloats || s.zone === 'todos' ? 'var(--panel2)' : 'var(--bg)') + ';display:flex;flex-direction:column;overflow-y:auto',
+      readerStyle: (readerFloats ? 'position:absolute;top:50px;bottom:0;right:0;z-index:20;width:min(600px,92vw);' : 'position:relative;z-index:20;width:600px;flex:0 1 600px;min-width:360px;') + 'background:var(--reader);border-left:1px solid var(--edge2);box-shadow:-16px 0 40px rgba(0,0,0,0.18);display:flex;flex-direction:column;overflow:hidden;animation:slidein .18s ease-out',
+      labelChipText: compact ? '+' : '+ label · l',
+      startResize: this.startResize,
+      sections,
+      crumbs: this.ancestors(thread).map(a => ({ title: a.title, open: () => this.setState({ sel: a.id }) })),
+      thread: { title: thread.title, model: thread.model, chips: this.effLabels(thread).map(l => this.chip(l)).filter(Boolean) },
+      messages,
+      todos, todosEmpty: todos.length === 0,
+      todoCount: todoArr.filter(t => t.done).length + '/' + todoArr.length,
+      zoneBadge: s.zone === 'todos' ? 'arrows · x select · e done · ⌫ delete' : 'tab to focus',
+      zoneBadgeStyle: 'font-size:11.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' + (s.zone === 'todos' ? 'color:var(--accent)' : ''),
+      todoDraft: s.todoDraft,
+      onTodoDraft: (e) => this.setState({ todoDraft: e.target.value }),
+      onTodoKey: this.onTodoKey,
+      todoRef: (el) => { this._todoEl = el; },
+      todoInputWrapStyle: 'border:1px solid ' + (todoMulti ? 'var(--edge2)' : 'var(--edge)') + ';background:' + (todoMulti ? 'var(--code)' : 'var(--bg)') + ';border-radius:8px;padding:8px 10px',
+      todoInputStyle: 'width:100%;min-height:' + (todoMulti ? '86px' : '24px') + ';resize:none;border:0;outline:none;background:transparent;color:var(--text);line-height:1.6;font-size:14px;' + (todoMulti ? "font-family:'JetBrains Mono',monospace;font-size:13px" : "font-family:'Instrument Sans',system-ui,sans-serif"),
+      sendHintStyle: pendingCount || s.todoDraft.trim() ? 'color:var(--accent)' : 'color:var(--faint)',
+      notesEditing: s.notesEditing, notesReading: !s.notesEditing,
+      notesRaw, notesEmpty: !notesRaw.trim(),
+      notesAction: s.notesEditing ? 'done' : 'edit',
+      toggleNotesEdit: () => this.setState({ notesEditing: !s.notesEditing, zone: 'todos' }),
+      onNotes: (e) => { const n = Object.assign({}, s.noteStore); n[thread.id] = e.target.value; this.setState({ noteStore: n }); },
+      noteBlocks: this.md(notesRaw, true),
+      isWaiting: thread.state === 'waiting',
+      statusText: thread.state === 'active' ? 'working' : thread.state === 'waiting' ? 'waiting on you' : 'idle',
+      statusStyle: 'font-size:12px;font-family:\'JetBrains Mono\',monospace;padding:2px 9px;border-radius:20px;white-space:nowrap;flex:0 0 auto;' + (thread.state === 'active' ? 'color:var(--live);border:1px solid var(--live)' : thread.state === 'waiting' ? 'color:var(--accent);border:1px solid var(--accent)' : 'color:var(--faint);border:1px solid var(--edge2)'),
+      labelList: this.LABELS.map(l => ({
+        name: l.name,
+        count: openThreads.filter(t => this.effLabels(t).find(x => x.id === l.id)).length,
+        mark: thread.labels.indexOf(l.id) > -1 ? '\u2713' : '',
+        toggle: () => this.toggleLabel(l.id),
+        swatch: 'width:10px;height:10px;border-radius:2px;flex:0 0 10px;background:oklch(' + (s.theme === 'dark' ? '0.78 0.11 ' : '0.50 0.13 ') + l.hue + ')'
+      })),
+      labelTargetText: pickedCount ? pickedCount + ' selected threads' : thread.title,
+      archivedCount: Object.keys(s.archived).length,
+      showArchive: () => this.setState({ toast: 'Archived threads open read-only in place \u2014 no unarchive step. Yaks stay greyed under their parent.' }),
+      railOpen: s.railOpen && (!railFloats || s.lastPane !== 'reader'),
+      readerOpen: s.readerOpen && (!readerFloats || s.lastPane !== 'rail'), showLabels: s.showLabels, toast: s.toast,
+      readerTabs: tabs.map((t, i) => ({
+        kind: t.kind, name: t.name, open: () => this.setState({ tab: i }),
+        style: 'display:flex;align-items:center;gap:8px;padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;font-size:13.5px;white-space:nowrap;' + (s.tab === i ? 'background:var(--readerCard);border:1px solid var(--edge);border-bottom-color:var(--readerCard);margin-bottom:-1px' : 'color:var(--muted);border:1px solid transparent')
+      })),
+      centerStyle: 'flex:1 1 560px;min-width:340px;display:flex;flex-direction:column;background:var(--bg)',
+      centerRef: (el) => {
+        if (!el || this._centerEl === el) return;
+        this._centerEl = el;
+        if (this._ro) this._ro.disconnect();
+        if (window.ResizeObserver) {
+          this._ro = new ResizeObserver(() => {
+            const w = el.getBoundingClientRect().width;
+            if (Math.abs((this.state.centerW || 0) - w) > 4) this.setState({ centerW: w });
+          });
+          this._ro.observe(el);
+        }
+      },
+      archiveText: compact ? '' : 'Archive ',
+      todosText: compact ? '' : 'Todos ',
+      readerText: compact ? '' : 'Reader ',
+      readerBlocks, keys: this.KEYS, codeMode, codeLang: 'rust',
+      clockOwn: this.fmt(own),
+      clockOwnLabel: thread.state === 'active' ? 'working, this thread' : 'worked, this thread',
+      hasYakTime: yakSecs > 0,
+      clockTotal: this.fmt(own + yakSecs),
+      clockTotalLabel: 'with ' + kidIds.length + ' ' + (kidIds.length === 1 ? 'yak' : 'yaks') + ' — click to split',
+      clockDotStyle: 'width:7px;height:7px;border-radius:50%;flex:0 0 7px;' + (thread.state === 'active' ? 'background:var(--live);animation:pulse 1.4s ease-in-out infinite' : 'background:transparent;border:1px solid var(--edge2)'),
+      clockOpen: s.clockOpen,
+      toggleClock: () => this.setState({ clockOpen: !s.clockOpen }),
+      clockRows: clockRows.map(r => ({
+        name: r.name, time: this.fmt(r.secs),
+        open: () => { if (r.id) this.setState({ sel: r.id }); },
+        rowStyle: 'display:flex;align-items:baseline;gap:11px;padding:5px 6px;border-radius:5px;' + (r.id ? 'cursor:pointer;' : '') + (r.total ? 'margin-top:5px;border-top:1px solid var(--edge);padding-top:9px;' : '') + (r.arch ? 'opacity:.45;' : ''),
+        nameStyle: 'font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:60%;' + (r.self || r.total ? 'color:var(--text);font-weight:500' : 'color:var(--muted)'),
+        timeStyle: "font-family:'JetBrains Mono',monospace;font-size:13px;white-space:nowrap;" + (r.total ? 'color:var(--accent)' : 'color:var(--muted)')
+      })),
+      bigGlyph: s.composerBig ? '\u2921' : '\u2922',
+      toggleBig: () => this.setState({ composerBig: !s.composerBig }),
+      sendHint: s.composerBig ? '\u2318\u21b5 send' : '\u21b5 send',
+      composerPlaceholder: s.composerBig ? 'Draft freely — ⏎ is a newline here, ⌘⏎ sends' : 'Reply, or type ``` for a code block',
+      composerFoot: s.composerBig ? 'expanded — ⏎ inserts a newline' : '⇧c spawns a yak here — it inherits these labels',
+      onComposerKey: (e) => {
+        const meta = e.metaKey || e.ctrlKey;
+        if (e.key === 'Enter' && !e.shiftKey && !s.composerBig && !meta) {
+          e.preventDefault();
+          if (s.draft.trim()) this.setState({ draft: '', toast: 'Sent \u2014 the clock on this thread keeps running.' });
+        } else if (e.key === 'Enter' && meta && s.composerBig) {
+          e.preventDefault();
+          if (s.draft.trim()) this.setState({ draft: '', composerBig: false, toast: 'Sent \u2014 the clock on this thread keeps running.' });
+        }
+      },
+      draft: s.draft,
+      onDraft: (e) => this.setState({ draft: e.target.value }),
+      focusThreads: () => { if (s.zone !== 'threads') this.setState({ zone: 'threads' }); },
+      focusTodos: () => { if (s.zone !== 'todos') this.setState({ zone: 'todos' }); },
+      composerStyle: 'border:1px solid ' + (codeMode ? 'var(--edge2)' : 'var(--edge)') + ';background:' + (codeMode ? 'var(--code)' : 'var(--panel)') + ';border-radius:12px;padding:13px 15px 11px 15px',
+      inputStyle: 'width:100%;min-height:' + (s.composerBig ? '320px' : codeMode ? '112px' : '50px') + ';resize:none;border:0;outline:none;background:transparent;color:var(--text);line-height:1.6;' + (codeMode ? "font-family:'JetBrains Mono',monospace;font-size:13.5px" : "font-family:'Instrument Sans',system-ui,sans-serif;font-size:15.5px"),
+      toggleRail: () => this.setState({ railOpen: !(s.railOpen && s.lastPane !== 'reader'), lastPane: 'rail' }),
+      toggleReader: () => this.setState({ readerOpen: !(s.readerOpen && s.lastPane !== 'rail'), lastPane: 'reader' }),
+      toggleLabels: () => this.setState({ showLabels: !s.showLabels }),
+
+      stop: (e) => { if (e && e.stopPropagation) e.stopPropagation(); },
+      toggleAcct: () => this.setState({ acctMenu: !s.acctMenu }),
+      acctMenu: s.acctMenu,
+      openKeys: () => this.setState({ settings: 'keys', acctMenu: false }),
+      acctItems: [
+        { name: 'Profile & stats', hint: '', go: () => this.setState({ settings: 'account', acctMenu: false }) },
+        { name: 'Appearance', hint: 't', go: () => this.setState({ settings: 'appearance', acctMenu: false }) },
+        { name: 'Permissions', hint: 'p', go: () => this.setState({ settings: 'permissions', acctMenu: false }) },
+        { name: 'Settings', hint: '\u2318,', go: () => this.setState({ settings: 'general', acctMenu: false }) },
+        { name: 'Sign out', hint: '', go: () => this.setState({ acctMenu: false, toast: 'Nothing to sign out of \u2014 this is a concept.' }) }
+      ],
+      usageLine: '98% of the weekly budget left \u00b7 resets Aug 16',
+      toggleTheme: () => this.setTheme(s.theme === 'dark' ? 'light' : 'dark'),
+      toggleThemeMenu: () => this.setState({ themeMenu: !s.themeMenu }),
+      themeMenu: s.themeMenu,
+      modeLabel: s.theme === 'dark' ? 'Dark \u25cf' : 'Light \u25cb',
+      themeGlyph: (() => { const p = this.PALETTES.find(x => x.id === s.palette) || {}; return (s.theme === 'dark' ? (p.darkName || p.name) : p.name) + (s.theme === 'dark' ? ' \u25cf' : ' \u25cb'); })(),
+      themeList: this.PALETTES.map(p => ({
+        name: p.darkName ? p.name + ' / ' + p.darkName : p.name,
+        mark: p.id === s.palette ? '\u2713' : '',
+        pick: () => { this.setTheme(s.theme, p.id); this.setState({ themeMenu: false }); },
+        style: 'display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:7px;cursor:pointer;font-size:13.5px;' + (p.id === s.palette ? 'background:var(--sel);' : ''),
+        swatch: 'width:22px;height:12px;border-radius:3px;flex:0 0 22px;background:linear-gradient(90deg,oklch(' + (s.theme === 'dark' ? '0.80 ' : '0.50 ') + p.chipC + ' ' + p.hue + ') 50%,var(--panel2) 50%);border:1px solid var(--edge2)'
+      })),
+
+      settingsOpen: !!s.settings,
+      closeSettings: () => this.setState({ settings: null }),
+      settingsTitle: ({ general: 'General', appearance: 'Appearance', permissions: 'Permissions', keys: 'Keyboard', account: 'Account' })[s.settings] || '',
+      isGeneral: s.settings === 'general', isAppearance: s.settings === 'appearance',
+      isPermissions: s.settings === 'permissions', isKeys: s.settings === 'keys', isAccount: s.settings === 'account',
+      settingsNav: [['general','General'],['appearance','Appearance'],['permissions','Permissions'],['keys','Keyboard'],['account','Account']].map(n => ({
+        name: n[1],
+        go: () => this.setState({ settings: n[0] }),
+        style: 'padding:7px 9px;border-radius:7px;cursor:pointer;font-size:13.5px;' + (s.settings === n[0] ? 'background:var(--sel);color:var(--text);' : 'color:var(--muted);')
+      })),
+      generalRows: (() => {
+        const tog = (id, name, sub) => ({
+          name, sub, isToggle: true, isChoice: false,
+          toggle: () => { const g = Object.assign({}, s.gen); g[id] = !g[id]; this.setState({ gen: g }); },
+          trackStyle: 'width:38px;height:22px;border-radius:12px;flex:0 0 38px;cursor:pointer;padding:2px;display:flex;transition:background .12s;background:' + (s.gen[id] ? 'var(--accent)' : 'var(--edge2)') + ';justify-content:' + (s.gen[id] ? 'flex-end' : 'flex-start'),
+          knobStyle: 'width:18px;height:18px;border-radius:50%;background:var(--bg)'
+        });
+        const choice = (id, name, sub, opts) => ({
+          name, sub, isToggle: false, isChoice: true,
+          options: opts.map(o => ({
+            name: o,
+            pick: () => { const g = Object.assign({}, s.gen); g[id] = o; this.setState({ gen: g }); },
+            style: 'padding:4px 11px;border-radius:5px;cursor:pointer;font-size:13px;white-space:nowrap;' + (s.gen[id] === o ? 'background:var(--bg);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.10);' : 'color:var(--muted);')
+          }))
+        });
+        return [
+          choice('send', 'Send with', 'The other one inserts a newline. Code blocks always take \u21e7\u21b5.', ['Enter', '\u2318\u21b5']),
+          tog('sleep', 'Stay awake while a yak is running', 'The machine holds off sleeping until every active thread goes idle.'),
+          tog('menubar', 'Keep a menu-bar presence', 'Live yak count stays visible when the window is closed.'),
+          tog('clockIdle', 'Count idle time against a thread', 'Off means the clock only runs while the agent is actually working.'),
+          tog('suggest', 'Suggest what to do next', 'Reads your open files to propose prompts. Off by default \u2014 it guesses.')
+        ];
+      })(),
+      modeOptions: ['light', 'dark'].map(m => ({
+        name: m === 'light' ? 'Light' : 'Dark',
+        pick: () => this.setTheme(m),
+        style: 'padding:4px 13px;border-radius:5px;cursor:pointer;font-size:13px;' + (s.theme === m ? 'background:var(--bg);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.10);' : 'color:var(--muted);')
+      })),
+      paletteCards: this.PALETTES.map(p => {
+        const sw = (v) => 'flex:1;background:' + v;
+        const on = p.id === s.palette;
+        const swatches = {
+          og: s.theme === 'dark' ? ['#0D0E10','#191A1D','#2A2D33','oklch(0.76 0.13 264)'] : ['#F0F0EE','#FDFDFC','#DEDEDA','oklch(0.52 0.15 264)'],
+          ledger: s.theme === 'dark' ? ['#100E0A','#1B1813','#2C271D','oklch(0.79 0.11 68)'] : ['#EEE8DA','#FBF8F1','#DED5C0','oklch(0.48 0.11 52)'],
+          basalt: s.theme === 'dark' ? ['#090C0D','#14181A','#252B2E','oklch(0.80 0.10 208)'] : ['#E9EDEE','#FAFBFB','#D4DADC','oklch(0.50 0.10 210)'],
+          mithril: s.theme === 'dark' ? ['#101216','#15181D','#232730','#6EA8FF'] : ['#EEF0F3','#FBFCFD','#E4E7EC','#2563EB']
+        }[p.id];
+        return {
+          name: p.darkName ? p.name + ' / ' + p.darkName : p.name,
+          sub: { og: 'Warm grey, indigo accent. The one this started as.', ledger: 'Paper and ink. Amber accent, brown-gold warnings.', basalt: 'Cool near-monochrome, teal-blue accent.', mithril: 'Terminal-derived. Blue is the only accent; hues carry meaning.' }[p.id],
+          mark: on ? '\u2713' : '',
+          pick: () => this.setTheme(s.theme, p.id),
+          style: 'border:1px solid ' + (on ? 'var(--accent)' : 'var(--edge)') + ';border-radius:11px;padding:11px;cursor:pointer;background:' + (on ? 'var(--sel)' : 'transparent'),
+          sw1: sw(swatches[0]), sw2: sw(swatches[1]), sw3: sw(swatches[2]), sw4: sw(swatches[3])
+        };
+      }),
+      defaultLeashOptions: this.LEASH.map(l => ({
+        name: l.name, sub: l.sub, mark: s.defaultLeash === l.id ? '\u2713' : '',
+        pick: () => this.setState({ defaultLeash: l.id }),
+        dot: 'width:8px;height:8px;border-radius:50%;flex:0 0 8px;margin-top:5px;background:' + this.leashColor(l.id),
+        nameStyle: 'font-size:13.5px;color:' + (l.id === 'full' ? this.leashColor('full') : 'var(--text)'),
+        cardStyle: 'display:flex;gap:11px;align-items:flex-start;border:1px solid ' + (s.defaultLeash === l.id ? 'var(--accent)' : 'var(--edge)') + ';border-radius:10px;padding:11px 13px;cursor:pointer;background:' + (s.defaultLeash === l.id ? 'var(--sel)' : 'transparent')
+      })),
+      overrideSummary: Object.keys(s.leash).length ? 'Everything beneath these inherits from them unless it sets its own.' : 'None. Every thread is running on the default above.',
+      overrideRows: Object.keys(s.leash).map(id => {
+        const t = this.THREADS.find(x => x.id === id); if (!t) return null;
+        const def = this.LEASH.find(l => l.id === s.leash[id]);
+        const kids = this.THREADS.filter(x => this.ancestors(x).some(a => a.id === id)).length;
+        return {
+          title: t.title, detail: def.name + (kids ? ' \u00b7 ' + kids + ' below inherit it' : ''),
+          dot: 'width:8px;height:8px;border-radius:50%;flex:0 0 8px;background:' + this.leashColor(s.leash[id]),
+          open: () => this.setState({ sel: id, settings: null }),
+          clear: () => this.setLeash(id, null)
+        };
+      }).filter(Boolean),
+      planLine: 'member since Sep 2025',
+      stats: [
+        { v: '4,089', k: 'threads' }, { v: '1,914', k: 'yaks spawned' },
+        { v: '612h', k: 'agent time' }, { v: '65d', k: 'current streak' }
+      ],
+      topYaks: [
+        { name: 'migrate-q2-devserver-cli', v: '31h 12m' }, { name: 'bai-location-data', v: '24h 40m' },
+        { name: 'infosec signoff gaps', v: '18h 05m' }, { name: 'harness-eng-desktop-mcp', v: '11h 22m' }
+      ],
+      habits: [
+        { name: 'Yaks per thread', v: '2.4' }, { name: 'Archived without reopening', v: '94%' },
+        { name: 'Longest single yak chain', v: '5 deep' }, { name: 'Median wait before you answer', v: '9m' }
+      ],
+      grid: (() => {
+        const out = []; let seed = 7;
+        for (let i = 0; i < 280; i++) {
+          seed = (seed * 1103515245 + 12345) % 2147483648;
+          const r = (seed / 2147483648);
+          const recent = i / 280;
+          const v = r * (0.25 + recent * 1.05);
+          const lvl = v < 0.12 ? 0 : v < 0.3 ? 1 : v < 0.55 ? 2 : v < 0.8 ? 3 : 4;
+          const bg = lvl === 0 ? 'var(--panel2)' : 'color-mix(in oklab, var(--accent) ' + (lvl * 24) + '%, var(--panel2))';
+          out.push({ style: 'width:9px;height:9px;border-radius:2px;background:' + bg });
+        }
+        return out;
+      })(),
+
+      leashMenu: s.leashMenu,
+      toggleLeash: () => this.setState({ leashMenu: !s.leashMenu }),
+      leashName: leashDef.name,
+      leashInherited: !eff.own,
+      leashChipStyle: 'display:flex;align-items:center;gap:7px;cursor:pointer;padding:3px 9px;border:1px solid var(--edge);border-radius:20px;font-size:12.5px;white-space:nowrap;color:var(--text)',
+      leashDotStyle: 'width:7px;height:7px;border-radius:50%;flex:0 0 7px;background:' + this.leashColor(eff.level),
+      leashHeader: eff.own ? 'This thread sets its own leash. Everything spawned beneath it inherits this.' : (eff.from ? 'Inherited from ' + eff.from.title + '. Overriding affects this thread and its yaks only.' : 'Running on the default for new threads. Set one here and its yaks inherit it.'),
+      leashOptions: this.LEASH.map(l => ({
+        name: l.name, sub: l.sub, mark: eff.level === l.id ? '\u2713' : '',
+        pick: () => this.setLeash(thread.id, l.id),
+        dot: 'width:8px;height:8px;border-radius:50%;flex:0 0 8px;margin-top:5px;background:' + this.leashColor(l.id),
+        nameStyle: 'font-size:13.5px;color:' + (l.id === 'full' ? this.leashColor('full') : 'var(--text)'),
+        style: 'display:flex;gap:10px;align-items:flex-start;padding:9px 10px;border-radius:8px;cursor:pointer;' + (eff.level === l.id && eff.own ? 'background:var(--sel);' : '')
+      })),
+      leashResetText: eff.own ? 'Clear the override \u00b7 fall back to inherited' : 'Inheriting \u2014 nothing to clear',
+      leashResetStyle: 'padding:8px 10px;margin-top:3px;border-top:1px solid var(--edge);font-size:12.5px;color:var(--faint);' + (eff.own ? 'cursor:pointer;' : 'pointer-events:none;opacity:.6;'),
+      resetLeash: () => this.setLeash(thread.id, null),
+      usagePct: '98% left',
+      usageReset: '\u00b7 resets Aug 16',
+      usageBarStyle: 'height:100%;width:98%;background:var(--accent);border-radius:3px',
+      usageNote: 'Weekly budget, all threads. A full reset is available if you burn it early.',
+      archiveCurrent: () => this.archive(thread.id),
+      undo: () => this.undo()
+    };
+  }
+}
+
+</script>
+</body>
+</html>

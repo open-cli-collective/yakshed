@@ -1,0 +1,17 @@
+name: config-ipc
+description: Reviews YakShed Tauri configuration, commands, events, capabilities, CSP, updater, and WebView-to-Rust boundaries.
+model_tier: medium
+effort: high
+file_globs:
+  - "**/tauri.conf.json"
+  - "**/tauri.conf.json5"
+  - "**/tauri.conf.toml"
+  - "src-tauri/**"
+  - "**/capabilities/**"
+  - "**/permissions/**"
+  - "crates/yakshed-desktop-api/**"
+applies_when:
+  - A change edits Tauri configuration, command/event handlers, the desktop facade, capabilities, permissions, plugins, CSP, sidecars, windows, updater, or frontend/backend DTOs.
+  - Do not select for pure domain, persistence, provider-protocol, or Rust-idiom changes that do not alter the desktop boundary.
+required_on_match: true
+needs_full_file_content: false

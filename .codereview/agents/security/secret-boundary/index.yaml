@@ -1,0 +1,22 @@
+name: secret-boundary
+description: Reviews YakShed credential authority, secret ingress, backend resolution, process delivery, redaction, migration, and cleanup.
+model_tier: medium
+effort: high
+file_globs:
+  - "crates/yakshed-secrets/**"
+  - "crates/yakshed-application/**/*credential*"
+  - "crates/yakshed-application/**/*secret*"
+  - "crates/yakshed-harness/**"
+  - "crates/provider-*/**/*auth*"
+  - "crates/provider-*/**/*credential*"
+  - "crates/yakshed-desktop-api/**/*credential*"
+  - "crates/yakshed-desktop-api/**/*secret*"
+  - "src-tauri/**/*credential*"
+  - "src-tauri/**/*secret*"
+  - "docs/standards/working-with-secrets.md"
+  - "Cargo.toml"
+applies_when:
+  - A change adds or alters credential requirements, delegated login, secret backend configuration, secret references, keyring/1Password/helper integration, secret-bearing IPC, process environment delivery, redaction, rotation, migration, or credential cleanup.
+  - Do not select for authentication-independent provider behavior or generic Rust issues already owned by another reviewer.
+required_on_match: true
+needs_full_file_content: true

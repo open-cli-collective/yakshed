@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+:root{
+  --bg:#FBFAF8; --panel:#F1EFEA; --panel2:#E9E6DF; --reader:#E6E2DA; --readerCard:#FCFBF9;
+  --edge:#DFDBD2; --edge2:#CFCAC0; --text:#232120; --muted:#8B857C; --faint:#AAA49A;
+  --sel:#E0DCD2; --hover:#EAE7E0; --code:#F0EDE6; --accent:oklch(0.55 0.13 42); --live:oklch(0.58 0.11 152);
+  --add:oklch(0.94 0.05 152); --addT:oklch(0.45 0.10 152); --del:oklch(0.93 0.05 30); --delT:oklch(0.48 0.12 30);
+}
+[data-theme="dark"]{
+  --bg:#1A1917; --panel:#131211; --panel2:#1F1E1B; --reader:#232120; --readerCard:#1B1A18;
+  --edge:#2C2A27; --edge2:#3A3733; --text:#EDEAE3; --muted:#8E8880; --faint:#6B655E;
+  --sel:#2A2724; --hover:#232120; --code:#232120; --accent:oklch(0.72 0.11 48); --live:oklch(0.74 0.11 152);
+  --add:oklch(0.32 0.05 152); --addT:oklch(0.80 0.10 152); --del:oklch(0.30 0.05 30); --delT:oklch(0.78 0.10 30);
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;background:var(--bg)}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--edge2);border-radius:9px}
+::-webkit-scrollbar-track{background:transparent}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.82)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slidein{from{transform:translateX(18px);opacity:0}to{transform:translateX(0);opacity:1}}
+</style>
+</helmet>
+
+<div style="position:relative;display:flex;height:100vh;width:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:'Instrument Sans',system-ui,sans-serif;font-size:13.5px;-webkit-font-smoothing:antialiased">
+
+  <div style="width:274px;flex:0 0 274px;background:var(--panel);border-right:1px solid var(--edge);display:flex;flex-direction:column;overflow:hidden">
+    <div style="display:flex;align-items:center;gap:8px;padding:14px 14px 10px 14px">
+      <div style="width:18px;height:18px;border-radius:5px;background:var(--accent)"></div>
+      <div style="font-weight:600;letter-spacing:-0.01em">harness</div>
+      <div style="color:var(--faint);font-size:11px">codex · claude</div>
+      <div style="flex:1"></div>
+      <div onClick="{{ toggleTheme }}" title="Follows your system by default" style="cursor:pointer;color:var(--muted);font-size:11px;font-family:'JetBrains Mono',monospace;padding:3px 6px;border:1px solid var(--edge2);border-radius:5px">{{ themeGlyph }}</div>
+    </div>
+
+    <div style="padding:0 12px 10px 12px;display:flex;flex-direction:column;gap:6px">
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 9px;background:var(--bg);border:1px solid var(--edge);border-radius:7px;color:var(--faint)">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px">/</span>
+        <span style="font-size:12.5px">Search all threads, archived too</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:7px;color:var(--text);font-weight:500" style-hover="background:var(--hover)">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">c</span>
+        <span>New task</span>
+        <span style="flex:1"></span>
+        <span style="font-size:11px;color:var(--faint)">⇧c yak</span>
+      </div>
+    </div>
+
+    <div style="flex:1;overflow-y:auto;padding:2px 8px 8px 8px">
+      <sc-for list="{{ sections }}" as="sec" hint-placeholder-count="3">
+        <div style="margin-top:12px">
+          <div style="display:flex;align-items:center;gap:7px;padding:4px 6px 5px 6px">
+            <span style="font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);font-weight:600">{{ sec.title }}</span>
+            <span style="font-size:10.5px;color:var(--faint);font-family:'JetBrains Mono',monospace">{{ sec.count }}</span>
+            <span style="flex:1;height:1px;background:var(--edge)"></span>
+          </div>
+          <sc-for list="{{ sec.items }}" as="row" hint-placeholder-count="4">
+            <div onClick="{{ row.open }}" style="{{ row.rowStyle }}" style-hover="background:var(--hover)">
+              <div onClick="{{ row.toggleSelect }}" style="{{ row.checkStyle }}">{{ row.checkGlyph }}</div>
+              <div style="{{ row.dotStyle }}"></div>
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <div style="{{ row.titleStyle }}">{{ row.title }}</div>
+                </div>
+                <div style="{{ row.subStyle }}">{{ row.sub }}</div>
+              </div>
+              <sc-for list="{{ row.chips }}" as="chip" hint-placeholder-count="0">
+                <div style="{{ chip.style }}">{{ chip.name }}</div>
+              </sc-for>
+            </div>
+          </sc-for>
+        </div>
+      </sc-for>
+
+      <div style="margin-top:16px">
+        <div style="display:flex;align-items:center;gap:7px;padding:4px 6px 5px 6px">
+          <span style="font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);font-weight:600">Labels</span>
+          <span style="flex:1;height:1px;background:var(--edge)"></span>
+        </div>
+        <sc-for list="{{ labelList }}" as="lab" hint-placeholder-count="5">
+          <div style="display:flex;align-items:center;gap:9px;padding:5px 8px;border-radius:6px;cursor:pointer;color:var(--muted)" style-hover="background:var(--hover);color:var(--text)">
+            <span style="{{ lab.swatch }}"></span>
+            <span style="flex:1;color:var(--text)">{{ lab.name }}</span>
+            <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--faint)">{{ lab.count }}</span>
+          </div>
+        </sc-for>
+        <div onClick="{{ showArchive }}" style="display:flex;align-items:center;gap:9px;padding:7px 8px;margin-top:6px;border-radius:6px;cursor:pointer;color:var(--muted)" style-hover="background:var(--hover)">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:11px">▤</span>
+          <span style="flex:1">Archived</span>
+          <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--faint)">{{ archivedCount }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="border-top:1px solid var(--edge);padding:9px 14px;display:flex;align-items:center;gap:9px;color:var(--muted)">
+      <div style="width:20px;height:20px;border-radius:50%;background:var(--panel2);border:1px solid var(--edge2)"></div>
+      <span style="color:var(--text)">Rian Stockbower</span>
+      <span style="flex:1"></span>
+      <span onClick="{{ toggleHelp }}" style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:11px;border:1px solid var(--edge2);border-radius:4px;padding:1px 5px">?</span>
+    </div>
+  </div>
+
+  <div style="flex:1 1 560px;min-width:380px;display:flex;flex-direction:column;background:var(--bg)">
+    <div style="display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid var(--edge);flex-wrap:nowrap;overflow:hidden">
+      <sc-for list="{{ crumbs }}" as="cr" hint-placeholder-count="1">
+        <div style="display:flex;align-items:center;gap:10px;color:var(--muted);flex:0 1 auto;min-width:0">
+          <span onClick="{{ cr.open }}" style="cursor:pointer;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" style-hover="color:var(--text)">{{ cr.title }}</span>
+          <span style="color:var(--faint);font-size:11px">›</span>
+        </div>
+      </sc-for>
+      <div style="font-weight:600;letter-spacing:-0.01em;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;min-width:60px">{{ thread.title }}</div>
+      <sc-for list="{{ thread.chips }}" as="chip" hint-placeholder-count="2">
+        <div style="{{ chip.style }}">{{ chip.name }}</div>
+      </sc-for>
+      <div onClick="{{ toggleLabels }}" style="cursor:pointer;color:var(--faint);border:1px dashed var(--edge2);border-radius:20px;padding:1px 7px;font-size:11px;white-space:nowrap;flex:0 100 auto;min-width:0;overflow:hidden" style-hover="color:var(--text)">+ label · l</div>
+      <div style="flex:1 1 4px;min-width:4px"></div>
+      <div style="{{ statusStyle }}">{{ statusText }}</div>
+      <div onClick="{{ archiveCurrent }}" style="cursor:pointer;color:var(--muted);padding:3px 8px;border-radius:6px;font-size:12.5px;white-space:nowrap;flex:0 0 auto" style-hover="background:var(--hover);color:var(--text)">Archive <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--faint)">e</span></div>
+      <div onClick="{{ toggleRail }}" style="cursor:pointer;color:var(--muted);padding:3px 8px;border-radius:6px;font-size:12.5px;white-space:nowrap;flex:0 0 auto" style-hover="background:var(--hover);color:var(--text)">Todos <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--faint)">]</span></div>
+      <div onClick="{{ toggleReader }}" style="cursor:pointer;color:var(--muted);padding:3px 8px;border-radius:6px;font-size:12.5px;white-space:nowrap;flex:0 0 auto" style-hover="background:var(--hover);color:var(--text)">Reader <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--faint)">\</span></div>
+    </div>
+
+    <div style="flex:1;overflow-y:auto;padding:26px 0 8px 0">
+      <div style="max-width:720px;margin:0 auto;padding:0 28px;display:flex;flex-direction:column;gap:20px">
+        <sc-for list="{{ messages }}" as="m" hint-placeholder-count="5">
+          <div style="{{ m.wrapStyle }}">
+            <div style="{{ m.bodyStyle }}">
+              <sc-if value="{{ m.isMeta }}" hint-placeholder-val="{{ false }}">
+                <div style="display:flex;align-items:center;gap:9px;padding-bottom:3px">
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">{{ m.meta }}</span>
+                  <span style="flex:1;height:1px;background:var(--edge)"></span>
+                </div>
+              </sc-if>
+              <sc-if value="{{ m.isPlan }}" hint-placeholder-val="{{ false }}">
+                <div onClick="{{ m.openInReader }}" style="cursor:pointer;border:1px solid var(--edge);background:var(--panel);border-radius:9px;padding:12px 14px">
+                  <div style="display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11.5px;font-family:'JetBrains Mono',monospace">PLAN · click to read →</div>
+                  <div style="font-family:'Newsreader',Georgia,serif;font-size:19px;margin-top:6px">{{ m.title }}</div>
+                  <div style="color:var(--muted);margin-top:4px;line-height:1.55;-webkit-mask-image:linear-gradient(to bottom,#000 40%,transparent);max-height:44px;overflow:hidden">{{ m.text }}</div>
+                </div>
+              </sc-if>
+              <sc-if value="{{ m.isText }}" hint-placeholder-val="{{ true }}">
+                <div style="{{ m.textStyle }}">{{ m.text }}</div>
+              </sc-if>
+              <sc-for list="{{ m.bullets }}" as="b" hint-placeholder-count="0">
+                <div style="display:flex;gap:9px;margin-top:5px;line-height:1.6">
+                  <span style="color:var(--faint)">·</span>
+                  <span>{{ b }}</span>
+                </div>
+              </sc-for>
+              <sc-if value="{{ m.isFile }}" hint-placeholder-val="{{ false }}">
+                <div onClick="{{ m.openInReader }}" style="display:inline-flex;align-items:center;gap:8px;margin-top:9px;cursor:pointer;border:1px solid var(--edge);border-radius:7px;padding:6px 10px;background:var(--panel)" style-hover="border-color:var(--edge2)">
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">{{ m.fileKind }}</span>
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:12px">{{ m.fileName }}</span>
+                  <span style="color:var(--faint);font-size:11px">open in reader</span>
+                </div>
+              </sc-if>
+            </div>
+          </div>
+        </sc-for>
+
+        <sc-if value="{{ isWaiting }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;align-items:center;gap:10px;border:1px solid var(--edge2);border-left:2px solid var(--accent);background:var(--panel);border-radius:8px;padding:10px 13px">
+            <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--accent)">WAITING ON YOU</span>
+            <span style="color:var(--muted)">Sat in Waiting for 41m — it needs an approval to continue.</span>
+          </div>
+        </sc-if>
+        <div style="height:8px"></div>
+      </div>
+    </div>
+
+    <div style="padding:0 28px 20px 28px">
+      <div style="max-width:720px;margin:0 auto">
+        <div style="{{ composerStyle }}">
+          <sc-if value="{{ codeMode }}" hint-placeholder-val="{{ false }}">
+            <div style="display:flex;align-items:center;gap:8px;padding:0 2px 7px 2px;color:var(--muted)">
+              <span style="font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--code);border:1px solid var(--edge);border-radius:4px;padding:1px 5px">```{{ codeLang }}</span>
+              <span style="font-size:11.5px">code block — ⇧⏎ for a new line, ⏎ sends</span>
+            </div>
+          </sc-if>
+          <textarea onInput="{{ onDraft }}" onChange="{{ onDraft }}" value="{{ draft }}" placeholder="Reply, or type ``` for a code block" style="{{ inputStyle }}"></textarea>
+          <div style="display:flex;align-items:center;gap:10px;padding-top:8px;color:var(--muted);font-size:12px">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:11px;border:1px solid var(--edge2);border-radius:5px;padding:1px 6px">⌥⏎ approve</span>
+            <span>{{ thread.model }}</span>
+            <span style="flex:1"></span>
+            <span style="font-size:11.5px">⇧c spawns a yak from this thread — it inherits these labels</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <sc-if value="{{ railOpen }}" hint-placeholder-val="{{ true }}">
+    <div style="width:296px;flex:0 1 296px;min-width:236px;border-left:1px solid var(--edge);background:var(--bg);display:flex;flex-direction:column;overflow-y:auto">
+      <div style="padding:13px 16px 8px 16px;display:flex;align-items:center;gap:8px">
+        <span style="font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);font-weight:600">Todo</span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--faint)">{{ todoCount }}</span>
+      </div>
+      <div style="padding:0 10px">
+        <sc-for list="{{ todos }}" as="t" hint-placeholder-count="5">
+          <div onClick="{{ t.toggle }}" style="display:flex;gap:10px;padding:6px 7px;border-radius:6px;cursor:pointer;line-height:1.5" style-hover="background:var(--hover)">
+            <span style="{{ t.boxStyle }}">{{ t.glyph }}</span>
+            <span style="{{ t.textStyle }}">{{ t.text }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="height:1px;background:var(--edge);margin:14px 16px"></div>
+      <div style="padding:0 16px 8px 16px;display:flex;align-items:center;gap:8px">
+        <span style="font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);font-weight:600">Notes</span>
+        <span style="font-size:11px;color:var(--faint)">markdown</span>
+      </div>
+      <div style="padding:0 16px 24px 16px">
+        <sc-for list="{{ noteBlocks }}" as="n" hint-placeholder-count="4">
+          <div style="{{ n.style }}">{{ n.text }}</div>
+        </sc-for>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ readerOpen }}" hint-placeholder-val="{{ true }}">
+    <div style="position:absolute;right:0;top:0;bottom:0;z-index:20;width:600px;max-width:52vw;background:var(--reader);border-left:1px solid var(--edge2);box-shadow:-14px 0 34px rgba(0,0,0,0.10);display:flex;flex-direction:column;overflow:hidden;animation:slidein .18s ease-out">
+      <div style="display:flex;align-items:center;gap:2px;padding:8px 10px 0 10px">
+        <sc-for list="{{ readerTabs }}" as="tab" hint-placeholder-count="2">
+          <div onClick="{{ tab.open }}" style="{{ tab.style }}">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">{{ tab.kind }}</span>
+            <span>{{ tab.name }}</span>
+          </div>
+        </sc-for>
+        <div style="flex:1"></div>
+        <div onClick="{{ toggleReader }}" style="cursor:pointer;color:var(--muted);padding:4px 8px;font-size:12.5px" style-hover="color:var(--text)">close \</div>
+      </div>
+      <div style="flex:1;overflow-y:auto;padding:14px 12px 30px 12px">
+        <div style="background:var(--readerCard);border:1px solid var(--edge);border-radius:10px;padding:26px 30px">
+          <sc-for list="{{ readerBlocks }}" as="b" hint-placeholder-count="8">
+            <div style="{{ b.style }}">{{ b.text }}</div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ showLabels }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;left:290px;top:52px;z-index:40;width:262px;background:var(--bg);border:1px solid var(--edge2);border-radius:10px;box-shadow:0 18px 46px rgba(0,0,0,0.16);padding:8px">
+      <div style="padding:5px 8px 8px 8px;color:var(--muted);font-size:11.5px">Label <span style="color:var(--text)">{{ labelTargetText }}</span> — children inherit</div>
+      <sc-for list="{{ labelList }}" as="lab" hint-placeholder-count="5">
+        <div onClick="{{ lab.toggle }}" style="display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:6px;cursor:pointer" style-hover="background:var(--hover)">
+          <span style="{{ lab.swatch }}"></span>
+          <span style="flex:1">{{ lab.name }}</span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">{{ lab.mark }}</span>
+        </div>
+      </sc-for>
+      <div style="display:flex;align-items:center;gap:8px;padding:7px 8px;margin-top:4px;border-top:1px solid var(--edge);color:var(--faint);font-size:12px">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px">↵</span> create new label
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:50;display:flex;align-items:center;gap:14px;background:var(--text);color:var(--bg);border-radius:9px;padding:10px 16px;box-shadow:0 14px 34px rgba(0,0,0,0.22);font-size:12.5px">
+      <span>{{ toast }}</span>
+      <span onClick="{{ undo }}" style="cursor:pointer;text-decoration:underline;opacity:.75">Undo · z</span>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ showHelp }}" hint-placeholder-val="{{ false }}">
+    <div onClick="{{ toggleHelp }}" style="position:fixed;inset:0;z-index:60;background:rgba(20,18,16,0.42);display:flex;align-items:center;justify-content:center">
+      <div style="width:620px;background:var(--bg);border:1px solid var(--edge2);border-radius:14px;padding:26px 30px;box-shadow:0 30px 70px rgba(0,0,0,0.3)">
+        <div style="font-family:'Newsreader',Georgia,serif;font-size:22px;margin-bottom:4px">Keys</div>
+        <div style="color:var(--muted);margin-bottom:18px">Gmail muscle memory, pointed at agent sessions.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 30px">
+          <sc-for list="{{ keys }}" as="k" hint-placeholder-count="10">
+            <div style="display:flex;align-items:baseline;gap:10px;border-bottom:1px solid var(--edge);padding-bottom:7px">
+              <span style="font-family:'JetBrains Mono',monospace;font-size:11.5px;border:1px solid var(--edge2);border-radius:5px;padding:1px 6px;color:var(--text)">{{ k.k }}</span>
+              <span style="color:var(--muted)">{{ k.d }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{}">
+class Component extends DCLogic {
+  LABELS = [
+    { id: 'infosec', name: 'infosec', hue: 42 },
+    { id: 'devserver', name: 'devserver', hue: 152 },
+    { id: 'q3', name: 'q3-commit', hue: 250 },
+    { id: 'research', name: 'research', hue: 300 },
+    { id: 'chore', name: 'chore', hue: 90 }
+  ];
+
+  THREADS = [
+    { id: 'infosec', parent: null, title: 'Find 2026 infosec signoff gaps', state: 'waiting', unread: true, labels: ['infosec', 'q3'], sub: 'needs approval to read Confluence · 41m', model: '5.6 Luna Max' },
+    { id: 'scan', parent: 'infosec', title: 'cloud-container-scanning', state: 'active', unread: false, labels: [], sub: 'working 1m 9s', model: '5.6 Luna Max' },
+    { id: 'slack', parent: 'infosec', title: 'slack-administrivia', state: 'idle', unread: true, labels: ['chore'], sub: 'finished · 3 files changed', model: '5.6 Sol' },
+    { id: 'migrate', parent: null, title: 'migrate-q2-devserver-cli', state: 'active', unread: false, labels: ['devserver', 'q3'], sub: 'working 4m 12s · 2 yaks open', model: '5.6 Sol High' },
+    { id: 'mcp', parent: 'migrate', title: 'harness-eng-desktop-mcp', state: 'waiting', unread: true, labels: [], sub: 'asked you a question · 6m', model: '5.6 Sol' },
+    { id: 'patterns', parent: 'migrate', title: 'devserver-patterns-true-up', state: 'idle', unread: false, labels: [], sub: 'plan ready to review', model: '5.6 Sol' },
+    { id: 'csv', parent: 'patterns', title: 'locations-in-csv-exports', state: 'idle', unread: false, labels: [], sub: 'yak of a yak · closed loop, unarchived', model: '5.6 Sol' },
+    { id: 'bai', parent: null, title: 'bai-location-data-centralbanc', state: 'idle', unread: false, labels: ['research'], sub: '72,598 rows mapped · yesterday', model: '5.6 Sol High' }
+  ];
+
+  TRANSCRIPTS = {
+    migrate: [
+      { kind: 'user', text: 'Move the devserver CLI off the Q2 shim. Anything that turns into its own rabbit hole, spawn a yak — don\u2019t inline it here.' },
+      { kind: 'meta', meta: 'Worked for 2m 04s  \u203a  14 files read, 3 written' },
+      { kind: 'agent', text: 'The shim only leaks in two places: argument parsing and the region lookup. Parsing is a contained rename. The region lookup is not \u2014 it reaches into the CSV export path, so I opened that as a yak rather than dragging it in here.' },
+      { kind: 'agent', text: 'Two yaks now hang off this thread and inherit devserver and q3-commit:', bullets: ['harness-eng-desktop-mcp \u2014 waiting on you, the MCP socket name changed', 'devserver-patterns-true-up \u2014 plan ready, spawned locations-in-csv-exports beneath it'] },
+      { kind: 'plan', title: 'Retire the Q2 devserver shim', text: 'Replace shim-owned arg parsing with the native parser, keep the region lookup behind its current interface until the CSV yak lands, then delete the shim module in one commit so bisect stays clean.' },
+      { kind: 'user', text: 'Good. Land parsing now, hold the lookup until the yak closes.' },
+      { kind: 'meta', meta: 'Worked for 4m 12s' },
+      { kind: 'agent', text: 'Parsing is migrated and the suite is green. Diff is in the reader \u2014 the shim delete is staged but not committed, since it would break the two open yaks.', file: 'cli.rs', fileKind: 'DIFF', tab: 1 }
+    ],
+    infosec: [
+      { kind: 'user', text: 'What is outstanding on the 2026 infosec calendar signoff?' },
+      { kind: 'meta', meta: 'Worked for 1m 09s' },
+      { kind: 'agent', text: 'I can reach the signoff page but the quarterly attestation child pages are in a restricted space. Approving the read once will let me trace every linked action item and owner.' },
+      { kind: 'agent', text: 'Approve the Confluence read for INFOSEC, or should I work from the exported PDF you dropped last week instead?' }
+    ],
+    fallback: [
+      { kind: 'user', text: 'Pick this back up where we left it.' },
+      { kind: 'meta', meta: 'Worked for 44s' },
+      { kind: 'agent', text: 'Loop is closed on my side \u2014 nothing is pending. Archiving this keeps it out of your way and it stays fully readable and searchable; nothing gets moved off disk or needs unarchiving to reference.' }
+    ]
+  };
+
+  TODOS = {
+    migrate: [
+      { id: 1, text: 'Native arg parser replaces shim parsing', done: true },
+      { id: 2, text: 'Suite green on linux + darwin', done: true },
+      { id: 3, text: 'Hold shim delete until CSV yak closes', done: false },
+      { id: 4, text: 'Answer the MCP socket-name question', done: false },
+      { id: 5, text: 'One commit for the delete, keep bisect clean', done: false }
+    ],
+    infosec: [
+      { id: 1, text: 'Approve restricted-space read', done: false },
+      { id: 2, text: 'Trace owners per quarterly attestation', done: false },
+      { id: 3, text: 'Flag schedule mismatches vs 2025', done: false }
+    ],
+    fallback: [
+      { id: 1, text: 'Nothing outstanding', done: true }
+    ]
+  };
+
+  NOTES = {
+    migrate: '## Why this is open\nThe shim delete is the last step, but it is load-bearing for two yaks. Both inherit `devserver` so they surface together in the label view.\n- close MCP question first, it is cheap\n- CSV yak is the real blocker\n## After landing\nArchive this thread and both yaks in one keystroke.',
+    infosec: '## Blocked\nRestricted space read. Ask Dana if the PDF export is authoritative.\n- 2025 signoff had 4 quarterly gaps\n- watch for the yearly/quarterly overlap',
+    fallback: '## Notes\nNothing here yet. Markdown renders as you type.'
+  };
+
+  PLAN_MD = '# Retire the Q2 devserver shim\n## Summary\nThe shim was a bridge for one quarter and now owns two responsibilities it should not: CLI argument parsing and the region lookup. Parsing moves cleanly. The lookup does not, so it stays behind its current interface until the CSV export yak resolves.\n## Sequence\n- Swap shim parsing for the native parser, preserving flag order and the two undocumented aliases.\n- Keep `region::lookup` calling through the shim facade so no yak breaks mid-flight.\n- Delete the shim module in a single commit once both yaks close, so a bisect never lands inside a half-migrated tree.\n## Risks\n- The undocumented aliases are used by two internal scripts and are not covered by tests.\n- Darwin builds resolve the socket path differently, which is what the MCP yak is about.\n## Not doing\n- Touching the CSV export path from this thread. That is the yak, and it has its own labels and todo list.';
+
+  DIFF = [
+    { t: 'crates/devserver-cli/src/cli.rs', k: 'file' },
+    { t: '@@ -18,11 +18,9 @@ pub fn parse(args: &[String]) -> Result<Opts>', k: 'hunk' },
+    { t: '     let mut opts = Opts::default();', k: 'ctx' },
+    { t: '-    let shim = q2shim::Compat::new(args);', k: 'del' },
+    { t: '-    opts.port = shim.port_or_default(8787);', k: 'del' },
+    { t: '-    opts.watch = shim.flag("watch");', k: 'del' },
+    { t: '+    let mut p = Parser::new(args);', k: 'add' },
+    { t: '+    opts.port = p.u16("--port").unwrap_or(8787);', k: 'add' },
+    { t: '+    opts.watch = p.flag("--watch") || p.flag("-w");', k: 'add' },
+    { t: '     // region lookup still goes through the facade until', k: 'ctx' },
+    { t: '     // locations-in-csv-exports lands (yak of devserver-patterns)', k: 'ctx' },
+    { t: '     opts.region = q2shim::region::lookup(&opts.zip)?;', k: 'ctx' },
+    { t: '@@ -41,6 +39,7 @@ mod tests', k: 'hunk' },
+    { t: '+    #[test] fn accepts_legacy_w_alias() { assert!(parse(&sv(["-w"])).unwrap().watch); }', k: 'add' }
+  ];
+
+  KEYS = [
+    { k: 'x', d: 'select thread' }, { k: 'l', d: 'label (children inherit)' },
+    { k: 'e', d: 'archive thread + its yaks' }, { k: 'z', d: 'undo last archive' },
+    { k: 'c / \u21e7c', d: 'new task / new yak here' }, { k: '/', d: 'search, archived included' },
+    { k: 'j k', d: 'next / previous thread' }, { k: 'u', d: 'mark unread' },
+    { k: ']', d: 'todo + notes rail' }, { k: '\\', d: 'reading pane' },
+    { k: '``` ', d: 'code block in the composer' }, { k: '?', d: 'this list' }
+  ];
+
+  state = {
+    sel: 'migrate', picked: {}, railOpen: true, readerOpen: true, tab: 0,
+    showLabels: false, showHelp: false, toast: null, draft: '', theme: 'light',
+    archived: {}, done: {}, undoList: null
+  };
+
+  componentDidMount() {
+    const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    this.setTheme(dark ? 'dark' : 'light');
+    this._key = (e) => {
+      const tag = (e.target.tagName || '').toLowerCase();
+      if (tag === 'textarea' || tag === 'input') return;
+      const k = e.key;
+      if (k === 'x') this.togglePick(this.state.sel);
+      else if (k === 'l') this.setState({ showLabels: !this.state.showLabels });
+      else if (k === 'e') this.archive(this.state.sel);
+      else if (k === 'z') this.undo();
+      else if (k === ']') this.setState({ railOpen: !this.state.railOpen });
+      else if (k === '\\') this.setState({ readerOpen: !this.state.readerOpen });
+      else if (k === '?') this.setState({ showHelp: !this.state.showHelp });
+      else if (k === 'd') this.setTheme(this.state.theme === 'dark' ? 'light' : 'dark');
+      else if (k === 'j' || k === 'k') this.step(k === 'j' ? 1 : -1);
+      else if (k === 'Escape') this.setState({ showLabels: false, showHelp: false });
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', this._key);
+  }
+  componentWillUnmount() { window.removeEventListener('keydown', this._key); }
+
+  setTheme(t) { document.documentElement.setAttribute('data-theme', t); this.setState({ theme: t }); }
+
+  open() { return this.THREADS.filter(t => !this.state.archived[t.id]); }
+  step(d) {
+    const list = this.open(); const i = list.findIndex(t => t.id === this.state.sel);
+    const n = list[Math.min(list.length - 1, Math.max(0, i + d))];
+    if (n) this.setState({ sel: n.id });
+  }
+  togglePick(id) {
+    const p = Object.assign({}, this.state.picked); if (p[id]) delete p[id]; else p[id] = true;
+    this.setState({ picked: p });
+  }
+  descendants(id) {
+    let out = [id], added = true;
+    while (added) { added = false; this.THREADS.forEach(t => { if (t.parent && out.indexOf(t.parent) > -1 && out.indexOf(t.id) < 0) { out.push(t.id); added = true; } }); }
+    return out;
+  }
+  archive(id) {
+    const ids = this.descendants(id);
+    const a = Object.assign({}, this.state.archived); ids.forEach(i => a[i] = true);
+    const next = this.open().find(t => ids.indexOf(t.id) < 0);
+    this.setState({
+      archived: a, undoList: ids, picked: {},
+      sel: next ? next.id : this.state.sel,
+      toast: ids.length > 1 ? 'Archived ' + ids.length + ' threads \u2014 parent and its yaks. Still readable, still searchable.' : 'Archived \u2014 still readable, still searchable.'
+    });
+    clearTimeout(this._t); this._t = setTimeout(() => this.setState({ toast: null }), 6000);
+  }
+  undo() {
+    if (!this.state.undoList) return;
+    const a = Object.assign({}, this.state.archived); this.state.undoList.forEach(i => delete a[i]);
+    this.setState({ archived: a, toast: null, undoList: null });
+  }
+  ancestors(t) {
+    const out = []; let cur = t;
+    while (cur && cur.parent) { cur = this.THREADS.find(x => x.id === cur.parent); if (cur) out.unshift(cur); }
+    return out;
+  }
+  effLabels(t) {
+    const own = t.labels.map(id => ({ id, own: true }));
+    const inh = [];
+    this.ancestors(t).forEach(a => a.labels.forEach(id => { if (!own.find(o => o.id === id) && !inh.find(o => o.id === id)) inh.push({ id, own: false }); }));
+    return own.concat(inh);
+  }
+  chip(l) {
+    const def = this.LABELS.find(x => x.id === l.id); if (!def) return null;
+    const c = 'oklch(0.56 0.10 ' + def.hue + ')';
+    const base = 'font-size:10.5px;letter-spacing:0.01em;padding:1px 7px;border-radius:20px;white-space:nowrap;color:' + c + ';';
+    return { name: def.name, style: l.own ? base + 'border:1px solid ' + c + '55;background:' + c + '18' : base + 'border:1px dashed ' + c + '66;opacity:.72' };
+  }
+  toggleLabel(id) {
+    const t = this.THREADS.find(x => x.id === this.state.sel);
+    const targets = Object.keys(this.state.picked).length ? Object.keys(this.state.picked) : [t.id];
+    targets.forEach(tid => {
+      const th = this.THREADS.find(x => x.id === tid); if (!th) return;
+      const i = th.labels.indexOf(id); if (i > -1) th.labels.splice(i, 1); else th.labels.push(id);
+    });
+    this.forceUpdate();
+  }
+  md(src) {
+    return src.split('\n').filter(l => l.trim()).map(line => {
+      if (line.indexOf('# ') === 0) return { text: line.slice(2), style: "font-family:'Newsreader',Georgia,serif;font-size:27px;line-height:1.2;margin:2px 0 12px 0;letter-spacing:-0.01em" };
+      if (line.indexOf('## ') === 0) return { text: line.slice(3), style: "font-family:'Newsreader',Georgia,serif;font-size:18px;margin:20px 0 7px 0;color:var(--text)" };
+      if (line.indexOf('- ') === 0) return { text: '\u2014  ' + line.slice(2), style: 'line-height:1.68;color:var(--text);margin:5px 0 5px 4px;padding-left:14px;text-indent:-14px' };
+      return { text: line, style: 'line-height:1.72;color:var(--text);margin:8px 0;text-wrap:pretty' };
+    });
+  }
+
+  renderVals() {
+    const s = this.state;
+    const thread = this.THREADS.find(t => t.id === s.sel) || this.THREADS[0];
+    const openThreads = this.open();
+
+    const mkRow = (t, depth) => {
+      const isSel = t.id === s.sel, picked = !!s.picked[t.id];
+      const dot = t.state === 'active'
+        ? 'width:6px;height:6px;border-radius:50%;background:var(--live);animation:pulse 1.4s ease-in-out infinite;flex:0 0 6px;margin-top:6px'
+        : t.state === 'waiting'
+          ? 'width:6px;height:6px;border-radius:50%;background:var(--accent);flex:0 0 6px;margin-top:6px'
+          : 'width:6px;height:6px;border-radius:50%;background:transparent;border:1px solid var(--edge2);flex:0 0 6px;margin-top:6px';
+      return {
+        title: t.title, sub: t.sub, open: () => this.setState({ sel: t.id }),
+        toggleSelect: (e) => { e.stopPropagation(); this.togglePick(t.id); },
+        rowStyle: 'display:flex;align-items:flex-start;gap:8px;padding:6px 8px 6px ' + (8 + depth * 15) + 'px;border-radius:6px;cursor:pointer;position:relative;' + (isSel ? 'background:var(--sel);' : '') + (depth ? 'border-left:1px solid var(--edge);margin-left:' + (6 + depth * 5) + 'px;' : ''),
+        checkStyle: 'width:13px;height:13px;flex:0 0 13px;margin-top:3px;border-radius:3px;border:1px solid ' + (picked ? 'var(--accent)' : 'var(--edge2)') + ';background:' + (picked ? 'var(--accent)' : 'transparent') + ';color:var(--bg);font-size:9px;display:flex;align-items:center;justify-content:center',
+        checkGlyph: picked ? '\u2713' : '',
+        dotStyle: dot,
+        titleStyle: 'font-size:12.8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' + (t.unread ? 'font-weight:600;color:var(--text)' : 'font-weight:400;color:var(--text)'),
+        subStyle: 'font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px',
+        chips: this.effLabels(t).map(l => this.chip(l)).filter(Boolean).slice(0, 1)
+      };
+    };
+
+    const tree = [];
+    const walk = (parent, depth) => {
+      openThreads.filter(t => t.parent === parent).forEach(t => { tree.push(mkRow(t, depth)); walk(t.id, depth + 1); });
+    };
+    walk(null, 0);
+
+    const active = openThreads.filter(t => t.state === 'active');
+    const waiting = openThreads.filter(t => t.state === 'waiting');
+    const sections = [
+      { title: 'Active', count: active.length, items: active.map(t => mkRow(t, 0)) },
+      { title: 'Waiting on you', count: waiting.length, items: waiting.map(t => mkRow(t, 0)) },
+      { title: 'Inbox', count: openThreads.length, items: tree }
+    ];
+
+    const raw = this.TRANSCRIPTS[thread.id] || this.TRANSCRIPTS.fallback;
+    const messages = raw.map(m => ({
+      isMeta: m.kind === 'meta', isPlan: m.kind === 'plan', isText: m.kind !== 'meta' && m.kind !== 'plan',
+      isFile: !!m.file, fileName: m.file, fileKind: m.fileKind,
+      openInReader: () => this.setState({ readerOpen: true, tab: m.tab != null ? m.tab : 0 }),
+      meta: m.meta, title: m.title, text: m.text, bullets: m.bullets || [],
+      wrapStyle: m.kind === 'user' ? 'display:flex;justify-content:flex-end' : 'display:block',
+      bodyStyle: m.kind === 'user'
+        ? 'max-width:82%;background:var(--panel);border:1px solid var(--edge);border-radius:12px 12px 4px 12px;padding:11px 15px;line-height:1.6'
+        : 'display:block',
+      textStyle: m.kind === 'meta' ? 'display:none' : 'line-height:1.72;text-wrap:pretty;font-size:14px'
+    }));
+
+    const todosSrc = this.TODOS[thread.id] || this.TODOS.fallback;
+    const todos = todosSrc.map(t => {
+      const key = thread.id + ':' + t.id;
+      const done = s.done[key] != null ? s.done[key] : t.done;
+      return {
+        text: t.text, glyph: done ? '\u2713' : '',
+        toggle: () => { const d = Object.assign({}, s.done); d[key] = !done; this.setState({ done: d }); },
+        boxStyle: 'width:14px;height:14px;flex:0 0 14px;margin-top:3px;border-radius:3px;border:1px solid ' + (done ? 'var(--live)' : 'var(--edge2)') + ';background:' + (done ? 'var(--live)' : 'transparent') + ';color:var(--bg);font-size:10px;display:flex;align-items:center;justify-content:center',
+        textStyle: done ? 'color:var(--faint);text-decoration:line-through' : 'color:var(--text)'
+      };
+    });
+
+    const codeMode = s.draft.indexOf('```') > -1;
+    const tabs = [
+      { kind: 'MD', name: 'plan.md' },
+      { kind: 'DIFF', name: 'cli.rs' }
+    ];
+    const readerBlocks = s.tab === 0 ? this.md(this.PLAN_MD) : this.DIFF.map(l => {
+      const mono = "font-family:'JetBrains Mono',monospace;font-size:11.8px;line-height:1.72;white-space:pre;padding:0 8px;border-radius:3px;";
+      const styles = {
+        file: mono + 'color:var(--muted);border-bottom:1px solid var(--edge);padding-bottom:8px;margin-bottom:8px',
+        hunk: mono + 'color:var(--muted);background:var(--code);margin:10px 0 4px 0;padding:3px 8px',
+        add: mono + 'background:var(--add);color:var(--addT)',
+        del: mono + 'background:var(--del);color:var(--delT)',
+        ctx: mono + 'color:var(--text);opacity:.8'
+      };
+      return { text: l.t, style: styles[l.k] };
+    });
+
+    const doneCount = todos.filter(t => t.glyph).length;
+    const pickedCount = Object.keys(s.picked).length;
+
+    return {
+      sections, crumbs: this.ancestors(thread).map(a => ({ title: a.title, open: () => this.setState({ sel: a.id }) })),
+      thread: { title: thread.title, model: thread.model, chips: this.effLabels(thread).map(l => this.chip(l)).filter(Boolean) },
+      messages, todos, todoCount: doneCount + '/' + todos.length,
+      noteBlocks: this.md(this.NOTES[thread.id] || this.NOTES.fallback).map(b => ({ text: b.text, style: b.style + ';font-size:12.5px' })),
+      isWaiting: thread.state === 'waiting',
+      statusText: thread.state === 'active' ? 'working' : thread.state === 'waiting' ? 'waiting on you' : 'idle',
+      statusStyle: 'font-size:11px;font-family:\'JetBrains Mono\',monospace;padding:2px 8px;border-radius:20px;white-space:nowrap;flex:0 0 auto;' + (thread.state === 'active' ? 'color:var(--live);border:1px solid var(--live)55' : thread.state === 'waiting' ? 'color:var(--accent);border:1px solid var(--accent)55' : 'color:var(--faint);border:1px solid var(--edge2)'),
+      labelList: this.LABELS.map(l => ({
+        name: l.name, count: this.open().filter(t => this.effLabels(t).find(x => x.id === l.id)).length,
+        mark: thread.labels.indexOf(l.id) > -1 ? '\u2713' : '',
+        toggle: () => this.toggleLabel(l.id),
+        swatch: 'width:9px;height:9px;border-radius:2px;flex:0 0 9px;background:oklch(0.56 0.10 ' + l.hue + ')'
+      })),
+      labelTargetText: pickedCount ? pickedCount + ' selected threads' : thread.title,
+      archivedCount: Object.keys(s.archived).length,
+      showArchive: () => this.setState({ toast: 'Archived threads open read-only in place \u2014 no unarchive step.' }),
+      railOpen: s.railOpen, readerOpen: s.readerOpen, showLabels: s.showLabels, showHelp: s.showHelp, toast: s.toast,
+      readerTabs: tabs.map((t, i) => ({
+        kind: t.kind, name: t.name, open: () => this.setState({ tab: i }),
+        style: 'display:flex;align-items:center;gap:7px;padding:7px 13px;border-radius:8px 8px 0 0;cursor:pointer;font-size:12.5px;' + (s.tab === i ? 'background:var(--readerCard);border:1px solid var(--edge);border-bottom-color:var(--readerCard);margin-bottom:-1px' : 'color:var(--muted);border:1px solid transparent')
+      })),
+      readerBlocks, keys: this.KEYS, codeMode, codeLang: 'rust',
+      draft: s.draft,
+      onDraft: (e) => this.setState({ draft: e.target.value }),
+      onComposerKey: () => {},
+      composerStyle: 'border:1px solid ' + (codeMode ? 'var(--edge2)' : 'var(--edge)') + ';background:' + (codeMode ? 'var(--code)' : 'var(--panel)') + ';border-radius:12px;padding:12px 14px 10px 14px',
+      inputStyle: 'width:100%;min-height:' + (codeMode ? '104px' : '46px') + ';resize:none;border:0;outline:none;background:transparent;color:var(--text);line-height:1.6;' + (codeMode ? "font-family:'JetBrains Mono',monospace;font-size:12.5px" : "font-family:'Instrument Sans',system-ui,sans-serif;font-size:14px"),
+      toggleRail: () => this.setState({ railOpen: !s.railOpen }),
+      toggleReader: () => this.setState({ readerOpen: !s.readerOpen }),
+      toggleLabels: () => this.setState({ showLabels: !s.showLabels }),
+      toggleHelp: () => this.setState({ showHelp: !s.showHelp }),
+      toggleTheme: () => this.setTheme(s.theme === 'dark' ? 'light' : 'dark'),
+      themeGlyph: s.theme === 'dark' ? 'dark \u25cf' : 'light \u25cb',
+      archiveCurrent: () => this.archive(thread.id),
+      undo: () => this.undo()
+    };
+  }
+}
+
+</script>
+</body>
+</html>

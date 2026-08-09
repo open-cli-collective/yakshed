@@ -1,0 +1,16 @@
+name: implementation-tests
+description: Reviews YakShed Rust changes for correctness, idiomatic implementation, concurrency safety, and tests that prove changed behavior.
+model_tier: medium
+effort: medium
+file_globs:
+  - "**/*.rs"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "**/Cargo.toml"
+  - "**/build.rs"
+  - "rust-toolchain"
+  - "rust-toolchain.toml"
+applies_when:
+  - A change touches Rust source, workspace dependencies, build scripts, concurrency, persistence code, process supervision, or behavior that should be proven by Rust tests.
+  - Do not select solely for architecture, credential-policy, or Tauri capability concerns owned by dedicated reviewers; report implementation-level defects within those files when they are independently actionable.
+needs_full_file_content: false
