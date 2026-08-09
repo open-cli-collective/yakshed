@@ -2,13 +2,13 @@ use std::{fs, sync::Arc};
 
 use tempfile::TempDir;
 use yakshed_application::{
-    AppStore, ApprovalResolution, Clock, ConfigChange, ConfigRevision, CreateProject, CreateRun,
-    CreateWorkItem, IdGenerator, ListTimeline, ListWorkItems, NewTimelineItem, PendingApproval,
-    StoreError, TimelineBatch,
+    AppStore, BeginApprovalResponse, Clock, ConfigChange, ConfigRevision, ConfirmApprovalResponse,
+    CreateProject, CreateRun, CreateWorkItem, IdGenerator, ListTimeline, ListWorkItems,
+    NewTimelineItem, PendingApproval, StoreError, TimelineBatch,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, AuditEventId, NamespacedProviderId, ProjectId, RunId,
-    TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
+    ApprovalDecision, ApprovalRequestId, ApprovalStatus, AuditEventId, NamespacedProviderId,
+    ProjectId, RunId, TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
 };
 use yakshed_store::{AppPaths, ConfigStore, SqliteStore};
 
@@ -62,6 +62,7 @@ impl Clock for FixedClock {
 struct Context {
     _temp: TempDir,
     paths: AppPaths,
+    ids: Arc<TestIds>,
     store: Arc<SqliteStore>,
 }
 
@@ -69,16 +70,14 @@ impl Context {
     async fn open() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
-        let store = SqliteStore::open(
-            paths.clone(),
-            Arc::new(FixedClock),
-            Arc::new(TestIds::new()),
-        )
-        .await
-        .unwrap();
+        let ids = Arc::new(TestIds::new());
+        let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock))
+            .await
+            .unwrap();
         Self {
             _temp: temp,
             paths,
+            ids,
             store: Arc::new(store),
         }
     }
@@ -86,6 +85,7 @@ impl Context {
     async fn project(&self) -> ProjectId {
         self.store
             .create_project(CreateProject {
+                id: self.ids.next_project_id(),
                 name: "YakShed".into(),
             })
             .await
@@ -155,7 +155,7 @@ async fn newer_schema_is_rejected_without_modification() {
     let before = fs::read(&database).unwrap();
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
+        SqliteStore::open(paths, Arc::new(FixedClock)).await,
         Err(StoreError::UnsupportedNewerSchema {
             found: 99,
             supported: 1
@@ -180,7 +180,7 @@ async fn incompatible_prior_schema_is_classified_as_migration_failure_and_retain
     drop(connection);
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
+        SqliteStore::open(paths, Arc::new(FixedClock)).await,
         Err(StoreError::Migration(_))
     ));
     let connection = rusqlite::Connection::open(database).unwrap();
@@ -200,25 +200,26 @@ async fn unusable_data_root_is_classified_as_open_failure() {
     fs::write(&paths.data_root, b"not a directory").unwrap();
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
+        SqliteStore::open(paths, Arc::new(FixedClock)).await,
         Err(StoreError::Open(_))
     ));
 }
 
 #[tokio::test]
-async fn foreign_keys_reject_orphan_edges_and_runs_without_partial_work() {
+async fn missing_references_are_not_found_without_partial_work() {
     let context = Context::open().await;
     let project_id = context.project().await;
     assert!(matches!(
         context
             .store
             .create_work_item(CreateWorkItem {
+                id: context.ids.next_work_item_id(),
                 project_id,
                 title: "orphan child".into(),
                 parent_id: Some(missing_work_item()),
             })
             .await,
-        Err(StoreError::Integrity(_))
+        Err(StoreError::NotFound { .. })
     ));
     assert!(
         context
@@ -233,11 +234,190 @@ async fn foreign_keys_reject_orphan_edges_and_runs_without_partial_work() {
         context
             .store
             .create_run(CreateRun {
+                id: context.ids.next_run_id(),
                 work_item_id: missing_work_item(),
                 provider_run: None,
             })
             .await,
-        Err(StoreError::Integrity(_))
+        Err(StoreError::NotFound { .. })
+    ));
+    assert!(matches!(
+        context
+            .store
+            .create_work_item(CreateWorkItem {
+                id: context.ids.next_work_item_id(),
+                project_id: "0193f26e-7a72-7000-8000-00000000fffe".parse().unwrap(),
+                title: "missing project".into(),
+                parent_id: None,
+            })
+            .await,
+        Err(StoreError::NotFound {
+            entity: "project",
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn duplicate_provider_id_is_a_conflict() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "provider conflict".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let provider_id = NamespacedProviderId::new("mock", "same-run").unwrap();
+    context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            work_item_id: work.id,
+            provider_run: Some(provider_id.clone()),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        context
+            .store
+            .create_run(CreateRun {
+                id: context.ids.next_run_id(),
+                work_item_id: work.id,
+                provider_run: Some(provider_id),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn repeated_create_commands_are_idempotent_by_supplied_id() {
+    let context = Context::open().await;
+    let project_command = CreateProject {
+        id: context.ids.next_project_id(),
+        name: "idempotent".into(),
+    };
+    let project = context
+        .store
+        .create_project(project_command.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        context.store.create_project(project_command).await.unwrap(),
+        project
+    );
+    assert!(matches!(
+        context
+            .store
+            .create_project(CreateProject {
+                id: project.id,
+                name: "different".into(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let work_command = CreateWorkItem {
+        id: context.ids.next_work_item_id(),
+        project_id: project.id,
+        title: "same command".into(),
+        parent_id: None,
+    };
+    let work = context
+        .store
+        .create_work_item(work_command.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        context.store.create_work_item(work_command).await.unwrap(),
+        work
+    );
+    let run_command = CreateRun {
+        id: context.ids.next_run_id(),
+        work_item_id: work.id,
+        provider_run: None,
+    };
+    let run = context.store.create_run(run_command.clone()).await.unwrap();
+    assert_eq!(context.store.create_run(run_command).await.unwrap(), run);
+    let approval_command = PendingApproval {
+        id: context.ids.next_approval_request_id(),
+        run_id: run.id,
+        provider_id: NamespacedProviderId::new("mock", "idempotent-approval").unwrap(),
+        kind: "command".into(),
+        summary: "same command".into(),
+    };
+    let approval = context
+        .store
+        .record_pending_approval(approval_command.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        context
+            .store
+            .record_pending_approval(approval_command)
+            .await
+            .unwrap(),
+        approval
+    );
+    assert_eq!(
+        context
+            .store
+            .list_projects(None, 10)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        context
+            .store
+            .list_work_items(ListWorkItems::for_project(project.id, 10))
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        context
+            .store
+            .list_active_runs(None, 10)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        context
+            .store
+            .list_pending_approvals(None, 10)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_non_v7_app_id() {
+    let context = Context::open().await;
+    assert!(matches!(
+        context
+            .store
+            .create_project(CreateProject {
+                id: uuid::Uuid::nil().into(),
+                name: "invalid id".into(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
     ));
 }
 
@@ -248,6 +428,7 @@ async fn archive_subtree_preserves_archived_records() {
     let root = context
         .store
         .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
             project_id,
             title: "root".into(),
             parent_id: None,
@@ -257,6 +438,7 @@ async fn archive_subtree_preserves_archived_records() {
     let child = context
         .store
         .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
             project_id,
             title: "child".into(),
             parent_id: Some(root.id),
@@ -266,6 +448,7 @@ async fn archive_subtree_preserves_archived_records() {
     let grandchild = context
         .store
         .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
             project_id,
             title: "grandchild".into(),
             parent_id: Some(child.id),
@@ -283,6 +466,18 @@ async fn archive_subtree_preserves_archived_records() {
         assert_eq!(archived.status, WorkItemStatus::Archived);
         assert_eq!(archived.revision.get(), 2);
     }
+    assert!(matches!(
+        context
+            .store
+            .create_work_item(CreateWorkItem {
+                id: context.ids.next_work_item_id(),
+                project_id,
+                title: "too late".into(),
+                parent_id: Some(root.id),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     assert!(
         context
             .store
@@ -315,6 +510,7 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         context
             .store
             .create_work_item(CreateWorkItem {
+                id: context.ids.next_work_item_id(),
                 project_id,
                 title: title.into(),
                 parent_id: None,
@@ -346,6 +542,7 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
     let run = context
         .store
         .create_run(CreateRun {
+            id: context.ids.next_run_id(),
             work_item_id: first.items[0].id,
             provider_run: None,
         })
@@ -357,13 +554,16 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
             run_id: run.id,
             source_namespace: "mock".into(),
             stream_id: "session/opaque".into(),
+            expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
             items: vec![
                 NewTimelineItem {
+                    id: context.ids.next_timeline_item_id(),
                     kind: "message".into(),
                     body: "first".into(),
                     provider_id: None,
                 },
                 NewTimelineItem {
+                    id: context.ids.next_timeline_item_id(),
                     kind: "message".into(),
                     body: "second".into(),
                     provider_id: None,
@@ -372,6 +572,51 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         })
         .await
         .unwrap();
+    assert!(matches!(
+        context
+            .store
+            .append_timeline_batch(TimelineBatch {
+                run_id: run.id,
+                source_namespace: "mock".into(),
+                stream_id: "session/opaque".into(),
+                expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
+                items: vec![NewTimelineItem {
+                    id: context.ids.next_timeline_item_id(),
+                    kind: "message".into(),
+                    body: "replayed".into(),
+                    provider_id: None,
+                }],
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let other_run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            work_item_id: first.items[0].id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        context
+            .store
+            .append_timeline_batch(TimelineBatch {
+                run_id: other_run.id,
+                source_namespace: "mock".into(),
+                stream_id: "session/opaque".into(),
+                expected_stream_revision: revision_two,
+                items: vec![NewTimelineItem {
+                    id: context.ids.next_timeline_item_id(),
+                    kind: "message".into(),
+                    body: "wrong run".into(),
+                    provider_id: None,
+                }],
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     let opaque = NamespacedProviderId::new("mock", "turn/α:opaque").unwrap();
     let revision_three = context
         .store
@@ -379,7 +624,9 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
             run_id: run.id,
             source_namespace: "mock".into(),
             stream_id: "session/opaque".into(),
+            expected_stream_revision: revision_two,
             items: vec![NewTimelineItem {
+                id: context.ids.next_timeline_item_id(),
                 kind: "provider_event".into(),
                 body: "third".into(),
                 provider_id: Some(opaque.clone()),
@@ -387,13 +634,15 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         })
         .await
         .unwrap();
-    let revision_four = context
+    let other_cursor = context
         .store
         .append_timeline_batch(TimelineBatch {
             run_id: run.id,
             source_namespace: "other-provider".into(),
             stream_id: "other-stream".into(),
+            expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
             items: vec![NewTimelineItem {
+                id: context.ids.next_timeline_item_id(),
                 kind: "message".into(),
                 body: "fourth".into(),
                 provider_id: None,
@@ -401,7 +650,9 @@ async fn pagination_is_stable_and_projection_revisions_are_monotonic() {
         })
         .await
         .unwrap();
-    assert!(revision_four > revision_three && revision_three > revision_two);
+    assert_eq!(revision_two.get(), 2);
+    assert_eq!(revision_three.get(), 3);
+    assert_eq!(other_cursor.get(), 1);
     let timeline = context
         .store
         .list_timeline_page(ListTimeline {
@@ -425,7 +676,7 @@ async fn corruption_is_classified_and_original_file_is_retained() {
     fs::write(&database, garbage).unwrap();
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
+        SqliteStore::open(paths, Arc::new(FixedClock)).await,
         Err(StoreError::Integrity(_))
     ));
     assert_eq!(fs::read(database).unwrap(), garbage);
@@ -437,6 +688,7 @@ async fn concurrent_callers_serialize_and_shutdown_is_typed() {
     let project_id = context.project().await;
     let create = |title: &'static str| {
         context.store.create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
             project_id,
             title: title.into(),
             parent_id: None,
@@ -464,6 +716,7 @@ async fn config_reset_does_not_remove_sqlite_work_data() {
     let work = context
         .store
         .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
             project_id,
             title: "durable".into(),
             parent_id: None,
@@ -479,12 +732,13 @@ async fn config_reset_does_not_remove_sqlite_work_data() {
 }
 
 #[tokio::test]
-async fn approval_resolution_is_application_shaped() {
+async fn approval_response_transitions_are_application_shaped() {
     let context = Context::open().await;
     let project_id = context.project().await;
     let work = context
         .store
         .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
             project_id,
             title: "approve".into(),
             parent_id: None,
@@ -494,6 +748,7 @@ async fn approval_resolution_is_application_shaped() {
     let run = context
         .store
         .create_run(CreateRun {
+            id: context.ids.next_run_id(),
             work_item_id: work.id,
             provider_run: None,
         })
@@ -502,6 +757,7 @@ async fn approval_resolution_is_application_shaped() {
     let approval = context
         .store
         .record_pending_approval(PendingApproval {
+            id: context.ids.next_approval_request_id(),
             run_id: run.id,
             provider_id: NamespacedProviderId::new("mock", "approval/raw-123").unwrap(),
             kind: "command".into(),
@@ -510,12 +766,231 @@ async fn approval_resolution_is_application_shaped() {
         .await
         .unwrap();
 
-    context
+    assert!(matches!(
+        context
+            .store
+            .confirm_approval_response(ConfirmApprovalResponse {
+                approval_id: approval.id,
+                audit_event_id: context.ids.next_audit_event_id(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let responding = context
         .store
-        .resolve_approval(ApprovalResolution {
+        .begin_approval_response(BeginApprovalResponse {
             approval_id: approval.id,
             decision: ApprovalDecision::Approved,
+            audit_event_id: context.ids.next_audit_event_id(),
         })
         .await
         .unwrap();
+    assert_eq!(
+        responding.status,
+        ApprovalStatus::Responding {
+            decision: ApprovalDecision::Approved
+        }
+    );
+    let resolved = context
+        .store
+        .confirm_approval_response(ConfirmApprovalResponse {
+            approval_id: approval.id,
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.status,
+        ApprovalStatus::Resolved {
+            decision: ApprovalDecision::Approved
+        }
+    );
+    assert!(matches!(
+        context
+            .store
+            .confirm_approval_response(ConfirmApprovalResponse {
+                approval_id: approval.id,
+                audit_event_id: context.ids.next_audit_event_id(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let ids = TestIds::new();
+    let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock))
+        .await
+        .unwrap();
+    let project = store
+        .create_project(CreateProject {
+            id: ids.next_project_id(),
+            name: "restart".into(),
+        })
+        .await
+        .unwrap();
+    let second_project = store
+        .create_project(CreateProject {
+            id: ids.next_project_id(),
+            name: "restart two".into(),
+        })
+        .await
+        .unwrap();
+    let root = store
+        .create_work_item(CreateWorkItem {
+            id: ids.next_work_item_id(),
+            project_id: project.id,
+            title: "root".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let child = store
+        .create_work_item(CreateWorkItem {
+            id: ids.next_work_item_id(),
+            project_id: project.id,
+            title: "child".into(),
+            parent_id: Some(root.id),
+        })
+        .await
+        .unwrap();
+    let run = store
+        .create_run(CreateRun {
+            id: ids.next_run_id(),
+            work_item_id: child.id,
+            provider_run: Some(NamespacedProviderId::new("mock", "run/restart").unwrap()),
+        })
+        .await
+        .unwrap();
+    let cursor = store
+        .append_timeline_batch(TimelineBatch {
+            run_id: run.id,
+            source_namespace: "mock".into(),
+            stream_id: "restart-stream".into(),
+            expected_stream_revision: yakshed_domain::ProjectionRevision::INITIAL,
+            items: vec![
+                NewTimelineItem {
+                    id: ids.next_timeline_item_id(),
+                    kind: "message".into(),
+                    body: "one".into(),
+                    provider_id: None,
+                },
+                NewTimelineItem {
+                    id: ids.next_timeline_item_id(),
+                    kind: "message".into(),
+                    body: "two".into(),
+                    provider_id: None,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    let pending = store
+        .record_pending_approval(PendingApproval {
+            id: ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "approval/pending").unwrap(),
+            kind: "command".into(),
+            summary: "pending".into(),
+        })
+        .await
+        .unwrap();
+    let responding = store
+        .record_pending_approval(PendingApproval {
+            id: ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "approval/responding").unwrap(),
+            kind: "command".into(),
+            summary: "responding".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .begin_approval_response(BeginApprovalResponse {
+            approval_id: responding.id,
+            decision: ApprovalDecision::Approved,
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let reopened = SqliteStore::open(paths, Arc::new(FixedClock))
+        .await
+        .unwrap();
+    let first_projects = reopened.list_projects(None, 1).await.unwrap();
+    let second_projects = reopened
+        .list_projects(first_projects.next_after, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_projects.items, vec![project.clone()]);
+    assert_eq!(second_projects.items, vec![second_project]);
+    let work = reopened
+        .list_work_items(ListWorkItems::for_project(project.id, 10))
+        .await
+        .unwrap();
+    assert_eq!(work.items.len(), 2);
+    assert_eq!(work.items[1].parent_id, Some(root.id));
+    assert_eq!(
+        reopened.list_active_runs(None, 10).await.unwrap().items,
+        vec![run.clone()]
+    );
+    assert_eq!(
+        reopened
+            .list_pending_approvals(None, 10)
+            .await
+            .unwrap()
+            .items[0]
+            .id,
+        pending.id
+    );
+    assert_eq!(
+        reopened
+            .list_unconfirmed_approval_responses(None, 10)
+            .await
+            .unwrap()
+            .items[0]
+            .id,
+        responding.id
+    );
+    let first_page = reopened
+        .list_timeline_page(ListTimeline {
+            run_id: run.id,
+            after: None,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let second_page = reopened
+        .list_timeline_page(ListTimeline {
+            run_id: run.id,
+            after: first_page.next_after,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first_page.items[0].body, "one");
+    assert_eq!(second_page.items[0].body, "two");
+    assert_eq!(
+        reopened
+            .append_timeline_batch(TimelineBatch {
+                run_id: run.id,
+                source_namespace: "mock".into(),
+                stream_id: "restart-stream".into(),
+                expected_stream_revision: cursor,
+                items: vec![NewTimelineItem {
+                    id: ids.next_timeline_item_id(),
+                    kind: "message".into(),
+                    body: "three".into(),
+                    provider_id: None,
+                }],
+            })
+            .await
+            .unwrap()
+            .get(),
+        3
+    );
 }

@@ -13,16 +13,14 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
 use rusqlite_migration::{M, Migrations};
 use tokio::sync::oneshot;
 use yakshed_application::{
-    AppStore, ApprovalResolution, Clock, CreateProject, CreateRun, CreateWorkItem, IdGenerator,
-    ListTimeline, ListWorkItems, PendingApproval, StoreError, TimelineBatch, TimelinePage,
-    WorkItemPage,
+    AppStore, ApprovalPage, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateProject,
+    CreateRun, CreateWorkItem, ListTimeline, ListWorkItems, PendingApproval, ProjectPage, RunPage,
+    StoreError, TimelineBatch, TimelinePage, WorkItemPage,
 };
-#[cfg(test)]
-use yakshed_domain::ApprovalRequestId;
 use yakshed_domain::{
-    ApprovalDecision, ApprovalSnapshot, ApprovalStatus, DataRevision, NamespacedProviderId,
-    ProjectSnapshot, ProjectionRevision, RunSnapshot, RunStatus, TimelineItemSnapshot,
-    UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
+    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, DataRevision,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, ProjectionRevision, RunId, RunSnapshot,
+    RunStatus, TimelineItemSnapshot, UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
 };
 
 use crate::AppPaths;
@@ -90,15 +88,23 @@ CREATE TABLE approval_requests (
     provider_approval_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
     summary TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'responding', 'resolved')),
+    decision TEXT CHECK (decision IN ('approved', 'denied')),
     requested_at_ms INTEGER NOT NULL,
+    response_started_at_ms INTEGER,
     resolved_at_ms INTEGER,
-    UNIQUE (provider_namespace, provider_approval_id)
+    UNIQUE (provider_namespace, provider_approval_id),
+    CHECK (
+        (status = 'pending' AND decision IS NULL AND response_started_at_ms IS NULL AND resolved_at_ms IS NULL)
+        OR (status = 'responding' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NULL)
+        OR (status = 'resolved' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NOT NULL)
+    )
 );
 
 CREATE TABLE projection_cursors (
     source_namespace TEXT NOT NULL,
     stream_id TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     revision INTEGER NOT NULL CHECK (revision >= 0),
     updated_at_ms INTEGER NOT NULL,
     PRIMARY KEY (source_namespace, stream_id)
@@ -129,22 +135,17 @@ struct Actor {
 struct Worker {
     connection: Connection,
     #[cfg(test)]
-    fail_resolution_after_update: bool,
+    fail_transition_after_update: bool,
 }
 
 /// Async facade over the dedicated SQLite worker.
 pub struct SqliteStore {
     actor: Actor,
     clock: Arc<dyn Clock>,
-    ids: Arc<dyn IdGenerator>,
 }
 
 impl SqliteStore {
-    pub async fn open(
-        paths: AppPaths,
-        clock: Arc<dyn Clock>,
-        ids: Arc<dyn IdGenerator>,
-    ) -> Result<Self, StoreError> {
+    pub async fn open(paths: AppPaths, clock: Arc<dyn Clock>) -> Result<Self, StoreError> {
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = oneshot::channel();
         let thread = thread::Builder::new()
@@ -156,7 +157,7 @@ impl SqliteStore {
                         Worker {
                             connection,
                             #[cfg(test)]
-                            fail_resolution_after_update: false,
+                            fail_transition_after_update: false,
                         },
                         receiver,
                     );
@@ -176,7 +177,6 @@ impl SqliteStore {
                 thread: Mutex::new(Some(thread)),
             },
             clock,
-            ids,
         })
     }
 
@@ -202,9 +202,9 @@ impl SqliteStore {
     }
 
     #[cfg(test)]
-    async fn fail_next_resolution_after_update(&self) -> Result<(), StoreError> {
+    async fn fail_next_transition_after_update(&self) -> Result<(), StoreError> {
         self.call(|worker| {
-            worker.fail_resolution_after_update = true;
+            worker.fail_transition_after_update = true;
             Ok(())
         })
         .await
@@ -334,12 +334,20 @@ fn is_corruption(error: &rusqlite::Error) -> bool {
 }
 
 fn map_database_error(error: rusqlite::Error) -> StoreError {
-    match error.sqlite_error_code() {
-        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => {
-            StoreError::Integrity(error.to_string())
-        }
-        Some(ErrorCode::ConstraintViolation) => StoreError::Integrity(error.to_string()),
-        _ => StoreError::Backend(error.to_string()),
+    if is_corruption(&error) {
+        StoreError::Integrity(error.to_string())
+    } else if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) {
+        StoreError::Conflict(error.to_string())
+    } else if matches!(
+        error,
+        rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::InvalidQuery
+    ) {
+        StoreError::Integrity(error.to_string())
+    } else {
+        StoreError::Backend(error.to_string())
     }
 }
 
@@ -348,6 +356,14 @@ fn validate_text(field: &str, value: &str) -> Result<(), StoreError> {
         Err(StoreError::Conflict(format!("{field} cannot be empty")))
     } else {
         Ok(())
+    }
+}
+
+fn validate_app_id(field: &str, is_v7: bool) -> Result<(), StoreError> {
+    if is_v7 {
+        Ok(())
+    } else {
+        Err(StoreError::Conflict(format!("{field} must be a UUIDv7")))
     }
 }
 
@@ -457,25 +473,189 @@ fn decision_value(decision: ApprovalDecision) -> &'static str {
     }
 }
 
+fn decision_from_value(value: &str) -> rusqlite::Result<ApprovalDecision> {
+    match value {
+        "approved" => Ok(ApprovalDecision::Approved),
+        "denied" => Ok(ApprovalDecision::Denied),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn project_from_row(row: &Row<'_>) -> rusqlite::Result<ProjectSnapshot> {
+    Ok(ProjectSnapshot {
+        id: parse_column(row, 0)?,
+        name: row.get(1)?,
+        created_at: UtcTimestamp::from_unix_millis(row.get(2)?),
+    })
+}
+
+fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
+    Ok(RunSnapshot {
+        id: parse_column(row, 0)?,
+        work_item_id: parse_column(row, 1)?,
+        status: match row.get::<_, String>(2)?.as_str() {
+            "running" => RunStatus::Running,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+        provider_id: provider_id(row.get(3)?, row.get(4)?)?,
+        created_at: UtcTimestamp::from_unix_millis(row.get(5)?),
+    })
+}
+
+const APPROVAL_SELECT: &str = "
+SELECT id, run_id, provider_namespace, provider_approval_id, kind, summary,
+       status, decision, requested_at_ms, response_started_at_ms, resolved_at_ms
+FROM approval_requests";
+
+fn approval_from_row(row: &Row<'_>) -> rusqlite::Result<ApprovalSnapshot> {
+    let status: String = row.get(6)?;
+    let decision = row
+        .get::<_, Option<String>>(7)?
+        .map(|value| decision_from_value(&value))
+        .transpose()?;
+    let status = match (status.as_str(), decision) {
+        ("pending", None) => ApprovalStatus::Pending,
+        ("responding", Some(decision)) => ApprovalStatus::Responding { decision },
+        ("resolved", Some(decision)) => ApprovalStatus::Resolved { decision },
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(ApprovalSnapshot {
+        id: parse_column(row, 0)?,
+        run_id: parse_column(row, 1)?,
+        provider_id: NamespacedProviderId::new(row.get::<_, String>(2)?, row.get::<_, String>(3)?)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        kind: row.get(4)?,
+        summary: row.get(5)?,
+        status,
+        requested_at: UtcTimestamp::from_unix_millis(row.get(8)?),
+        response_started_at: row
+            .get::<_, Option<i64>>(9)?
+            .map(UtcTimestamp::from_unix_millis),
+        resolved_at: row
+            .get::<_, Option<i64>>(10)?
+            .map(UtcTimestamp::from_unix_millis),
+    })
+}
+
+fn get_approval(
+    connection: &Connection,
+    id: ApprovalRequestId,
+) -> Result<ApprovalSnapshot, StoreError> {
+    connection
+        .query_row(
+            &format!("{APPROVAL_SELECT} WHERE id = ?1"),
+            [id.to_string()],
+            approval_from_row,
+        )
+        .optional()
+        .map_err(map_database_error)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "approval request",
+            id: id.to_string(),
+        })
+}
+
+fn list_approval_page(
+    connection: &Connection,
+    status: &'static str,
+    after: Option<ApprovalRequestId>,
+    limit: usize,
+    fetch_limit: i64,
+) -> Result<ApprovalPage, StoreError> {
+    let sql = format!(
+        "{APPROVAL_SELECT} WHERE status = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"
+    );
+    let mut statement = connection.prepare(&sql).map_err(map_database_error)?;
+    let after = after.map(|id| id.to_string());
+    let mut items = statement
+        .query_map(params![status, after, fetch_limit], approval_from_row)
+        .map_err(map_database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_database_error)?;
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let next_after = has_more.then(|| items.last().map(|item| item.id)).flatten();
+    Ok(ApprovalPage { items, next_after })
+}
+
 #[async_trait]
 impl AppStore for SqliteStore {
     async fn create_project(&self, command: CreateProject) -> Result<ProjectSnapshot, StoreError> {
+        validate_app_id("project id", command.id.is_v7())?;
         validate_text("project name", &command.name)?;
-        let id = self.ids.next_project_id();
         let created_at = self.clock.now();
         self.call(move |worker| {
+            let existing = worker
+                .connection
+                .query_row(
+                    "SELECT id, name, created_at_ms FROM projects WHERE id = ?1",
+                    [command.id.to_string()],
+                    project_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                return if existing.name == command.name {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Conflict(format!(
+                        "project id already exists with different content: {}",
+                        command.id
+                    )))
+                };
+            }
             worker
                 .connection
                 .execute(
                     "INSERT INTO projects (id, name, created_at_ms) VALUES (?1, ?2, ?3)",
-                    params![id.to_string(), command.name, created_at.unix_millis()],
+                    params![
+                        command.id.to_string(),
+                        command.name,
+                        created_at.unix_millis()
+                    ],
                 )
                 .map_err(map_database_error)?;
             Ok(ProjectSnapshot {
-                id,
+                id: command.id,
                 name: command.name,
                 created_at,
             })
+        })
+        .await
+    }
+
+    async fn list_projects(
+        &self,
+        after: Option<ProjectId>,
+        limit: u32,
+    ) -> Result<ProjectPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            let after = after.map(|id| id.to_string());
+            let mut statement = worker
+                .connection
+                .prepare(
+                    "SELECT id, name, created_at_ms FROM projects
+                     WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT ?2",
+                )
+                .map_err(map_database_error)?;
+            let mut items = statement
+                .query_map(params![after, fetch_limit], project_from_row)
+                .map_err(map_database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_database_error)?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after = has_more.then(|| items.last().map(|item| item.id)).flatten();
+            Ok(ProjectPage { items, next_after })
         })
         .await
     }
@@ -484,32 +664,74 @@ impl AppStore for SqliteStore {
         &self,
         command: CreateWorkItem,
     ) -> Result<WorkItemSnapshot, StoreError> {
+        validate_app_id("work item id", command.id.is_v7())?;
         validate_text("work item title", &command.title)?;
-        let id = self.ids.next_work_item_id();
         let now = self.clock.now();
         self.call(move |worker| {
             let transaction = worker
                 .connection
                 .transaction()
                 .map_err(map_database_error)?;
+            let existing = transaction
+                .query_row(
+                    &format!("{WORK_ITEM_SELECT} WHERE w.id = ?1"),
+                    [command.id.to_string()],
+                    work_item_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                return if existing.project_id == command.project_id
+                    && existing.title == command.title
+                    && existing.parent_id == command.parent_id
+                {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Conflict(format!(
+                        "work item id already exists with different content: {}",
+                        command.id
+                    )))
+                };
+            }
+            let project_exists = transaction
+                .query_row(
+                    "SELECT 1 FROM projects WHERE id = ?1",
+                    [command.project_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_database_error)?
+                .is_some();
+            if !project_exists {
+                return Err(StoreError::NotFound {
+                    entity: "project",
+                    id: command.project_id.to_string(),
+                });
+            }
             if let Some(parent_id) = command.parent_id {
-                let parent_project: Option<String> = transaction
+                let parent: Option<(String, String)> = transaction
                     .query_row(
-                        "SELECT project_id FROM work_items WHERE id = ?1",
+                        "SELECT project_id, status FROM work_items WHERE id = ?1",
                         [parent_id.to_string()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()
                     .map_err(map_database_error)?;
-                match parent_project {
+                match parent {
                     None => {
-                        return Err(StoreError::Integrity(format!(
-                            "parent work item does not exist: {parent_id}"
-                        )));
+                        return Err(StoreError::NotFound {
+                            entity: "parent work item",
+                            id: parent_id.to_string(),
+                        });
                     }
-                    Some(project) if project != command.project_id.to_string() => {
+                    Some((project, _)) if project != command.project_id.to_string() => {
                         return Err(StoreError::Conflict(
                             "parent and child must belong to the same project".to_owned(),
+                        ));
+                    }
+                    Some((_, status)) if status == "archived" => {
+                        return Err(StoreError::Conflict(
+                            "cannot attach an active work item to an archived parent".to_owned(),
                         ));
                     }
                     Some(_) => {}
@@ -521,7 +743,7 @@ impl AppStore for SqliteStore {
                      (id, project_id, title, status, revision, created_at_ms, updated_at_ms)
                      VALUES (?1, ?2, ?3, 'ready', 1, ?4, ?4)",
                     params![
-                        id.to_string(),
+                        command.id.to_string(),
                         command.project_id.to_string(),
                         command.title,
                         now.unix_millis()
@@ -533,13 +755,13 @@ impl AppStore for SqliteStore {
                     .execute(
                         "INSERT INTO work_edges (parent_id, child_id, kind)
                          VALUES (?1, ?2, 'parent')",
-                        params![parent_id.to_string(), id.to_string()],
+                        params![parent_id.to_string(), command.id.to_string()],
                     )
                     .map_err(map_database_error)?;
             }
             transaction.commit().map_err(map_database_error)?;
             Ok(WorkItemSnapshot {
-                id,
+                id: command.id,
                 project_id: command.project_id,
                 title: command.title,
                 status: WorkItemStatus::Ready,
@@ -643,9 +865,47 @@ impl AppStore for SqliteStore {
     }
 
     async fn create_run(&self, command: CreateRun) -> Result<RunSnapshot, StoreError> {
-        let id = self.ids.next_run_id();
+        validate_app_id("run id", command.id.is_v7())?;
         let now = self.clock.now();
         self.call(move |worker| {
+            let existing = worker
+                .connection
+                .query_row(
+                    "SELECT id, work_item_id, status, provider_namespace,
+                            provider_run_id, created_at_ms FROM runs WHERE id = ?1",
+                    [command.id.to_string()],
+                    run_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                return if existing.work_item_id == command.work_item_id
+                    && existing.provider_id == command.provider_run
+                {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Conflict(format!(
+                        "run id already exists with different content: {}",
+                        command.id
+                    )))
+                };
+            }
+            let work_exists = worker
+                .connection
+                .query_row(
+                    "SELECT 1 FROM work_items WHERE id = ?1",
+                    [command.work_item_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_database_error)?
+                .is_some();
+            if !work_exists {
+                return Err(StoreError::NotFound {
+                    entity: "work item",
+                    id: command.work_item_id.to_string(),
+                });
+            }
             let (namespace, provider_run_id) =
                 command
                     .provider_run
@@ -663,7 +923,7 @@ impl AppStore for SqliteStore {
                      (id, work_item_id, status, provider_namespace, provider_run_id, created_at_ms)
                      VALUES (?1, ?2, 'running', ?3, ?4, ?5)",
                     params![
-                        id.to_string(),
+                        command.id.to_string(),
                         command.work_item_id.to_string(),
                         namespace,
                         provider_run_id,
@@ -672,12 +932,44 @@ impl AppStore for SqliteStore {
                 )
                 .map_err(map_database_error)?;
             Ok(RunSnapshot {
-                id,
+                id: command.id,
                 work_item_id: command.work_item_id,
                 status: RunStatus::Running,
                 provider_id: command.provider_run,
                 created_at: now,
             })
+        })
+        .await
+    }
+
+    async fn list_active_runs(
+        &self,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            let after = after.map(|id| id.to_string());
+            let mut statement = worker
+                .connection
+                .prepare(
+                    "SELECT id, work_item_id, status, provider_namespace,
+                            provider_run_id, created_at_ms
+                     FROM runs WHERE status = 'running' AND (?1 IS NULL OR id > ?1)
+                     ORDER BY id LIMIT ?2",
+                )
+                .map_err(map_database_error)?;
+            let mut items = statement
+                .query_map(params![after, fetch_limit], run_from_row)
+                .map_err(map_database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_database_error)?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after = has_more.then(|| items.last().map(|item| item.id)).flatten();
+            Ok(RunPage { items, next_after })
         })
         .await
     }
@@ -689,14 +981,10 @@ impl AppStore for SqliteStore {
         validate_text("projection source namespace", &batch.source_namespace)?;
         validate_text("projection stream id", &batch.stream_id)?;
         for item in &batch.items {
+            validate_app_id("timeline item id", item.id.is_v7())?;
             validate_text("timeline item kind", &item.kind)?;
         }
         let now = self.clock.now();
-        let ids: Vec<_> = batch
-            .items
-            .iter()
-            .map(|_| self.ids.next_timeline_item_id())
-            .collect();
         self.call(move |worker| {
             let transaction = worker
                 .connection
@@ -717,26 +1005,46 @@ impl AppStore for SqliteStore {
                     id: batch.run_id.to_string(),
                 });
             }
-            let mut revision: i64 = transaction
+            let expected = i64::try_from(batch.expected_stream_revision.get())
+                .map_err(|error| StoreError::Conflict(error.to_string()))?;
+            let cursor: Option<(String, i64)> = transaction
                 .query_row(
-                    "SELECT revision FROM projection_cursors
+                    "SELECT run_id, revision FROM projection_cursors
                      WHERE source_namespace = ?1 AND stream_id = ?2",
                     params![batch.source_namespace, batch.stream_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
-                .map_err(map_database_error)?
-                .unwrap_or(0);
-            let timeline_revision: i64 = transaction
+                .map_err(map_database_error)?;
+            match cursor {
+                Some((run_id, _)) if run_id != batch.run_id.to_string() => {
+                    return Err(StoreError::Conflict(
+                        "projection stream is already bound to a different run".to_owned(),
+                    ));
+                }
+                Some((_, current)) if current != expected => {
+                    return Err(StoreError::Conflict(format!(
+                        "projection cursor conflict: expected {expected}, current {current}"
+                    )));
+                }
+                None if expected != 0 => {
+                    return Err(StoreError::Conflict(format!(
+                        "projection cursor conflict: expected {expected}, current 0"
+                    )));
+                }
+                Some(_) | None => {}
+            }
+            let item_count = i64::try_from(batch.items.len())
+                .map_err(|error| StoreError::Conflict(error.to_string()))?;
+            let mut timeline_revision: i64 = transaction
                 .query_row(
                     "SELECT coalesce(max(revision), 0) FROM timeline_items WHERE run_id = ?1",
                     [batch.run_id.to_string()],
                     |row| row.get(0),
                 )
                 .map_err(map_database_error)?;
-            revision = revision.max(timeline_revision);
-            for (id, item) in ids.into_iter().zip(batch.items) {
-                revision = revision.checked_add(1).ok_or_else(|| {
+            for item in batch.items {
+                timeline_revision = timeline_revision.checked_add(1).ok_or_else(|| {
                     StoreError::Conflict("projection revision overflow".to_owned())
                 })?;
                 let (namespace, provider_item_id) =
@@ -753,9 +1061,9 @@ impl AppStore for SqliteStore {
                           provider_item_id, created_at_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![
-                            id.to_string(),
+                            item.id.to_string(),
                             batch.run_id.to_string(),
-                            revision,
+                            timeline_revision,
                             item.kind,
                             item.body,
                             namespace,
@@ -765,25 +1073,30 @@ impl AppStore for SqliteStore {
                     )
                     .map_err(map_database_error)?;
             }
+            let stream_revision = expected
+                .checked_add(item_count)
+                .ok_or_else(|| StoreError::Conflict("projection cursor overflow".to_owned()))?;
             transaction
                 .execute(
                     "INSERT INTO projection_cursors
-                     (source_namespace, stream_id, revision, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4)
+                     (source_namespace, stream_id, run_id, revision, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(source_namespace, stream_id) DO UPDATE SET
                          revision = excluded.revision,
                          updated_at_ms = excluded.updated_at_ms",
                     params![
                         batch.source_namespace,
                         batch.stream_id,
-                        revision,
+                        batch.run_id.to_string(),
+                        stream_revision,
                         now.unix_millis()
                     ],
                 )
                 .map_err(map_database_error)?;
             transaction.commit().map_err(map_database_error)?;
             Ok(ProjectionRevision::new(
-                u64::try_from(revision).map_err(|error| StoreError::Backend(error.to_string()))?,
+                u64::try_from(stream_revision)
+                    .map_err(|error| StoreError::Backend(error.to_string()))?,
             ))
         })
         .await
@@ -853,10 +1166,49 @@ impl AppStore for SqliteStore {
         &self,
         approval: PendingApproval,
     ) -> Result<ApprovalSnapshot, StoreError> {
+        validate_app_id("approval request id", approval.id.is_v7())?;
         validate_text("approval kind", &approval.kind)?;
-        let id = self.ids.next_approval_request_id();
         let now = self.clock.now();
         self.call(move |worker| {
+            let existing = worker
+                .connection
+                .query_row(
+                    &format!("{APPROVAL_SELECT} WHERE id = ?1"),
+                    [approval.id.to_string()],
+                    approval_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                return if existing.run_id == approval.run_id
+                    && existing.provider_id == approval.provider_id
+                    && existing.kind == approval.kind
+                    && existing.summary == approval.summary
+                {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Conflict(format!(
+                        "approval id already exists with different content: {}",
+                        approval.id
+                    )))
+                };
+            }
+            let run_exists = worker
+                .connection
+                .query_row(
+                    "SELECT 1 FROM runs WHERE id = ?1",
+                    [approval.run_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_database_error)?
+                .is_some();
+            if !run_exists {
+                return Err(StoreError::NotFound {
+                    entity: "run",
+                    id: approval.run_id.to_string(),
+                });
+            }
             worker
                 .connection
                 .execute(
@@ -865,7 +1217,7 @@ impl AppStore for SqliteStore {
                       summary, status, requested_at_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
                     params![
-                        id.to_string(),
+                        approval.id.to_string(),
                         approval.run_id.to_string(),
                         approval.provider_id.namespace(),
                         approval.provider_id.value(),
@@ -876,22 +1228,40 @@ impl AppStore for SqliteStore {
                 )
                 .map_err(map_database_error)?;
             Ok(ApprovalSnapshot {
-                id,
+                id: approval.id,
                 run_id: approval.run_id,
                 provider_id: approval.provider_id,
                 kind: approval.kind,
                 summary: approval.summary,
                 status: ApprovalStatus::Pending,
                 requested_at: now,
+                response_started_at: None,
                 resolved_at: None,
             })
         })
         .await
     }
 
-    async fn resolve_approval(&self, resolution: ApprovalResolution) -> Result<(), StoreError> {
+    async fn list_pending_approvals(
+        &self,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            list_approval_page(&worker.connection, "pending", after, limit, fetch_limit)
+        })
+        .await
+    }
+
+    async fn begin_approval_response(
+        &self,
+        response: BeginApprovalResponse,
+    ) -> Result<ApprovalSnapshot, StoreError> {
+        validate_app_id("audit event id", response.audit_event_id.is_v7())?;
         let now = self.clock.now();
-        let audit_id = self.ids.next_audit_event_id();
         self.call(move |worker| {
             let transaction = worker
                 .connection
@@ -900,11 +1270,11 @@ impl AppStore for SqliteStore {
             let changed = transaction
                 .execute(
                     "UPDATE approval_requests
-                     SET status = ?2, resolved_at_ms = ?3
+                     SET status = 'responding', decision = ?2, response_started_at_ms = ?3
                      WHERE id = ?1 AND status = 'pending'",
                     params![
-                        resolution.approval_id.to_string(),
-                        decision_value(resolution.decision),
+                        response.approval_id.to_string(),
+                        decision_value(response.decision),
                         now.unix_millis()
                     ],
                 )
@@ -913,23 +1283,23 @@ impl AppStore for SqliteStore {
                 let exists = transaction
                     .query_row(
                         "SELECT 1 FROM approval_requests WHERE id = ?1",
-                        [resolution.approval_id.to_string()],
+                        [response.approval_id.to_string()],
                         |_| Ok(()),
                     )
                     .optional()
                     .map_err(map_database_error)?
                     .is_some();
                 return Err(if exists {
-                    StoreError::Conflict("approval is already resolved".to_owned())
+                    StoreError::Conflict("approval response has already begun".to_owned())
                 } else {
                     StoreError::NotFound {
                         entity: "approval request",
-                        id: resolution.approval_id.to_string(),
+                        id: response.approval_id.to_string(),
                     }
                 });
             }
             #[cfg(test)]
-            if std::mem::take(&mut worker.fail_resolution_after_update) {
+            if std::mem::take(&mut worker.fail_transition_after_update) {
                 return Err(StoreError::Backend(
                     "injected failure after approval update".to_owned(),
                 ));
@@ -938,16 +1308,106 @@ impl AppStore for SqliteStore {
                 .execute(
                     "INSERT INTO audit_events
                      (id, event_type, entity_type, entity_id, body, created_at_ms)
-                     VALUES (?1, 'approval_resolved', 'approval_request', ?2, ?3, ?4)",
+                     VALUES (?1, 'approval_response_begun', 'approval_request', ?2, ?3, ?4)",
                     params![
-                        audit_id.to_string(),
-                        resolution.approval_id.to_string(),
-                        decision_value(resolution.decision),
+                        response.audit_event_id.to_string(),
+                        response.approval_id.to_string(),
+                        decision_value(response.decision),
                         now.unix_millis()
                     ],
                 )
                 .map_err(map_database_error)?;
-            transaction.commit().map_err(map_database_error)
+            let snapshot = get_approval(&transaction, response.approval_id)?;
+            transaction.commit().map_err(map_database_error)?;
+            Ok(snapshot)
+        })
+        .await
+    }
+
+    async fn confirm_approval_response(
+        &self,
+        response: ConfirmApprovalResponse,
+    ) -> Result<ApprovalSnapshot, StoreError> {
+        validate_app_id("audit event id", response.audit_event_id.is_v7())?;
+        let now = self.clock.now();
+        self.call(move |worker| {
+            let transaction = worker
+                .connection
+                .transaction()
+                .map_err(map_database_error)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE approval_requests
+                     SET status = 'resolved', resolved_at_ms = ?2
+                     WHERE id = ?1 AND status = 'responding'",
+                    params![response.approval_id.to_string(), now.unix_millis()],
+                )
+                .map_err(map_database_error)?;
+            if changed == 0 {
+                let exists = transaction
+                    .query_row(
+                        "SELECT 1 FROM approval_requests WHERE id = ?1",
+                        [response.approval_id.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(map_database_error)?
+                    .is_some();
+                return Err(if exists {
+                    StoreError::Conflict(
+                        "approval response is not awaiting confirmation".to_owned(),
+                    )
+                } else {
+                    StoreError::NotFound {
+                        entity: "approval request",
+                        id: response.approval_id.to_string(),
+                    }
+                });
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut worker.fail_transition_after_update) {
+                return Err(StoreError::Backend(
+                    "injected failure after approval update".to_owned(),
+                ));
+            }
+            let snapshot = get_approval(&transaction, response.approval_id)?;
+            let decision = match snapshot.status {
+                ApprovalStatus::Resolved { decision } => decision,
+                _ => {
+                    return Err(StoreError::Integrity(
+                        "invalid approval transition".to_owned(),
+                    ));
+                }
+            };
+            transaction
+                .execute(
+                    "INSERT INTO audit_events
+                     (id, event_type, entity_type, entity_id, body, created_at_ms)
+                     VALUES (?1, 'approval_response_confirmed', 'approval_request', ?2, ?3, ?4)",
+                    params![
+                        response.audit_event_id.to_string(),
+                        response.approval_id.to_string(),
+                        decision_value(decision),
+                        now.unix_millis()
+                    ],
+                )
+                .map_err(map_database_error)?;
+            transaction.commit().map_err(map_database_error)?;
+            Ok(snapshot)
+        })
+        .await
+    }
+
+    async fn list_unconfirmed_approval_responses(
+        &self,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            list_approval_page(&worker.connection, "responding", after, limit, fetch_limit)
         })
         .await
     }
@@ -993,7 +1453,7 @@ impl Drop for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yakshed_application::SystemIdGenerator;
+    use yakshed_application::{IdGenerator, SystemIdGenerator};
 
     struct FixedClock;
 
@@ -1004,21 +1464,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_failure_rolls_back_approval_and_audit_together() {
+    async fn approval_transitions_and_audits_commit_or_roll_back_together() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SqliteStore::open(
-            AppPaths::for_test(temp.path()),
-            Arc::new(FixedClock),
-            Arc::new(SystemIdGenerator),
-        )
-        .await
-        .unwrap();
+        let ids = SystemIdGenerator;
+        let store = SqliteStore::open(AppPaths::for_test(temp.path()), Arc::new(FixedClock))
+            .await
+            .unwrap();
         let project = store
-            .create_project(CreateProject { name: "p".into() })
+            .create_project(CreateProject {
+                id: ids.next_project_id(),
+                name: "p".into(),
+            })
             .await
             .unwrap();
         let work = store
             .create_work_item(CreateWorkItem {
+                id: ids.next_work_item_id(),
                 project_id: project.id,
                 title: "w".into(),
                 parent_id: None,
@@ -1027,6 +1488,7 @@ mod tests {
             .unwrap();
         let run = store
             .create_run(CreateRun {
+                id: ids.next_run_id(),
                 work_item_id: work.id,
                 provider_run: None,
             })
@@ -1034,6 +1496,7 @@ mod tests {
             .unwrap();
         let approval = store
             .record_pending_approval(PendingApproval {
+                id: ids.next_approval_request_id(),
                 run_id: run.id,
                 provider_id: NamespacedProviderId::new("mock", "approval-1").unwrap(),
                 kind: "command".into(),
@@ -1041,13 +1504,14 @@ mod tests {
             })
             .await
             .unwrap();
-        store.fail_next_resolution_after_update().await.unwrap();
+        store.fail_next_transition_after_update().await.unwrap();
 
         assert!(
             store
-                .resolve_approval(ApprovalResolution {
+                .begin_approval_response(BeginApprovalResponse {
                     approval_id: approval.id,
                     decision: ApprovalDecision::Approved,
+                    audit_event_id: ids.next_audit_event_id(),
                 })
                 .await
                 .is_err()
@@ -1058,6 +1522,53 @@ mod tests {
                 .await
                 .unwrap(),
             ("pending".to_owned(), 0)
+        );
+        store
+            .begin_approval_response(BeginApprovalResponse {
+                approval_id: approval.id,
+                decision: ApprovalDecision::Approved,
+                audit_event_id: ids.next_audit_event_id(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .approval_status_and_audit_count(approval.id)
+                .await
+                .unwrap(),
+            ("responding".to_owned(), 1)
+        );
+
+        store.fail_next_transition_after_update().await.unwrap();
+        assert!(
+            store
+                .confirm_approval_response(ConfirmApprovalResponse {
+                    approval_id: approval.id,
+                    audit_event_id: ids.next_audit_event_id(),
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .approval_status_and_audit_count(approval.id)
+                .await
+                .unwrap(),
+            ("responding".to_owned(), 1)
+        );
+        store
+            .confirm_approval_response(ConfirmApprovalResponse {
+                approval_id: approval.id,
+                audit_event_id: ids.next_audit_event_id(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .approval_status_and_audit_count(approval.id)
+                .await
+                .unwrap(),
+            ("resolved".to_owned(), 2)
         );
     }
 }

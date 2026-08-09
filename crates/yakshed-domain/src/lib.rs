@@ -276,6 +276,10 @@ macro_rules! uuid_id {
             pub fn new_v7() -> Self {
                 Self(Uuid::now_v7())
             }
+
+            pub fn is_v7(self) -> bool {
+                self.0.get_version_num() == 7
+            }
         }
 
         impl From<Uuid> for $name {
@@ -442,7 +446,8 @@ pub enum ApprovalDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalStatus {
     Pending,
-    Resolved(ApprovalDecision),
+    Responding { decision: ApprovalDecision },
+    Resolved { decision: ApprovalDecision },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -454,6 +459,7 @@ pub struct ApprovalSnapshot {
     pub summary: String,
     pub status: ApprovalStatus,
     pub requested_at: UtcTimestamp,
+    pub response_started_at: Option<UtcTimestamp>,
     pub resolved_at: Option<UtcTimestamp>,
 }
 

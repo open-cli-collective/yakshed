@@ -183,11 +183,19 @@ impl IdGenerator for SystemIdGenerator {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateProject {
+    pub id: ProjectId,
     pub name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectPage {
+    pub items: Vec<ProjectSnapshot>,
+    pub next_after: Option<ProjectId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateWorkItem {
+    pub id: WorkItemId,
     pub project_id: ProjectId,
     pub title: String,
     pub parent_id: Option<WorkItemId>,
@@ -220,12 +228,20 @@ pub struct WorkItemPage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateRun {
+    pub id: RunId,
     pub work_item_id: WorkItemId,
     pub provider_run: Option<NamespacedProviderId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunPage {
+    pub items: Vec<RunSnapshot>,
+    pub next_after: Option<RunId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewTimelineItem {
+    pub id: TimelineItemId,
     pub kind: String,
     pub body: String,
     pub provider_id: Option<NamespacedProviderId>,
@@ -236,6 +252,7 @@ pub struct TimelineBatch {
     pub run_id: RunId,
     pub source_namespace: String,
     pub stream_id: String,
+    pub expected_stream_revision: ProjectionRevision,
     pub items: Vec<NewTimelineItem>,
 }
 
@@ -254,6 +271,7 @@ pub struct TimelinePage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingApproval {
+    pub id: ApprovalRequestId,
     pub run_id: RunId,
     pub provider_id: NamespacedProviderId,
     pub kind: String,
@@ -261,9 +279,22 @@ pub struct PendingApproval {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovalResolution {
+pub struct BeginApprovalResponse {
     pub approval_id: ApprovalRequestId,
     pub decision: ApprovalDecision,
+    pub audit_event_id: AuditEventId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfirmApprovalResponse {
+    pub approval_id: ApprovalRequestId,
+    pub audit_event_id: AuditEventId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalPage {
+    pub items: Vec<ApprovalSnapshot>,
+    pub next_after: Option<ApprovalRequestId>,
 }
 
 #[derive(Debug, ThisError)]
@@ -287,9 +318,15 @@ pub enum StoreError {
 }
 
 /// Application-shaped durable state operations; implementations expose no storage handles.
+/// Create operations are idempotent by supplied ID when immutable command content matches.
 #[async_trait]
 pub trait AppStore: Send + Sync {
     async fn create_project(&self, command: CreateProject) -> Result<ProjectSnapshot, StoreError>;
+    async fn list_projects(
+        &self,
+        after: Option<ProjectId>,
+        limit: u32,
+    ) -> Result<ProjectPage, StoreError>;
     async fn create_work_item(
         &self,
         command: CreateWorkItem,
@@ -298,6 +335,11 @@ pub trait AppStore: Send + Sync {
     async fn list_work_items(&self, query: ListWorkItems) -> Result<WorkItemPage, StoreError>;
     async fn archive_work_subtree(&self, root: WorkItemId) -> Result<u64, StoreError>;
     async fn create_run(&self, command: CreateRun) -> Result<RunSnapshot, StoreError>;
+    async fn list_active_runs(
+        &self,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError>;
     async fn append_timeline_batch(
         &self,
         batch: TimelineBatch,
@@ -307,7 +349,24 @@ pub trait AppStore: Send + Sync {
         &self,
         approval: PendingApproval,
     ) -> Result<ApprovalSnapshot, StoreError>;
-    async fn resolve_approval(&self, resolution: ApprovalResolution) -> Result<(), StoreError>;
+    async fn list_pending_approvals(
+        &self,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError>;
+    async fn begin_approval_response(
+        &self,
+        response: BeginApprovalResponse,
+    ) -> Result<ApprovalSnapshot, StoreError>;
+    async fn confirm_approval_response(
+        &self,
+        response: ConfirmApprovalResponse,
+    ) -> Result<ApprovalSnapshot, StoreError>;
+    async fn list_unconfirmed_approval_responses(
+        &self,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError>;
     async fn shutdown(&self) -> Result<(), StoreError>;
 }
 
