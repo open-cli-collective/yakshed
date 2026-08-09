@@ -247,6 +247,9 @@ impl<C: Clock> ArtifactStore<C> {
         digest: &ContentDigest,
         max_bytes: u64,
     ) -> Result<BoundedArtifactReader, ArtifactError> {
+        let digest_lock = self.state.get(digest);
+        let _guard = digest_lock.lock().unwrap();
+        reconcile_repair_sidecar(&self.path_for_digest(digest), sync_directory)?;
         let file = self.open_file(digest)?;
         let byte_len = file.metadata()?.len();
         if byte_len > max_bytes {
@@ -263,6 +266,7 @@ impl<C: Clock> ArtifactStore<C> {
     pub fn verify(&self, expected: &ContentDigest) -> Result<(), ArtifactError> {
         let digest_lock = self.state.get(expected);
         let _guard = digest_lock.lock().unwrap();
+        reconcile_repair_sidecar(&self.path_for_digest(expected), sync_directory)?;
         self.verify_file(expected)
     }
 
@@ -566,8 +570,16 @@ fn promote_repair_staging(
 ) -> Result<(), ArtifactError> {
     let sidecar = destination.with_extension("old");
     rename(destination, &sidecar)?;
-    sync(destination.parent().expect("digest path has a parent"))?;
-    rename(staging, destination)?;
+    if let Err(error) = sync(destination.parent().expect("digest path has a parent")) {
+        return Err(rollback_repair_error(destination, error, &mut sync));
+    }
+    if let Err(error) = rename(staging, destination) {
+        return Err(rollback_repair_error(
+            destination,
+            ArtifactError::Io(error),
+            &mut sync,
+        ));
+    }
     finish_promotion(destination, sha256_root, &mut sync)?;
     remove(&sidecar)?;
     sync(destination.parent().expect("digest path has a parent"))
@@ -599,16 +611,51 @@ fn recover_repair_sidecars(
             let digest_lock = state.get(&digest);
             let _guard = digest_lock.lock().unwrap();
             let canonical = shard.path().join(digest.as_str());
-            if canonical.try_exists()? {
-                fs::remove_file(entry.path())?;
-            } else {
-                fs::rename(entry.path(), &canonical)?;
-                set_private_file_permissions(&canonical)?;
-            }
-            sync(&shard.path())?;
+            reconcile_repair_sidecar(&canonical, &mut sync)?;
         }
     }
     Ok(())
+}
+
+fn reconcile_repair_sidecar(
+    canonical: &Path,
+    mut sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    let sidecar = canonical.with_extension("old");
+    if !sidecar.try_exists()? {
+        return Ok(());
+    }
+    if canonical.try_exists()? {
+        fs::remove_file(sidecar)?;
+    } else {
+        fs::rename(sidecar, canonical)?;
+        set_private_file_permissions(canonical)?;
+    }
+    sync(canonical.parent().expect("digest path has a parent"))
+}
+
+fn rollback_repair_error(
+    canonical: &Path,
+    repair: ArtifactError,
+    sync: impl FnMut(&Path) -> Result<(), ArtifactError>,
+) -> ArtifactError {
+    let rollback = reconcile_repair_sidecar(canonical, sync).and_then(|()| {
+        if canonical.try_exists()? {
+            Ok(())
+        } else {
+            Err(ArtifactError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "repair sidecar could not restore the canonical blob",
+            )))
+        }
+    });
+    match rollback {
+        Ok(()) => repair,
+        Err(rollback) => ArtifactError::RepairRollback {
+            repair: Box::new(repair),
+            rollback: Box::new(rollback),
+        },
+    }
 }
 
 /// Flushes a directory entry on Unix, where directory handles support `fsync`.
@@ -692,6 +739,11 @@ pub enum ArtifactError {
     BoundExceeded { byte_len: u64, max_bytes: u64 },
     #[error("invalid artifact input: {0}")]
     InvalidInput(&'static str),
+    #[error("artifact repair failed: {repair}; live rollback also failed: {rollback}")]
+    RepairRollback {
+        repair: Box<ArtifactError>,
+        rollback: Box<ArtifactError>,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -872,7 +924,104 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_rolls_back_after_first_repair_rename() {
+    fn concurrent_read_waits_for_repair_and_sees_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_data_root().unwrap();
+        let repairer = ArtifactStore::new(&paths, 1024).unwrap();
+        let reader_store = ArtifactStore::new(&paths, 1024).unwrap();
+        let record = repairer
+            .publish(
+                &b"concurrent repair"[..],
+                artifact_metadata("0193f26e-7a72-7d42-bf77-0de14c4cc247"),
+            )
+            .unwrap();
+        let canonical = repairer.path_for_digest(&record.digest);
+        fs::write(&canonical, b"corrupt").unwrap();
+        let (mut staging, staging_path, active) = repairer.create_staging_file().unwrap();
+        staging.write_all(b"concurrent repair").unwrap();
+        staging.sync_all().unwrap();
+        drop(staging);
+        let repair_digest = record.digest.clone();
+        let read_digest = record.digest.clone();
+        let (between_tx, between_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let repair = thread::spawn(move || {
+            let digest_lock = repairer.state.get(&repair_digest);
+            let _guard = digest_lock.lock().unwrap();
+            let rename_count = Cell::new(0);
+            let result = repairer.replace_corrupt_blob(
+                &repair_digest,
+                &staging_path,
+                &canonical,
+                |_| {},
+                |from, to| {
+                    rename_count.set(rename_count.get() + 1);
+                    if rename_count.get() == 2 {
+                        between_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                    fs::rename(from, to)
+                },
+                |path| fs::remove_file(path),
+            );
+            drop(active);
+            result
+        });
+
+        between_rx.recv().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let read = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = (|| {
+                let mut reader = reader_store.open(&read_digest, 1024)?;
+                let mut content = Vec::new();
+                reader.read_to_end(&mut content)?;
+                reader_store.verify(&read_digest)?;
+                Ok::<_, ArtifactError>(content)
+            })();
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "reader did not wait for the digest lock"
+        );
+
+        resume_tx.send(()).unwrap();
+        repair.join().unwrap().unwrap();
+        assert_eq!(done_rx.recv().unwrap().unwrap(), b"concurrent repair");
+        read.join().unwrap();
+    }
+
+    #[test]
+    fn open_reconciles_a_live_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_data_root().unwrap();
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        let record = store
+            .publish(
+                &b"inline recovery"[..],
+                artifact_metadata("0193f26e-7a72-7d42-bf77-0de14c4cc248"),
+            )
+            .unwrap();
+        let canonical = store.path_for_digest(&record.digest);
+        let sidecar = canonical.with_extension("old");
+        fs::rename(&canonical, &sidecar).unwrap();
+
+        let mut reader = store.open(&record.digest, 1024).unwrap();
+        let mut content = Vec::new();
+        reader.read_to_end(&mut content).unwrap();
+
+        assert_eq!(content, b"inline recovery");
+        assert!(!sidecar.exists());
+        store.verify(&record.digest).unwrap();
+    }
+
+    #[test]
+    fn live_promotion_failure_rolls_back_and_is_retriable() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
         paths.create_data_root().unwrap();
@@ -912,13 +1061,8 @@ mod tests {
             .unwrap_err();
         drop(guard);
         drop(active);
-        drop(store);
 
         assert!(matches!(error, ArtifactError::Io(_)));
-        assert!(!canonical.exists());
-        assert!(canonical.with_extension("old").exists());
-
-        let store = ArtifactStore::new(&paths, 1024).unwrap();
         assert_eq!(fs::read(&canonical).unwrap(), b"corrupt");
         assert!(!canonical.with_extension("old").exists());
         assert!(matches!(
@@ -934,6 +1078,28 @@ mod tests {
             .unwrap();
         store.verify(&record.digest).unwrap();
         assert_eq!(fs::read(canonical).unwrap(), b"repair after failure");
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_persisted_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_data_root().unwrap();
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        let record = store
+            .publish(
+                &b"crash rollback"[..],
+                artifact_metadata("0193f26e-7a72-7d42-bf77-0de14c4cc246"),
+            )
+            .unwrap();
+        let canonical = store.path_for_digest(&record.digest);
+        let sidecar = canonical.with_extension("old");
+        fs::rename(&canonical, &sidecar).unwrap();
+        drop(store);
+
+        let store = ArtifactStore::new(&paths, 1024).unwrap();
+        assert!(!sidecar.exists());
+        store.verify(&record.digest).unwrap();
     }
 
     #[test]
