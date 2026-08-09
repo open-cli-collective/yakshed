@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, FileTimes, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -20,15 +20,16 @@ use crate::AppPaths;
 
 static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
 static NEXT_QUARANTINE_FILE: AtomicU64 = AtomicU64::new(0);
-static ARTIFACT_LOCK_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<KeyedArtifactLocks>>>> =
+static ARTIFACT_STATE_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<SharedArtifactState>>>> =
     OnceLock::new();
 
 #[derive(Default)]
-struct KeyedArtifactLocks {
+struct SharedArtifactState {
     locks: Mutex<HashMap<ContentDigest, Weak<Mutex<()>>>>,
+    active_staging: Mutex<HashSet<PathBuf>>,
 }
 
-impl KeyedArtifactLocks {
+impl SharedArtifactState {
     fn get(&self, digest: &ContentDigest) -> Arc<Mutex<()>> {
         let mut locks = self.locks.lock().unwrap();
         locks.retain(|_, lock| lock.strong_count() > 0);
@@ -39,18 +40,41 @@ impl KeyedArtifactLocks {
         locks.insert(digest.clone(), Arc::downgrade(&lock));
         lock
     }
+
+    fn register_staging(self: &Arc<Self>, path: PathBuf) -> ActiveStaging {
+        self.active_staging.lock().unwrap().insert(path.clone());
+        ActiveStaging {
+            state: Arc::clone(self),
+            path,
+        }
+    }
+
+    fn is_staging_active(&self, path: &Path) -> bool {
+        self.active_staging.lock().unwrap().contains(path)
+    }
 }
 
-fn shared_artifact_locks(root: &Path) -> Arc<KeyedArtifactLocks> {
-    let registry = ARTIFACT_LOCK_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry = registry.lock().unwrap();
-    registry.retain(|_, locks| locks.strong_count() > 0);
-    if let Some(locks) = registry.get(root).and_then(Weak::upgrade) {
-        return locks;
+struct ActiveStaging {
+    state: Arc<SharedArtifactState>,
+    path: PathBuf,
+}
+
+impl Drop for ActiveStaging {
+    fn drop(&mut self) {
+        self.state.active_staging.lock().unwrap().remove(&self.path);
     }
-    let locks = Arc::new(KeyedArtifactLocks::default());
-    registry.insert(root.to_owned(), Arc::downgrade(&locks));
-    locks
+}
+
+fn shared_artifact_state(root: &Path) -> Arc<SharedArtifactState> {
+    let registry = ARTIFACT_STATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap();
+    registry.retain(|_, state| state.strong_count() > 0);
+    if let Some(state) = registry.get(root).and_then(Weak::upgrade) {
+        return state;
+    }
+    let state = Arc::new(SharedArtifactState::default());
+    registry.insert(root.to_owned(), Arc::downgrade(&state));
+    state
 }
 
 /// Caller-owned metadata needed to publish one artifact body.
@@ -87,7 +111,7 @@ pub struct ArtifactStore<C = SystemClock> {
     quarantine_root: PathBuf,
     max_size: u64,
     clock: C,
-    locks: Arc<KeyedArtifactLocks>,
+    state: Arc<SharedArtifactState>,
 }
 
 impl ArtifactStore {
@@ -119,12 +143,12 @@ impl<C: Clock> ArtifactStore<C> {
         }
         let canonical_root = fs::canonicalize(&artifacts_root)?;
         Ok(Self {
-            sha256_root,
-            staging_root,
-            quarantine_root,
+            sha256_root: canonical_root.join("sha256"),
+            staging_root: canonical_root.join("staging"),
+            quarantine_root: canonical_root.join("quarantine"),
             max_size,
             clock,
-            locks: shared_artifact_locks(&canonical_root),
+            state: shared_artifact_state(&canonical_root),
         })
     }
 
@@ -144,7 +168,7 @@ impl<C: Clock> ArtifactStore<C> {
             ));
         }
 
-        let (mut staging_file, staging_path) = self.create_staging_file()?;
+        let (mut staging_file, staging_path, _active_staging) = self.create_staging_file()?;
         let mut hasher = Sha256::new();
         let mut byte_len = 0_u64;
         let mut buffer = [0_u8; 8192];
@@ -174,7 +198,7 @@ impl<C: Clock> ArtifactStore<C> {
         let digest = digest_from_hasher(hasher);
         let destination = self.path_for_digest(&digest);
         let shard = destination.parent().expect("digest path has a parent");
-        let digest_lock = self.locks.get(&digest);
+        let digest_lock = self.state.get(&digest);
         let _guard = digest_lock.lock().unwrap();
         create_directory_durable(shard, sync_directory)?;
 
@@ -182,13 +206,7 @@ impl<C: Clock> ArtifactStore<C> {
             match self.verify_file(&digest) {
                 Ok(()) => fs::remove_file(&staging_path)?,
                 Err(ArtifactError::DigestMismatch { .. }) => {
-                    self.quarantine_corrupt(&digest, &destination)?;
-                    promote_staging(
-                        &staging_path,
-                        &destination,
-                        &self.sha256_root,
-                        sync_directory,
-                    )?;
+                    self.replace_corrupt_blob(&digest, &staging_path, &destination, |_| {})?;
                 }
                 Err(error) => return Err(error),
             }
@@ -233,7 +251,7 @@ impl<C: Clock> ArtifactStore<C> {
     }
 
     pub fn verify(&self, expected: &ContentDigest) -> Result<(), ArtifactError> {
-        let digest_lock = self.locks.get(expected);
+        let digest_lock = self.state.get(expected);
         let _guard = digest_lock.lock().unwrap();
         self.verify_file(expected)
     }
@@ -261,7 +279,8 @@ impl<C: Clock> ArtifactStore<C> {
 
     /// Removes old unreferenced blobs and disposable staging/quarantine debris.
     ///
-    /// Quarantine entries are never referenced and are retained by age alone.
+    /// Quarantine entries are never referenced and are retained by age alone. Active
+    /// staging files are process-owned and skipped regardless of age.
     ///
     /// `grace` is also the metadata-commit lease: callers must commit a record within this
     /// duration after `publish` returns. Age is re-read under the digest lock immediately
@@ -272,8 +291,8 @@ impl<C: Clock> ArtifactStore<C> {
         grace: Duration,
     ) -> Result<usize, ArtifactError> {
         let now = self.clock.now();
-        let mut removed = collect_old_debris(&self.staging_root, now, grace)?;
-        removed += collect_old_debris(&self.quarantine_root, now, grace)?;
+        let mut removed = self.collect_old_staging(now, grace)?;
+        removed += self.collect_old_quarantine(now, grace)?;
 
         for shard in fs::read_dir(&self.sha256_root)? {
             let shard = shard?;
@@ -292,7 +311,7 @@ impl<C: Clock> ArtifactStore<C> {
                 if referenced.contains(&digest) {
                     continue;
                 }
-                let digest_lock = self.locks.get(&digest);
+                let digest_lock = self.state.get(&digest);
                 let _guard = digest_lock.lock().unwrap();
                 let path = self.path_for_digest(&digest);
                 let metadata = match fs::metadata(&path) {
@@ -312,12 +331,65 @@ impl<C: Clock> ArtifactStore<C> {
         Ok(removed)
     }
 
-    fn create_staging_file(&self) -> Result<(File, PathBuf), ArtifactError> {
+    fn collect_old_staging(
+        &self,
+        now: SystemTime,
+        grace: Duration,
+    ) -> Result<usize, ArtifactError> {
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.staging_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() || self.state.is_staging_active(&path) {
+                continue;
+            }
+            if is_old(&entry.metadata()?, now, grace)? {
+                fs::remove_file(path)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn collect_old_quarantine(
+        &self,
+        now: SystemTime,
+        grace: Duration,
+    ) -> Result<usize, ArtifactError> {
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.quarantine_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let digest_lock = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.split('-').next())
+                .and_then(|digest| digest.parse::<ContentDigest>().ok())
+                .map(|digest| self.state.get(&digest));
+            let _guard = digest_lock.as_ref().map(|lock| lock.lock().unwrap());
+            let path = entry.path();
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ArtifactError::Io(error)),
+            };
+            if is_old(&metadata, now, grace)? {
+                fs::remove_file(path)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn create_staging_file(&self) -> Result<(File, PathBuf, ActiveStaging), ArtifactError> {
         loop {
             let sequence = NEXT_STAGING_FILE.fetch_add(1, Ordering::Relaxed);
             let path = self
                 .staging_root
                 .join(format!("{}-{sequence}.tmp", std::process::id()));
+            let active = self.state.register_staging(path.clone());
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -328,7 +400,7 @@ impl<C: Clock> ArtifactStore<C> {
             match options.open(&path) {
                 Ok(file) => {
                     set_private_file_permissions(&path)?;
-                    return Ok((file, path));
+                    return Ok((file, path, active));
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(ArtifactError::Io(error)),
@@ -359,11 +431,24 @@ impl<C: Clock> ArtifactStore<C> {
         Ok(())
     }
 
+    fn replace_corrupt_blob(
+        &self,
+        digest: &ContentDigest,
+        staging: &Path,
+        canonical: &Path,
+        after_quarantine: impl FnOnce(&Path),
+    ) -> Result<(), ArtifactError> {
+        let quarantine = self.quarantine_corrupt(digest, canonical)?;
+        after_quarantine(&quarantine);
+        promote_staging(staging, canonical, &self.sha256_root, sync_directory)
+    }
+
     fn quarantine_corrupt(
         &self,
         digest: &ContentDigest,
         canonical: &Path,
-    ) -> Result<(), ArtifactError> {
+    ) -> Result<PathBuf, ArtifactError> {
+        self.refresh_lease(canonical)?;
         loop {
             let sequence = NEXT_QUARANTINE_FILE.fetch_add(1, Ordering::Relaxed);
             let quarantine =
@@ -374,10 +459,9 @@ impl<C: Clock> ArtifactStore<C> {
             }
             match fs::rename(canonical, &quarantine) {
                 Ok(()) => {
-                    self.refresh_lease(&quarantine)?;
                     sync_directory(&self.quarantine_root)?;
                     sync_directory(canonical.parent().expect("digest path has a parent"))?;
-                    return Ok(());
+                    return Ok(quarantine);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(ArtifactError::Io(error)),
@@ -397,24 +481,14 @@ impl Read for BoundedArtifactReader {
     }
 }
 
-fn collect_old_debris(
-    root: &Path,
+fn is_old(
+    metadata: &fs::Metadata,
     now: SystemTime,
     grace: Duration,
-) -> Result<usize, ArtifactError> {
-    let mut removed = 0;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let modified = entry.metadata()?.modified()?;
-        if now.duration_since(modified).is_ok_and(|age| age >= grace) {
-            fs::remove_file(entry.path())?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
+) -> Result<bool, ArtifactError> {
+    Ok(now
+        .duration_since(metadata.modified()?)
+        .is_ok_and(|age| age >= grace))
 }
 
 fn promote_staging(
@@ -430,8 +504,17 @@ fn promote_staging(
     Ok(())
 }
 
+/// Flushes a directory entry on Unix, where directory handles support `fsync`.
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+/// Windows' standard library exposes no directory-handle `FlushFileBuffers` equivalent.
+/// Calls remain unconditional, but this accepted platform limitation is a no-op on Windows.
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<(), ArtifactError> {
     Ok(())
 }
 
@@ -508,10 +591,13 @@ pub enum ArtifactError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::cell::RefCell;
+    use std::{sync::mpsc, thread};
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn sync_directory_syncs_an_open_directory_handle() {
         let temp = tempfile::tempdir().unwrap();
@@ -519,6 +605,7 @@ mod tests {
         sync_directory(temp.path()).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn promotion_syncs_directory_entries_after_rename() {
         let temp = tempfile::tempdir().unwrap();
@@ -540,6 +627,7 @@ mod tests {
         assert_eq!(*synced.borrow(), [shard, sha256_root]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn cold_start_syncs_each_new_directory_parent() {
         let temp = tempfile::tempdir().unwrap();
@@ -589,13 +677,79 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
 
-        let first = shared_artifact_locks(&root);
-        let second = shared_artifact_locks(&root);
+        let first = shared_artifact_state(&root);
+        let second = shared_artifact_state(&root);
 
         assert!(Arc::ptr_eq(&first, &second));
         let weak = Arc::downgrade(&first);
         drop(first);
         drop(second);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn quarantine_gc_waits_for_corrupt_repair_across_store_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_data_root().unwrap();
+        let repairer = ArtifactStore::new(&paths, 1024).unwrap();
+        let collector = ArtifactStore::new(&paths, 1024).unwrap();
+        let record = repairer
+            .publish(
+                &b"repair race"[..],
+                ArtifactMetadata {
+                    id: "0193f26e-7a72-7d42-bf77-0de14c4cc240".parse().unwrap(),
+                    work_item_id: "0193f26e-7a72-7d42-bf77-0de14c4cc241".parse().unwrap(),
+                    run_id: None,
+                    kind: ArtifactKind::Plan,
+                    media_type: "text/plain".to_owned(),
+                    provenance: ArtifactProvenance::new("test").unwrap(),
+                },
+            )
+            .unwrap();
+        let canonical = repairer.path_for_digest(&record.digest);
+        fs::write(&canonical, b"corrupt").unwrap();
+        File::options()
+            .write(true)
+            .open(&canonical)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(7200)))
+            .unwrap();
+        let (mut staging, staging_path, _active) = repairer.create_staging_file().unwrap();
+        staging.write_all(b"repair race").unwrap();
+        staging.sync_all().unwrap();
+        drop(staging);
+
+        let (visible_tx, visible_rx) = mpsc::channel();
+        let (collecting_tx, collecting_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let collect = thread::spawn(move || {
+            visible_rx.recv().unwrap();
+            collecting_tx.send(()).unwrap();
+            let result =
+                collector.collect_unreferenced(&BTreeSet::new(), Duration::from_secs(3600));
+            done_tx.send(result).unwrap();
+        });
+        let digest_lock = repairer.state.get(&record.digest);
+        let guard = digest_lock.lock().unwrap();
+
+        repairer
+            .replace_corrupt_blob(&record.digest, &staging_path, &canonical, |quarantine| {
+                visible_tx.send(()).unwrap();
+                collecting_rx.recv().unwrap();
+                assert!(
+                    done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "quarantine GC did not wait for the digest lock"
+                );
+                assert!(quarantine.exists());
+            })
+            .unwrap();
+        drop(guard);
+
+        assert_eq!(done_rx.recv().unwrap().unwrap(), 0);
+        collect.join().unwrap();
+        repairer.verify(&record.digest).unwrap();
+        assert_eq!(fs::read(canonical).unwrap(), b"repair race");
+        assert_eq!(fs::read_dir(&repairer.quarantine_root).unwrap().count(), 1);
     }
 }

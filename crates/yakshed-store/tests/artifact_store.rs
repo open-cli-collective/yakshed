@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, FileTimes},
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, mpsc},
     thread,
     time::{Duration, SystemTime},
 };
@@ -237,8 +237,10 @@ fn concurrent_republish_across_store_handles_survives_collection() {
 fn quarantine_collection_respects_grace_period() {
     let (_temp, paths, store) = fixture(1024);
     let quarantine = paths.data_root.join("artifacts/quarantine");
-    let old = quarantine.join("old-corrupt-blob");
-    let young = quarantine.join("young-corrupt-blob");
+    let old =
+        quarantine.join("0000000000000000000000000000000000000000000000000000000000000000-old");
+    let young =
+        quarantine.join("1111111111111111111111111111111111111111111111111111111111111111-young");
     fs::write(&old, b"old sensitive debris").unwrap();
     fs::write(&young, b"young sensitive debris").unwrap();
     File::options()
@@ -288,6 +290,60 @@ impl Read for FailingReader {
             Ok(7)
         }
     }
+}
+
+struct BlockingReader {
+    started: Option<mpsc::Sender<()>>,
+    resume: mpsc::Receiver<()>,
+    content: io::Cursor<&'static [u8]>,
+}
+
+impl Read for BlockingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if let Some(started) = self.started.take() {
+            started.send(()).unwrap();
+            self.resume.recv().unwrap();
+        }
+        self.content.read(buffer)
+    }
+}
+
+#[test]
+fn active_staging_survives_collection_until_publish_finishes() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_data_root().unwrap();
+    let publisher = ArtifactStore::new(&paths, 1024).unwrap();
+    let collector = ArtifactStore::with_clock(
+        &paths,
+        1024,
+        TestClock(SystemTime::now() + Duration::from_secs(7200)),
+    )
+    .unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let publish = thread::spawn(move || {
+        publisher.publish(
+            BlockingReader {
+                started: Some(started_tx),
+                resume: resume_rx,
+                content: io::Cursor::new(&b"slow artifact"[..]),
+            },
+            metadata("0193f26e-7a72-7d42-bf77-0de14c4cc239"),
+        )
+    });
+
+    started_rx.recv().unwrap();
+    assert_eq!(
+        collector
+            .collect_unreferenced(&BTreeSet::new(), Duration::from_secs(3600))
+            .unwrap(),
+        0
+    );
+    resume_tx.send(()).unwrap();
+
+    let record = publish.join().unwrap().unwrap();
+    collector.verify(&record.digest).unwrap();
 }
 
 #[test]
