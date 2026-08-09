@@ -24,6 +24,221 @@ impl fmt::Display for ConnectionId {
     }
 }
 
+/// Stable identity of one artifact metadata record.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ArtifactId(Uuid);
+
+impl FromStr for ArtifactId {
+    type Err = ValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_uuid_v7("artifact id", value).map(Self)
+    }
+}
+
+impl TryFrom<String> for ArtifactId {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ArtifactId> for String {
+    fn from(value: ArtifactId) -> Self {
+        value.to_string()
+    }
+}
+
+impl fmt::Display for ArtifactId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Stable identity of one durable work item.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct WorkItemId(Uuid);
+
+impl FromStr for WorkItemId {
+    type Err = ValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_uuid_v7("work item id", value).map(Self)
+    }
+}
+
+impl TryFrom<String> for WorkItemId {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<WorkItemId> for String {
+    fn from(value: WorkItemId) -> Self {
+        value.to_string()
+    }
+}
+
+impl fmt::Display for WorkItemId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Stable identity of one harness run.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RunId(Uuid);
+
+impl FromStr for RunId {
+    type Err = ValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_uuid_v7("run id", value).map(Self)
+    }
+}
+
+impl TryFrom<String> for RunId {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<RunId> for String {
+    fn from(value: RunId) -> Self {
+        value.to_string()
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Validated lowercase hexadecimal SHA-256 digest.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ContentDigest(String);
+
+impl ContentDigest {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(ValidationError(
+                "content digest must be 64 lowercase hexadecimal characters".to_owned(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ContentDigest {
+    type Err = ValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for ContentDigest {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ContentDigest> for String {
+    fn from(value: ContentDigest) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for ContentDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Product-owned artifact body categories.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Plan,
+    Diff,
+    File,
+    Image,
+    CommandLog,
+    BrowserCapture,
+    ProviderPayload,
+}
+
+/// Validated opaque description of where an artifact originated.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ArtifactProvenance(String);
+
+impl ArtifactProvenance {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        require_nonempty("artifact provenance", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ArtifactProvenance {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ArtifactProvenance> for String {
+    fn from(value: ArtifactProvenance) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for ArtifactProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Durable metadata for one immutable artifact body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub id: ArtifactId,
+    pub work_item_id: WorkItemId,
+    pub run_id: Option<RunId>,
+    pub kind: ArtifactKind,
+    pub digest: ContentDigest,
+    pub byte_len: u64,
+    pub media_type: String,
+    pub provenance: ArtifactProvenance,
+}
+
 /// A configured harness/model-provider trust boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Connection {
@@ -310,6 +525,15 @@ fn require_nonempty(field: &'static str, value: &str) -> Result<(), ValidationEr
     }
 }
 
+fn parse_uuid_v7(field: &'static str, value: &str) -> Result<Uuid, ValidationError> {
+    let uuid = Uuid::parse_str(value)
+        .map_err(|error| ValidationError(format!("invalid {field}: {error}")))?;
+    if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
+        return Err(ValidationError(format!("{field} must be a UUIDv7")));
+    }
+    Ok(uuid)
+}
+
 fn require_identifier(field: &'static str, value: &str) -> Result<(), ValidationError> {
     require_nonempty(field, value)?;
     if value
@@ -406,5 +630,25 @@ mod tests {
         }
         assert!(ProviderStateRootId::new("com0").is_ok());
         assert!(ProviderStateRootId::new("com10").is_ok());
+    }
+
+    #[test]
+    fn artifact_values_enforce_uuid_and_digest_shapes() {
+        assert!(
+            "0193f26e-7a72-7d42-bf77-0de14c4cc220"
+                .parse::<ArtifactId>()
+                .is_ok()
+        );
+        assert!(
+            "550e8400-e29b-41d4-a716-446655440000"
+                .parse::<ArtifactId>()
+                .is_err()
+        );
+        assert!(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                .parse::<ContentDigest>()
+                .is_ok()
+        );
+        assert!(ArtifactProvenance::new(" ").is_err());
     }
 }
