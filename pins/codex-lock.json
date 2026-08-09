@@ -1,0 +1,56 @@
+{
+  "codex_version": "0.147.0",
+  "release_tag": "rust-v0.147.0",
+  "release_repo": "openai/codex",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "asset": "codex-aarch64-apple-darwin.tar.gz",
+      "sha256": "75984b81f92a71b0c0f4b3b5cad80e5c57177e4d8c8b4b1e13db703b20dc4358"
+    },
+    "x86_64-apple-darwin": {
+      "asset": "codex-x86_64-apple-darwin.tar.gz",
+      "sha256": "36e782f71d8164cc37c2b89c64948f2180e9a2f8456b27e660da75bc6b5574e2"
+    },
+    "aarch64-unknown-linux-musl": {
+      "asset": "codex-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "eb677c80f666b1ab8b4b1d083b66e8d614b1281d960bb6f9fd8ca98f58b38b90"
+    },
+    "x86_64-unknown-linux-musl": {
+      "asset": "codex-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36"
+    },
+    "aarch64-pc-windows-msvc": {
+      "asset": "codex-aarch64-pc-windows-msvc.exe.tar.gz",
+      "sha256": "c3a7da6cd2ed2a4e3c85a0b4f0b254cde81b51a9e3600530978fce689807ed07"
+    },
+    "x86_64-pc-windows-msvc": {
+      "asset": "codex-x86_64-pc-windows-msvc.exe.tar.gz",
+      "sha256": "7c47d4dc9202569d85ef2cbe9203dd2e75c326f5085e3854487a740339a8bdcd"
+    }
+  },
+  "stable_schema_sha256": "2530e42f2b0f44bb14d2729069be94e5bd2d4a0c0e7a457323d25d41cac62faa",
+  "stable_schema_digest_method": "sha256 over the sorted list of `sha256(file)  ./relative/path` lines for every file under pins/codex-app-server-schema/, i.e. `find . -type f | sort | while read f; do shasum -a 256 \"$f\"; done | shasum -a 256`",
+  "schema_generation_command": "codex app-server generate-json-schema --out pins/codex-app-server-schema",
+  "adapter_revision": 1,
+  "toolchain": {
+    "rust": "1.96.0",
+    "pinned_crates_advisory": {
+      "comment": "Enforcement is Cargo.toml + committed Cargo.lock in the workspace; these are the versions current at pin time (2026-08-09).",
+      "rusqlite": "0.40.2",
+      "rusqlite_migration": "2.6.0",
+      "keyring-core": "1.0.0",
+      "apple-native-keyring-store": "1.0.2",
+      "windows-native-keyring-store": "1.1.0",
+      "dbus-secret-service-keyring-store": "1.0.0",
+      "secrecy": "0.10.3",
+      "directories": "6.0.0",
+      "atomic-write-file": "0.3.0",
+      "tauri": "2.11.5",
+      "tokio": "1.53.1",
+      "serde_json": "1.0.151",
+      "uuid": "1.24.0"
+    }
+  },
+  "pinned_at": "2026-08-09",
+  "notes": "Local development machines may run codex 0.147.0 from Homebrew; the Homebrew binary's digest will not match the release tarball digests above. The release assets are what CI and packaging must verify. The `codex-app-server-*` standalone binaries also exist in the release; YakShed pins the main `codex` binary and invokes `codex app-server` per overall.md §5."
+}
