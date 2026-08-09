@@ -4,12 +4,12 @@ use tempfile::TempDir;
 use yakshed_application::{
     AppStore, BeginApprovalResponse, Clock, ConfigChange, ConfigRevision, ConfirmApprovalResponse,
     CreateProject, CreateRun, CreateWorkItem, GetStreamCursor, IdGenerator, ListTimeline,
-    ListWorkItems, NewTimelineItem, PendingApproval, StoreError, TimelineBatch,
+    ListWorkItems, NewTimelineItem, PendingApproval, StoreError, TimelineBatch, TransitionRun,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalStatus, AuditEventId, NamespacedProviderId,
-    ProjectId, RunId, StreamCursor, TimelineBatchId, TimelineItemId, UtcTimestamp, WorkItemId,
-    WorkItemStatus,
+    ApprovalDecision, ApprovalRequestId, ApprovalStatus, AuditEventId, ConnectionId,
+    NamespacedProviderId, ProjectId, RunId, RunStatus, StreamCursor, TimelineBatchId,
+    TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
 };
 use yakshed_store::{AppPaths, ConfigStore, SqliteStore};
 
@@ -101,6 +101,14 @@ impl Context {
 
 fn missing_work_item() -> WorkItemId {
     "0193f26e-7a72-7000-8000-00000000ffff".parse().unwrap()
+}
+
+fn connection_a() -> ConnectionId {
+    "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap()
+}
+
+fn connection_b() -> ConnectionId {
+    "0193f26e-7a72-7000-8000-00000000bbb2".parse().unwrap()
 }
 
 #[tokio::test]
@@ -240,6 +248,7 @@ async fn missing_references_are_not_found_without_partial_work() {
             .store
             .create_run(CreateRun {
                 id: context.ids.next_run_id(),
+                connection_id: connection_a(),
                 work_item_id: missing_work_item(),
                 provider_run: None,
             })
@@ -282,6 +291,7 @@ async fn duplicate_provider_id_is_a_conflict() {
         .store
         .create_run(CreateRun {
             id: context.ids.next_run_id(),
+            connection_id: connection_a(),
             work_item_id: work.id,
             provider_run: Some(provider_id.clone()),
         })
@@ -293,12 +303,105 @@ async fn duplicate_provider_id_is_a_conflict() {
             .store
             .create_run(CreateRun {
                 id: context.ids.next_run_id(),
+                connection_id: connection_a(),
                 work_item_id: work.id,
                 provider_run: Some(provider_id),
             })
             .await,
         Err(StoreError::Conflict(_))
     ));
+}
+
+#[tokio::test]
+async fn provider_ids_and_streams_are_scoped_by_connection() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "scoped providers".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let provider_run = NamespacedProviderId::new("mock", "same-native-run").unwrap();
+    let run_a = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: Some(provider_run.clone()),
+        })
+        .await
+        .unwrap();
+    let run_b = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_b(),
+            work_item_id: work.id,
+            provider_run: Some(provider_run),
+        })
+        .await
+        .unwrap();
+    assert_eq!(run_a.connection_id, connection_a());
+    assert_eq!(run_b.connection_id, connection_b());
+
+    for (connection_id, run_id) in [(connection_a(), run_a.id), (connection_b(), run_b.id)] {
+        context
+            .store
+            .append_timeline_batch(TimelineBatch {
+                batch_id: context.ids.next_timeline_batch_id(),
+                connection_id,
+                run_id,
+                source_namespace: "mock".into(),
+                stream_id: "same-native-stream".into(),
+                expected_stream_revision: StreamCursor::INITIAL,
+                items: vec![NewTimelineItem {
+                    id: context.ids.next_timeline_item_id(),
+                    kind: "event".into(),
+                    body: "same provider item".into(),
+                    provider_id: Some(
+                        NamespacedProviderId::new("mock", "same-native-item").unwrap(),
+                    ),
+                }],
+            })
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        context
+            .store
+            .append_timeline_batch(TimelineBatch {
+                batch_id: context.ids.next_timeline_batch_id(),
+                connection_id: connection_b(),
+                run_id: run_a.id,
+                source_namespace: "mock".into(),
+                stream_id: "same-native-stream".into(),
+                expected_stream_revision: StreamCursor::new(1),
+                items: Vec::new(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    for (connection_id, run_id) in [(connection_a(), run_a.id), (connection_b(), run_b.id)] {
+        let approval = context
+            .store
+            .record_pending_approval(PendingApproval {
+                id: context.ids.next_approval_request_id(),
+                run_id,
+                provider_id: NamespacedProviderId::new("mock", "same-native-approval").unwrap(),
+                kind: "command".into(),
+                summary: "scoped".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(approval.connection_id, connection_id);
+    }
 }
 
 #[tokio::test]
@@ -344,6 +447,7 @@ async fn repeated_create_commands_are_idempotent_by_supplied_id() {
     );
     let run_command = CreateRun {
         id: context.ids.next_run_id(),
+        connection_id: connection_a(),
         work_item_id: work.id,
         provider_run: None,
     };
@@ -548,6 +652,7 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
         .store
         .create_run(CreateRun {
             id: context.ids.next_run_id(),
+            connection_id: connection_a(),
             work_item_id: first.items[0].id,
             provider_run: None,
         })
@@ -555,6 +660,7 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
         .unwrap();
     let first_batch = TimelineBatch {
         batch_id: context.ids.next_timeline_batch_id(),
+        connection_id: connection_a(),
         run_id: run.id,
         source_namespace: "mock".into(),
         stream_id: "session/opaque".into(),
@@ -582,16 +688,29 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
     assert_eq!(
         context
             .store
-            .append_timeline_batch(first_batch)
+            .append_timeline_batch(first_batch.clone())
             .await
             .unwrap(),
         cursor_two
     );
+    let mut divergent = first_batch.clone();
+    divergent.items[0].body = "different".into();
+    assert!(matches!(
+        context.store.append_timeline_batch(divergent).await,
+        Err(StoreError::Conflict(_))
+    ));
+    let mut wrong_expected = first_batch;
+    wrong_expected.expected_stream_revision = StreamCursor::new(1);
+    assert!(matches!(
+        context.store.append_timeline_batch(wrong_expected).await,
+        Err(StoreError::Conflict(_))
+    ));
     assert!(matches!(
         context
             .store
             .append_timeline_batch(TimelineBatch {
                 batch_id: context.ids.next_timeline_batch_id(),
+                connection_id: connection_a(),
                 run_id: run.id,
                 source_namespace: "mock".into(),
                 stream_id: "session/opaque".into(),
@@ -610,6 +729,7 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
         .store
         .create_run(CreateRun {
             id: context.ids.next_run_id(),
+            connection_id: connection_a(),
             work_item_id: first.items[0].id,
             provider_run: None,
         })
@@ -620,6 +740,7 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
             .store
             .append_timeline_batch(TimelineBatch {
                 batch_id: context.ids.next_timeline_batch_id(),
+                connection_id: connection_a(),
                 run_id: other_run.id,
                 source_namespace: "mock".into(),
                 stream_id: "session/opaque".into(),
@@ -639,6 +760,7 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
         .store
         .append_timeline_batch(TimelineBatch {
             batch_id: context.ids.next_timeline_batch_id(),
+            connection_id: connection_a(),
             run_id: run.id,
             source_namespace: "mock".into(),
             stream_id: "session/opaque".into(),
@@ -656,6 +778,7 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
         .store
         .append_timeline_batch(TimelineBatch {
             batch_id: context.ids.next_timeline_batch_id(),
+            connection_id: connection_a(),
             run_id: run.id,
             source_namespace: "other-provider".into(),
             stream_id: "other-stream".into(),
@@ -682,6 +805,8 @@ async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_
         .await
         .unwrap();
     assert_eq!(timeline.items.len(), 4);
+    assert_eq!(timeline.items[0].body, "first");
+    assert_eq!(timeline.items[1].body, "second");
     assert_eq!(
         timeline
             .items
@@ -776,6 +901,7 @@ async fn approval_response_transitions_are_application_shaped() {
         .store
         .create_run(CreateRun {
             id: context.ids.next_run_id(),
+            connection_id: connection_a(),
             work_item_id: work.id,
             provider_run: None,
         })
@@ -845,6 +971,100 @@ async fn approval_response_transitions_are_application_shaped() {
 }
 
 #[tokio::test]
+async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "terminal run".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    context
+        .store
+        .record_pending_approval(PendingApproval {
+            id: context.ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "void-on-failure").unwrap(),
+            kind: "command".into(),
+            summary: "cannot proceed".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        context
+            .store
+            .transition_run(TransitionRun {
+                run_id: run.id,
+                expected_current: RunStatus::Running,
+                target: RunStatus::Running,
+                occurred_at: UtcTimestamp::from_unix_millis(50),
+                audit_event_id: context.ids.next_audit_event_id(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let failed = context
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Failed,
+            occurred_at: UtcTimestamp::from_unix_millis(51),
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.ended_at, Some(UtcTimestamp::from_unix_millis(51)));
+    assert!(
+        context
+            .store
+            .list_active_runs(None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        context
+            .store
+            .list_pending_approvals(None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(matches!(
+        context
+            .store
+            .transition_run(TransitionRun {
+                run_id: run.id,
+                expected_current: RunStatus::Running,
+                target: RunStatus::Interrupted,
+                occurred_at: UtcTimestamp::from_unix_millis(52),
+                audit_event_id: context.ids.next_audit_event_id(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
 async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
@@ -887,6 +1107,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
     let run = store
         .create_run(CreateRun {
             id: ids.next_run_id(),
+            connection_id: connection_a(),
             work_item_id: child.id,
             provider_run: Some(NamespacedProviderId::new("mock", "run/restart").unwrap()),
         })
@@ -895,6 +1116,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
     let first_batch_id = ids.next_timeline_batch_id();
     let restart_batch = TimelineBatch {
         batch_id: first_batch_id,
+        connection_id: connection_a(),
         run_id: run.id,
         source_namespace: "mock".into(),
         stream_id: "restart-stream".into(),
@@ -1010,6 +1232,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
     assert_eq!(second_page.items[0].body, "two");
     let recovered_cursor = reopened
         .get_stream_cursor(GetStreamCursor {
+            connection_id: connection_a(),
             run_id: run.id,
             source_namespace: "mock".into(),
             stream_id: "restart-stream".into(),
@@ -1044,6 +1267,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
         reopened
             .append_timeline_batch(TimelineBatch {
                 batch_id: ids.next_timeline_batch_id(),
+                connection_id: connection_a(),
                 run_id: run.id,
                 source_namespace: "mock".into(),
                 stream_id: "restart-stream".into(),
@@ -1059,5 +1283,24 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
             .unwrap()
             .get(),
         3
+    );
+    let interrupted = reopened
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Interrupted,
+            occurred_at: UtcTimestamp::from_unix_millis(99),
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(interrupted.status, RunStatus::Interrupted);
+    assert!(
+        reopened
+            .list_active_runs(None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
     );
 }

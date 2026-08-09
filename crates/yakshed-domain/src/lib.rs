@@ -443,20 +443,38 @@ pub struct WorkItemSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunStatus {
     Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl RunStatus {
+    pub const fn can_transition_to(self, target: Self) -> bool {
+        matches!(
+            (self, target),
+            (
+                Self::Running,
+                Self::Completed | Self::Failed | Self::Interrupted
+            )
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunSnapshot {
     pub id: RunId,
+    pub connection_id: ConnectionId,
     pub work_item_id: WorkItemId,
     pub status: RunStatus,
     pub provider_id: Option<NamespacedProviderId>,
     pub created_at: UtcTimestamp,
+    pub ended_at: Option<UtcTimestamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelineItemSnapshot {
     pub id: TimelineItemId,
+    pub connection_id: ConnectionId,
     pub run_id: RunId,
     pub revision: TimelineRevision,
     pub kind: String,
@@ -476,11 +494,13 @@ pub enum ApprovalStatus {
     Pending,
     Responding { decision: ApprovalDecision },
     Resolved { decision: ApprovalDecision },
+    Voided { decision: Option<ApprovalDecision> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalSnapshot {
     pub id: ApprovalRequestId,
+    pub connection_id: ConnectionId,
     pub run_id: RunId,
     pub provider_id: NamespacedProviderId,
     pub kind: String,
@@ -489,6 +509,7 @@ pub struct ApprovalSnapshot {
     pub requested_at: UtcTimestamp,
     pub response_started_at: Option<UtcTimestamp>,
     pub resolved_at: Option<UtcTimestamp>,
+    pub voided_at: Option<UtcTimestamp>,
 }
 
 /// A configured harness/model-provider trust boundary.
@@ -828,6 +849,20 @@ mod tests {
     fn app_owned_ids_are_uuid_v7() {
         let parsed = Uuid::parse_str(&WorkItemId::new_v7().to_string()).unwrap();
         assert_eq!(parsed.get_version_num(), 7);
+    }
+
+    #[test]
+    fn run_state_transition_matrix_is_closed() {
+        for terminal in [
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Interrupted,
+        ] {
+            assert!(RunStatus::Running.can_transition_to(terminal));
+            assert!(!terminal.can_transition_to(RunStatus::Running));
+            assert!(!terminal.can_transition_to(terminal));
+        }
+        assert!(!RunStatus::Running.can_transition_to(RunStatus::Running));
     }
 
     #[test]

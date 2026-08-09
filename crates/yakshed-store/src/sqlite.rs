@@ -15,13 +15,14 @@ use tokio::sync::oneshot;
 use yakshed_application::{
     AppStore, ApprovalPage, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateProject,
     CreateRun, CreateWorkItem, GetStreamCursor, ListTimeline, ListWorkItems, PendingApproval,
-    ProjectPage, RunPage, StoreError, StreamCursorState, TimelineBatch, TimelinePage, WorkItemPage,
+    ProjectPage, RunPage, StoreError, StreamCursorState, TimelineBatch, TimelinePage,
+    TransitionRun, WorkItemPage,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, DataRevision,
-    NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus, StreamCursor,
-    TimelineBatchId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId,
-    WorkItemSnapshot, WorkItemStatus,
+    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ConnectionId,
+    DataRevision, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus,
+    StreamCursor, TimelineBatchId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
+    WorkItemId, WorkItemSnapshot, WorkItemStatus,
 };
 
 use crate::AppPaths;
@@ -59,18 +60,23 @@ CREATE TABLE work_edges (
 
 CREATE TABLE runs (
     id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
     work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
-    status TEXT NOT NULL CHECK (status = 'running'),
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'interrupted')),
     provider_namespace TEXT,
     provider_run_id TEXT,
     created_at_ms INTEGER NOT NULL,
+    ended_at_ms INTEGER,
     CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
-    UNIQUE (provider_namespace, provider_run_id)
+    CHECK ((status = 'running') = (ended_at_ms IS NULL)),
+    UNIQUE (connection_id, id),
+    UNIQUE (connection_id, provider_namespace, provider_run_id)
 );
 
 CREATE TABLE timeline_items (
     id TEXT PRIMARY KEY NOT NULL,
-    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    connection_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision > 0),
     kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
     body TEXT NOT NULL,
@@ -78,38 +84,49 @@ CREATE TABLE timeline_items (
     provider_item_id TEXT,
     created_at_ms INTEGER NOT NULL,
     CHECK ((provider_namespace IS NULL) = (provider_item_id IS NULL)),
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
     UNIQUE (run_id, revision),
-    UNIQUE (provider_namespace, provider_item_id)
+    UNIQUE (connection_id, provider_namespace, provider_item_id)
 );
 
 CREATE TABLE approval_requests (
     id TEXT PRIMARY KEY NOT NULL,
-    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    connection_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
     provider_namespace TEXT NOT NULL,
     provider_approval_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
     summary TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'responding', 'resolved')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'responding', 'resolved', 'voided')),
     decision TEXT CHECK (decision IN ('approved', 'denied')),
     requested_at_ms INTEGER NOT NULL,
     response_started_at_ms INTEGER,
     resolved_at_ms INTEGER,
-    UNIQUE (provider_namespace, provider_approval_id),
+    voided_at_ms INTEGER,
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    UNIQUE (connection_id, provider_namespace, provider_approval_id),
     CHECK (
-        (status = 'pending' AND decision IS NULL AND response_started_at_ms IS NULL AND resolved_at_ms IS NULL)
-        OR (status = 'responding' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NULL)
-        OR (status = 'resolved' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NOT NULL)
+        (status = 'pending' AND decision IS NULL AND response_started_at_ms IS NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
+        OR (status = 'responding' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
+        OR (status = 'resolved' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NOT NULL AND voided_at_ms IS NULL)
+        OR (status = 'voided' AND resolved_at_ms IS NULL AND voided_at_ms IS NOT NULL
+            AND ((decision IS NULL AND response_started_at_ms IS NULL)
+                 OR (decision IS NOT NULL AND response_started_at_ms IS NOT NULL)))
     )
 );
 
 CREATE TABLE projection_cursors (
+    connection_id TEXT NOT NULL,
     source_namespace TEXT NOT NULL,
     stream_id TEXT NOT NULL,
-    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
     cursor INTEGER NOT NULL CHECK (cursor >= 0),
     last_batch_id TEXT NOT NULL,
+    last_start_cursor INTEGER NOT NULL CHECK (last_start_cursor >= 0),
+    last_payload_digest TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (source_namespace, stream_id)
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    PRIMARY KEY (connection_id, source_namespace, stream_id)
 );
 
 CREATE TABLE audit_events (
@@ -231,6 +248,38 @@ impl SqliteStore {
                 .query_row("SELECT count(*) FROM audit_events", [], |row| row.get(0))
                 .map_err(map_database_error)?;
             Ok((status, u64::try_from(count).unwrap()))
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn run_and_approval_statuses(
+        &self,
+        run_id: RunId,
+        approval_id: ApprovalRequestId,
+    ) -> Result<(String, String, u64), StoreError> {
+        self.call(move |worker| {
+            let run_status = worker
+                .connection
+                .query_row(
+                    "SELECT status FROM runs WHERE id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(map_database_error)?;
+            let approval_status = worker
+                .connection
+                .query_row(
+                    "SELECT status FROM approval_requests WHERE id = ?1",
+                    [approval_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(map_database_error)?;
+            let count: i64 = worker
+                .connection
+                .query_row("SELECT count(*) FROM audit_events", [], |row| row.get(0))
+                .map_err(map_database_error)?;
+            Ok((run_status, approval_status, u64::try_from(count).unwrap()))
         })
         .await
     }
@@ -494,53 +543,78 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<ProjectSnapshot> {
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
     Ok(RunSnapshot {
         id: parse_column(row, 0)?,
-        work_item_id: parse_column(row, 1)?,
-        status: match row.get::<_, String>(2)?.as_str() {
-            "running" => RunStatus::Running,
-            _ => return Err(rusqlite::Error::InvalidQuery),
-        },
-        provider_id: provider_id(row.get(3)?, row.get(4)?)?,
-        created_at: UtcTimestamp::from_unix_millis(row.get(5)?),
+        connection_id: parse_column(row, 1)?,
+        work_item_id: parse_column(row, 2)?,
+        status: run_status_from_value(&row.get::<_, String>(3)?)?,
+        provider_id: provider_id(row.get(4)?, row.get(5)?)?,
+        created_at: UtcTimestamp::from_unix_millis(row.get(6)?),
+        ended_at: row
+            .get::<_, Option<i64>>(7)?
+            .map(UtcTimestamp::from_unix_millis),
     })
 }
 
+fn run_status_value(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Interrupted => "interrupted",
+    }
+}
+
+fn run_status_from_value(value: &str) -> rusqlite::Result<RunStatus> {
+    match value {
+        "running" => Ok(RunStatus::Running),
+        "completed" => Ok(RunStatus::Completed),
+        "failed" => Ok(RunStatus::Failed),
+        "interrupted" => Ok(RunStatus::Interrupted),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
 const APPROVAL_SELECT: &str = "
-SELECT id, run_id, provider_namespace, provider_approval_id, kind, summary,
-       status, decision, requested_at_ms, response_started_at_ms, resolved_at_ms
+SELECT id, connection_id, run_id, provider_namespace, provider_approval_id, kind, summary,
+       status, decision, requested_at_ms, response_started_at_ms, resolved_at_ms, voided_at_ms
 FROM approval_requests";
 
 fn approval_from_row(row: &Row<'_>) -> rusqlite::Result<ApprovalSnapshot> {
-    let status: String = row.get(6)?;
+    let status: String = row.get(7)?;
     let decision = row
-        .get::<_, Option<String>>(7)?
+        .get::<_, Option<String>>(8)?
         .map(|value| decision_from_value(&value))
         .transpose()?;
     let status = match (status.as_str(), decision) {
         ("pending", None) => ApprovalStatus::Pending,
         ("responding", Some(decision)) => ApprovalStatus::Responding { decision },
         ("resolved", Some(decision)) => ApprovalStatus::Resolved { decision },
+        ("voided", decision) => ApprovalStatus::Voided { decision },
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(ApprovalSnapshot {
         id: parse_column(row, 0)?,
-        run_id: parse_column(row, 1)?,
-        provider_id: NamespacedProviderId::new(row.get::<_, String>(2)?, row.get::<_, String>(3)?)
+        connection_id: parse_column(row, 1)?,
+        run_id: parse_column(row, 2)?,
+        provider_id: NamespacedProviderId::new(row.get::<_, String>(3)?, row.get::<_, String>(4)?)
             .map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    2,
+                    3,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
             })?,
-        kind: row.get(4)?,
-        summary: row.get(5)?,
+        kind: row.get(5)?,
+        summary: row.get(6)?,
         status,
-        requested_at: UtcTimestamp::from_unix_millis(row.get(8)?),
+        requested_at: UtcTimestamp::from_unix_millis(row.get(9)?),
         response_started_at: row
-            .get::<_, Option<i64>>(9)?
+            .get::<_, Option<i64>>(10)?
             .map(UtcTimestamp::from_unix_millis),
         resolved_at: row
-            .get::<_, Option<i64>>(10)?
+            .get::<_, Option<i64>>(11)?
+            .map(UtcTimestamp::from_unix_millis),
+        voided_at: row
+            .get::<_, Option<i64>>(12)?
             .map(UtcTimestamp::from_unix_millis),
     })
 }
@@ -587,42 +661,92 @@ fn list_approval_page(
 }
 
 struct PersistedStreamCursor {
+    connection_id: ConnectionId,
     run_id: RunId,
     cursor: StreamCursor,
     last_batch_id: TimelineBatchId,
+    last_start_cursor: StreamCursor,
+    last_payload_digest: String,
 }
 
 fn find_stream_cursor(
     connection: &Connection,
+    connection_id: ConnectionId,
     source_namespace: &str,
     stream_id: &str,
 ) -> Result<Option<PersistedStreamCursor>, StoreError> {
     connection
         .query_row(
-            "SELECT run_id, cursor, last_batch_id FROM projection_cursors
-             WHERE source_namespace = ?1 AND stream_id = ?2",
-            params![source_namespace, stream_id],
+            "SELECT connection_id, run_id, cursor, last_batch_id, last_start_cursor,
+                    last_payload_digest
+             FROM projection_cursors
+             WHERE connection_id = ?1 AND source_namespace = ?2 AND stream_id = ?3",
+            params![connection_id.to_string(), source_namespace, stream_id],
             |row| {
-                let cursor = u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                let cursor = u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        1,
+                        2,
                         rusqlite::types::Type::Integer,
                         Box::new(error),
                     )
                 })?;
-                let last_batch_id: TimelineBatchId = parse_column(row, 2)?;
+                let last_batch_id: TimelineBatchId = parse_column(row, 3)?;
                 if !last_batch_id.is_v7() {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
+                let last_start_cursor = u64::try_from(row.get::<_, i64>(4)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?;
                 Ok(PersistedStreamCursor {
-                    run_id: parse_column(row, 0)?,
+                    connection_id: parse_column(row, 0)?,
+                    run_id: parse_column(row, 1)?,
                     cursor: StreamCursor::new(cursor),
                     last_batch_id,
+                    last_start_cursor: StreamCursor::new(last_start_cursor),
+                    last_payload_digest: row.get(5)?,
                 })
             },
         )
         .optional()
         .map_err(map_database_error)
+}
+
+/// FNV-1a over `yakshed.timeline-batch.v1\0`, the item count, then each ordered
+/// item's UUID, kind, body, and optional provider namespace/value. Integers and
+/// byte-string lengths are unsigned little-endian u64 values.
+fn timeline_payload_digest(items: &[yakshed_application::NewTimelineItem]) -> String {
+    fn add(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn add_bytes(hash: &mut u64, bytes: &[u8]) {
+        add(hash, &(bytes.len() as u64).to_le_bytes());
+        add(hash, bytes);
+    }
+
+    let mut hash = 0xcbf29ce484222325;
+    add(&mut hash, b"yakshed.timeline-batch.v1\0");
+    add(&mut hash, &(items.len() as u64).to_le_bytes());
+    for item in items {
+        add_bytes(&mut hash, item.id.to_string().as_bytes());
+        add_bytes(&mut hash, item.kind.as_bytes());
+        add_bytes(&mut hash, item.body.as_bytes());
+        match &item.provider_id {
+            Some(provider) => {
+                add(&mut hash, &[1]);
+                add_bytes(&mut hash, provider.namespace().as_bytes());
+                add_bytes(&mut hash, provider.value().as_bytes());
+            }
+            None => add(&mut hash, &[0]),
+        }
+    }
+    format!("{hash:016x}")
 }
 
 #[async_trait]
@@ -912,8 +1036,8 @@ impl AppStore for SqliteStore {
             let existing = worker
                 .connection
                 .query_row(
-                    "SELECT id, work_item_id, status, provider_namespace,
-                            provider_run_id, created_at_ms FROM runs WHERE id = ?1",
+                    "SELECT id, connection_id, work_item_id, status, provider_namespace,
+                            provider_run_id, created_at_ms, ended_at_ms FROM runs WHERE id = ?1",
                     [command.id.to_string()],
                     run_from_row,
                 )
@@ -921,6 +1045,7 @@ impl AppStore for SqliteStore {
                 .map_err(map_database_error)?;
             if let Some(existing) = existing {
                 return if existing.work_item_id == command.work_item_id
+                    && existing.connection_id == command.connection_id
                     && existing.provider_id == command.provider_run
                 {
                     Ok(existing)
@@ -961,10 +1086,12 @@ impl AppStore for SqliteStore {
                 .connection
                 .execute(
                     "INSERT INTO runs
-                     (id, work_item_id, status, provider_namespace, provider_run_id, created_at_ms)
-                     VALUES (?1, ?2, 'running', ?3, ?4, ?5)",
+                     (id, connection_id, work_item_id, status, provider_namespace,
+                      provider_run_id, created_at_ms)
+                     VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)",
                     params![
                         command.id.to_string(),
+                        command.connection_id.to_string(),
                         command.work_item_id.to_string(),
                         namespace,
                         provider_run_id,
@@ -974,11 +1101,105 @@ impl AppStore for SqliteStore {
                 .map_err(map_database_error)?;
             Ok(RunSnapshot {
                 id: command.id,
+                connection_id: command.connection_id,
                 work_item_id: command.work_item_id,
                 status: RunStatus::Running,
                 provider_id: command.provider_run,
                 created_at: now,
+                ended_at: None,
             })
+        })
+        .await
+    }
+
+    async fn transition_run(&self, command: TransitionRun) -> Result<RunSnapshot, StoreError> {
+        validate_app_id("audit event id", command.audit_event_id.is_v7())?;
+        if !command.expected_current.can_transition_to(command.target) {
+            return Err(StoreError::Conflict(
+                "illegal run state transition".to_owned(),
+            ));
+        }
+        self.call(move |worker| {
+            let transaction = worker
+                .connection
+                .transaction()
+                .map_err(map_database_error)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE runs SET status = ?2, ended_at_ms = ?3
+                     WHERE id = ?1 AND status = ?4",
+                    params![
+                        command.run_id.to_string(),
+                        run_status_value(command.target),
+                        command.occurred_at.unix_millis(),
+                        run_status_value(command.expected_current)
+                    ],
+                )
+                .map_err(map_database_error)?;
+            if changed == 0 {
+                let current = transaction
+                    .query_row(
+                        "SELECT status FROM runs WHERE id = ?1",
+                        [command.run_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(map_database_error)?;
+                return Err(match current {
+                    Some(current) => StoreError::Conflict(format!(
+                        "run state conflict: expected {}, current {current}",
+                        run_status_value(command.expected_current)
+                    )),
+                    None => StoreError::NotFound {
+                        entity: "run",
+                        id: command.run_id.to_string(),
+                    },
+                });
+            }
+            let voided = transaction
+                .execute(
+                    "UPDATE approval_requests
+                     SET status = 'voided', voided_at_ms = ?2
+                     WHERE run_id = ?1 AND status IN ('pending', 'responding')",
+                    params![
+                        command.run_id.to_string(),
+                        command.occurred_at.unix_millis()
+                    ],
+                )
+                .map_err(map_database_error)?;
+            #[cfg(test)]
+            if std::mem::take(&mut worker.fail_transition_after_update) {
+                return Err(StoreError::Backend(
+                    "injected failure after run transition".to_owned(),
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO audit_events
+                     (id, event_type, entity_type, entity_id, body, created_at_ms)
+                     VALUES (?1, 'run_transitioned', 'run', ?2, ?3, ?4)",
+                    params![
+                        command.audit_event_id.to_string(),
+                        command.run_id.to_string(),
+                        format!(
+                            "{}->{};voided_approvals={voided}",
+                            run_status_value(command.expected_current),
+                            run_status_value(command.target)
+                        ),
+                        command.occurred_at.unix_millis()
+                    ],
+                )
+                .map_err(map_database_error)?;
+            let snapshot = transaction
+                .query_row(
+                    "SELECT id, connection_id, work_item_id, status, provider_namespace,
+                            provider_run_id, created_at_ms, ended_at_ms FROM runs WHERE id = ?1",
+                    [command.run_id.to_string()],
+                    run_from_row,
+                )
+                .map_err(map_database_error)?;
+            transaction.commit().map_err(map_database_error)?;
+            Ok(snapshot)
         })
         .await
     }
@@ -996,8 +1217,8 @@ impl AppStore for SqliteStore {
             let mut statement = worker
                 .connection
                 .prepare(
-                    "SELECT id, work_item_id, status, provider_namespace,
-                            provider_run_id, created_at_ms
+                    "SELECT id, connection_id, work_item_id, status, provider_namespace,
+                            provider_run_id, created_at_ms, ended_at_ms
                      FROM runs WHERE status = 'running' AND (?1 IS NULL OR id > ?1)
                      ORDER BY id LIMIT ?2",
                 )
@@ -1026,42 +1247,60 @@ impl AppStore for SqliteStore {
             validate_app_id("timeline item id", item.id.is_v7())?;
             validate_text("timeline item kind", &item.kind)?;
         }
+        let payload_digest = timeline_payload_digest(&batch.items);
         let now = self.clock.now();
         self.call(move |worker| {
             let transaction = worker
                 .connection
                 .transaction()
                 .map_err(map_database_error)?;
-            let run_exists = transaction
+            let run_connection = transaction
                 .query_row(
-                    "SELECT 1 FROM runs WHERE id = ?1",
+                    "SELECT connection_id FROM runs WHERE id = ?1",
                     [batch.run_id.to_string()],
-                    |_| Ok(()),
+                    |row| parse_column::<ConnectionId>(row, 0),
                 )
                 .optional()
-                .map_err(map_database_error)?
-                .is_some();
-            if !run_exists {
+                .map_err(map_database_error)?;
+            let Some(run_connection) = run_connection else {
                 return Err(StoreError::NotFound {
                     entity: "run",
                     id: batch.run_id.to_string(),
                 });
+            };
+            if run_connection != batch.connection_id {
+                return Err(StoreError::Conflict(
+                    "run belongs to a different connection".to_owned(),
+                ));
             }
             let expected = i64::try_from(batch.expected_stream_revision.get())
                 .map_err(|error| StoreError::Conflict(error.to_string()))?;
-            let cursor =
-                find_stream_cursor(&transaction, &batch.source_namespace, &batch.stream_id)?;
+            let cursor = find_stream_cursor(
+                &transaction,
+                batch.connection_id,
+                &batch.source_namespace,
+                &batch.stream_id,
+            )?;
             match cursor {
-                Some(cursor) if cursor.run_id != batch.run_id => {
+                Some(cursor)
+                    if cursor.connection_id != batch.connection_id
+                        || cursor.run_id != batch.run_id =>
+                {
                     return Err(StoreError::Conflict(
                         "projection stream is already bound to a different run".to_owned(),
                     ));
                 }
                 Some(cursor)
                     if cursor.last_batch_id == batch.batch_id
-                        && cursor.cursor.get() >= batch.expected_stream_revision.get() =>
+                        && cursor.last_start_cursor == batch.expected_stream_revision
+                        && cursor.last_payload_digest == payload_digest =>
                 {
                     return Ok(cursor.cursor);
+                }
+                Some(cursor) if cursor.last_batch_id == batch.batch_id => {
+                    return Err(StoreError::Conflict(
+                        "timeline batch retry does not match its committed receipt".to_owned(),
+                    ));
                 }
                 Some(cursor) if cursor.cursor.get() != batch.expected_stream_revision.get() => {
                     return Err(StoreError::Conflict(format!(
@@ -1099,11 +1338,12 @@ impl AppStore for SqliteStore {
                 transaction
                     .execute(
                         "INSERT INTO timeline_items
-                         (id, run_id, revision, kind, body, provider_namespace,
+                         (id, connection_id, run_id, revision, kind, body, provider_namespace,
                           provider_item_id, created_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                         params![
                             item.id.to_string(),
+                            batch.connection_id.to_string(),
                             batch.run_id.to_string(),
                             timeline_revision,
                             item.kind,
@@ -1121,18 +1361,24 @@ impl AppStore for SqliteStore {
             transaction
                 .execute(
                     "INSERT INTO projection_cursors
-                     (source_namespace, stream_id, run_id, cursor, last_batch_id, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(source_namespace, stream_id) DO UPDATE SET
+                     (connection_id, source_namespace, stream_id, run_id, cursor, last_batch_id,
+                      last_start_cursor, last_payload_digest, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(connection_id, source_namespace, stream_id) DO UPDATE SET
                          cursor = excluded.cursor,
                          last_batch_id = excluded.last_batch_id,
+                         last_start_cursor = excluded.last_start_cursor,
+                         last_payload_digest = excluded.last_payload_digest,
                          updated_at_ms = excluded.updated_at_ms",
                     params![
+                        batch.connection_id.to_string(),
                         batch.source_namespace,
                         batch.stream_id,
                         batch.run_id.to_string(),
                         stream_revision,
                         batch.batch_id.to_string(),
+                        expected,
+                        payload_digest,
                         now.unix_millis()
                     ],
                 )
@@ -1155,13 +1401,19 @@ impl AppStore for SqliteStore {
         self.call(move |worker| {
             let cursor = find_stream_cursor(
                 &worker.connection,
+                query.connection_id,
                 &query.source_namespace,
                 &query.stream_id,
             )?;
             match cursor {
-                Some(cursor) if cursor.run_id != query.run_id => Err(StoreError::Conflict(
-                    "projection stream is bound to a different run".to_owned(),
-                )),
+                Some(cursor)
+                    if cursor.connection_id != query.connection_id
+                        || cursor.run_id != query.run_id =>
+                {
+                    Err(StoreError::Conflict(
+                        "projection stream is bound to a different run".to_owned(),
+                    ))
+                }
                 Some(cursor) => Ok(Some(StreamCursorState {
                     cursor: cursor.cursor,
                     last_batch_id: cursor.last_batch_id,
@@ -1185,7 +1437,7 @@ impl AppStore for SqliteStore {
             let mut statement = worker
                 .connection
                 .prepare(
-                    "SELECT id, run_id, revision, kind, body, provider_namespace,
+                    "SELECT id, connection_id, run_id, revision, kind, body, provider_namespace,
                             provider_item_id, created_at_ms
                      FROM timeline_items
                      WHERE run_id = ?1 AND (?2 IS NULL OR revision > ?2)
@@ -1197,23 +1449,24 @@ impl AppStore for SqliteStore {
                 .query_map(
                     params![query.run_id.to_string(), after, fetch_limit],
                     |row| {
-                        let revision: i64 = row.get(2)?;
+                        let revision: i64 = row.get(3)?;
                         Ok(TimelineItemSnapshot {
                             id: parse_column(row, 0)?,
-                            run_id: parse_column(row, 1)?,
+                            connection_id: parse_column(row, 1)?,
+                            run_id: parse_column(row, 2)?,
                             revision: TimelineRevision::new(u64::try_from(revision).map_err(
                                 |error| {
                                     rusqlite::Error::FromSqlConversionFailure(
-                                        2,
+                                        3,
                                         rusqlite::types::Type::Integer,
                                         Box::new(error),
                                     )
                                 },
                             )?),
-                            kind: row.get(3)?,
-                            body: row.get(4)?,
-                            provider_id: provider_id(row.get(5)?, row.get(6)?)?,
-                            created_at: UtcTimestamp::from_unix_millis(row.get(7)?),
+                            kind: row.get(4)?,
+                            body: row.get(5)?,
+                            provider_id: provider_id(row.get(6)?, row.get(7)?)?,
+                            created_at: UtcTimestamp::from_unix_millis(row.get(8)?),
                         })
                     },
                 )
@@ -1263,31 +1516,31 @@ impl AppStore for SqliteStore {
                     )))
                 };
             }
-            let run_exists = worker
+            let connection_id = worker
                 .connection
                 .query_row(
-                    "SELECT 1 FROM runs WHERE id = ?1",
+                    "SELECT connection_id FROM runs WHERE id = ?1",
                     [approval.run_id.to_string()],
-                    |_| Ok(()),
+                    |row| parse_column::<ConnectionId>(row, 0),
                 )
                 .optional()
-                .map_err(map_database_error)?
-                .is_some();
-            if !run_exists {
+                .map_err(map_database_error)?;
+            let Some(connection_id) = connection_id else {
                 return Err(StoreError::NotFound {
                     entity: "run",
                     id: approval.run_id.to_string(),
                 });
-            }
+            };
             worker
                 .connection
                 .execute(
                     "INSERT INTO approval_requests
-                     (id, run_id, provider_namespace, provider_approval_id, kind,
+                     (id, connection_id, run_id, provider_namespace, provider_approval_id, kind,
                       summary, status, requested_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
                     params![
                         approval.id.to_string(),
+                        connection_id.to_string(),
                         approval.run_id.to_string(),
                         approval.provider_id.namespace(),
                         approval.provider_id.value(),
@@ -1299,6 +1552,7 @@ impl AppStore for SqliteStore {
                 .map_err(map_database_error)?;
             Ok(ApprovalSnapshot {
                 id: approval.id,
+                connection_id,
                 run_id: approval.run_id,
                 provider_id: approval.provider_id,
                 kind: approval.kind,
@@ -1307,6 +1561,7 @@ impl AppStore for SqliteStore {
                 requested_at: now,
                 response_started_at: None,
                 resolved_at: None,
+                voided_at: None,
             })
         })
         .await
@@ -1534,7 +1789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_transitions_and_audits_commit_or_roll_back_together() {
+    async fn approval_and_run_transitions_commit_audits_or_roll_back_together() {
         let temp = tempfile::tempdir().unwrap();
         let ids = SystemIdGenerator;
         let store = SqliteStore::open(AppPaths::for_test(temp.path()), Arc::new(FixedClock))
@@ -1559,6 +1814,7 @@ mod tests {
         let run = store
             .create_run(CreateRun {
                 id: ids.next_run_id(),
+                connection_id: "0193f26e-7a72-7d42-bf77-0de14c4cc222".parse().unwrap(),
                 work_item_id: work.id,
                 provider_run: None,
             })
@@ -1639,6 +1895,54 @@ mod tests {
                 .await
                 .unwrap(),
             ("resolved".to_owned(), 2)
+        );
+
+        let pending = store
+            .record_pending_approval(PendingApproval {
+                id: ids.next_approval_request_id(),
+                run_id: run.id,
+                provider_id: NamespacedProviderId::new("mock", "approval-2").unwrap(),
+                kind: "command".into(),
+                summary: "still pending".into(),
+            })
+            .await
+            .unwrap();
+        store.fail_next_transition_after_update().await.unwrap();
+        assert!(
+            store
+                .transition_run(TransitionRun {
+                    run_id: run.id,
+                    expected_current: RunStatus::Running,
+                    target: RunStatus::Failed,
+                    occurred_at: UtcTimestamp::from_unix_millis(43),
+                    audit_event_id: ids.next_audit_event_id(),
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .run_and_approval_statuses(run.id, pending.id)
+                .await
+                .unwrap(),
+            ("running".to_owned(), "pending".to_owned(), 2)
+        );
+        store
+            .transition_run(TransitionRun {
+                run_id: run.id,
+                expected_current: RunStatus::Running,
+                target: RunStatus::Failed,
+                occurred_at: UtcTimestamp::from_unix_millis(43),
+                audit_event_id: ids.next_audit_event_id(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .run_and_approval_statuses(run.id, pending.id)
+                .await
+                .unwrap(),
+            ("failed".to_owned(), "voided".to_owned(), 3)
         );
     }
 }

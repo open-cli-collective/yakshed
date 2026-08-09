@@ -7,7 +7,7 @@ use thiserror::Error as ThisError;
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, AuditEventId, Connection, ConnectionId,
     CredentialBinding, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
-    SecretBackend, SecretBackendId, StreamCursor, TimelineBatchId, TimelineItemId,
+    RunStatus, SecretBackend, SecretBackendId, StreamCursor, TimelineBatchId, TimelineItemId,
     TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
@@ -234,8 +234,18 @@ pub struct WorkItemPage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateRun {
     pub id: RunId,
+    pub connection_id: ConnectionId,
     pub work_item_id: WorkItemId,
     pub provider_run: Option<NamespacedProviderId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransitionRun {
+    pub run_id: RunId,
+    pub expected_current: RunStatus,
+    pub target: RunStatus,
+    pub occurred_at: UtcTimestamp,
+    pub audit_event_id: AuditEventId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,6 +265,7 @@ pub struct NewTimelineItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelineBatch {
     pub batch_id: TimelineBatchId,
+    pub connection_id: ConnectionId,
     pub run_id: RunId,
     pub source_namespace: String,
     pub stream_id: String,
@@ -277,6 +288,7 @@ pub struct TimelinePage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetStreamCursor {
+    pub connection_id: ConnectionId,
     pub run_id: RunId,
     pub source_namespace: String,
     pub stream_id: String,
@@ -354,6 +366,7 @@ pub trait AppStore: Send + Sync {
     async fn list_work_items(&self, query: ListWorkItems) -> Result<WorkItemPage, StoreError>;
     async fn archive_work_subtree(&self, root: WorkItemId) -> Result<u64, StoreError>;
     async fn create_run(&self, command: CreateRun) -> Result<RunSnapshot, StoreError>;
+    async fn transition_run(&self, command: TransitionRun) -> Result<RunSnapshot, StoreError>;
     async fn list_active_runs(
         &self,
         after: Option<RunId>,
