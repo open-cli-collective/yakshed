@@ -10,10 +10,7 @@ use std::{error::Error, fmt, sync::Arc};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use time::OffsetDateTime;
-pub use yakshed_application::{
-    DEV_SECRETS_FEATURE, LOCAL_FILE_BACKEND_KIND, SecretBackendConfigurationError,
-    validate_backend_configuration,
-};
+pub use yakshed_application::{SecretBackendConfigurationError, validate_backend_configuration};
 pub use yakshed_domain::{
     ConnectionId, CredentialSlot, OperationId, SecretBackend, SecretBackendId,
     SecretBackendSettings, SecretLocator, SecretReference,
@@ -26,6 +23,15 @@ pub use broker::{
 #[cfg(feature = "dev-secrets")]
 pub use local_file::LocalFileBackend;
 pub use memory::{MemorySecretBackend, MemorySecretFault};
+
+pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
+
+pub const fn supported_backend_kinds() -> &'static [&'static str] {
+    #[cfg(all(feature = "dev-secrets", unix))]
+    return &["memory", LOCAL_FILE_BACKEND_KIND];
+    #[cfg(not(all(feature = "dev-secrets", unix)))]
+    &["memory"]
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretReferenceSummary {

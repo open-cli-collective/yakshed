@@ -53,6 +53,12 @@ pub struct LocalFileBackend {
 #[cfg(unix)]
 struct LocalFileState {
     id: SecretBackendId,
+    configured_path: PathBuf,
+    initialized: Mutex<Option<Arc<InitializedLocalFile>>>,
+}
+
+#[cfg(unix)]
+struct InitializedLocalFile {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
 }
@@ -72,23 +78,17 @@ impl LocalFileBackend {
                 backend: config.id.clone(),
             });
         };
-        validate_backend_configuration(config)?;
+        validate_backend_configuration(config, crate::supported_backend_kinds())?;
         #[cfg(not(unix))]
         let _ = path;
 
         #[cfg(unix)]
         {
-            let path = canonical_store_path(Path::new(path)).map_err(|_| {
-                SecretBackendConfigurationError::InvalidPath {
-                    backend: config.id.clone(),
-                }
-            })?;
-            let lock = shared_file_lock(&path);
             Ok(Self {
                 state: Arc::new(LocalFileState {
                     id: config.id.clone(),
-                    path,
-                    lock,
+                    configured_path: PathBuf::from(path),
+                    initialized: Mutex::new(None),
                 }),
             })
         }
@@ -174,37 +174,56 @@ impl LocalFileState {
         }
     }
 
-    fn load(&self) -> Result<LocalFileStore, SecretError> {
-        read_store(&self.path, &self.id)
+    fn initialized(&self) -> Result<Arc<InitializedLocalFile>, SecretError> {
+        let mut initialized = self
+            .initialized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(initialized) = initialized.as_ref() {
+            return Ok(Arc::clone(initialized));
+        }
+        let path = canonical_store_path(&self.configured_path)
+            .map_err(|_| backend_failure(&self.id, "failed to initialize local secret store"))?;
+        let value = Arc::new(InitializedLocalFile {
+            lock: shared_file_lock(&path),
+            path,
+        });
+        *initialized = Some(Arc::clone(&value));
+        Ok(value)
     }
 
-    fn save(&self, store: &LocalFileStore) -> Result<(), SecretError> {
-        write_store_with_hooks(&self.path, store, || Ok(()), sync_directory)
+    fn load(&self, path: &Path) -> Result<LocalFileStore, SecretError> {
+        read_store(path, &self.id)
+    }
+
+    fn save(&self, path: &Path, store: &LocalFileStore) -> Result<(), SecretError> {
+        write_store_with_hooks(path, store, || Ok(()), sync_directory)
             .map_err(|error| map_write_error(&self.id, error))
     }
 
     fn with_store_lock<T>(
         &self,
         abandoned: Option<&AtomicBool>,
-        action: impl FnOnce() -> Result<T, SecretError>,
+        action: impl FnOnce(&Path) -> Result<T, SecretError>,
     ) -> Result<T, SecretError> {
-        let _process_guard = self
+        let initialized = self.initialized()?;
+        let _process_guard = initialized
             .lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_parent(&self.path, &self.id)?;
-        let _file_guard = lock_exclusive(&lock_path(&self.path))
+        validate_parent(&initialized.path, &self.id)?;
+        let _file_guard = lock_exclusive(&lock_path(&initialized.path))
             .map_err(|_| backend_failure(&self.id, "failed to lock local secret store"))?;
-        validate_parent(&self.path, &self.id)?;
-        validate_store_if_present(&self.path, &self.id)?;
+        validate_parent(&initialized.path, &self.id)?;
+        validate_store_if_present(&initialized.path, &self.id)?;
         if abandoned.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Err(SecretError::Cancelled {
                 backend: self.id.clone(),
             });
         }
-        claim_or_validate(&self.path, &self.id)?;
-        validate_store_if_present(&self.path, &self.id)?;
-        action()
+        claim_or_validate(&initialized.path, &self.id)?;
+        validate_store_if_present(&initialized.path, &self.id)?;
+        action(&initialized.path)
     }
 }
 
@@ -220,8 +239,8 @@ impl SecretResolver for LocalFileBackend {
 
     async fn probe(&self) -> Result<SecretBackendStatus, SecretError> {
         self.run_blocking(|state| {
-            state.with_store_lock(None, || {
-                state.load()?;
+            state.with_store_lock(None, |path| {
+                state.load(path)?;
                 Ok(SecretBackendStatus::Available)
             })
         })
@@ -235,8 +254,8 @@ impl SecretResolver for LocalFileBackend {
     ) -> Result<ResolvedSecret, SecretError> {
         let locator = locator.clone();
         self.run_blocking(move |state| {
-            state.with_store_lock(None, || {
-                let store = state.load()?;
+            state.with_store_lock(None, |path| {
+                let store = state.load(path)?;
                 let value =
                     store
                         .secrets
@@ -273,8 +292,8 @@ impl SecretAdministrator for LocalFileBackend {
         let locator = locator.clone();
         let value = value.expose_secret().to_owned();
         self.run_mutation(move |state, abandoned| {
-            state.with_store_lock(Some(abandoned), || {
-                let mut store = state.load()?;
+            state.with_store_lock(Some(abandoned), |path| {
+                let mut store = state.load(path)?;
                 let existed = store.secrets.contains_key(locator.as_str());
                 if existed && !options.overwrite {
                     return Err(SecretError::AlreadyExists {
@@ -287,7 +306,7 @@ impl SecretAdministrator for LocalFileBackend {
                     });
                 }
                 store.secrets.insert(locator.as_str().to_owned(), value);
-                state.save(&store)?;
+                state.save(path, &store)?;
                 Ok(if existed {
                     PutSecretOutcome::Replaced
                 } else {
@@ -301,8 +320,8 @@ impl SecretAdministrator for LocalFileBackend {
     async fn delete(&self, locator: &SecretLocator) -> Result<DeleteSecretOutcome, SecretError> {
         let locator = locator.clone();
         self.run_mutation(move |state, abandoned| {
-            state.with_store_lock(Some(abandoned), || {
-                let mut store = state.load()?;
+            state.with_store_lock(Some(abandoned), |path| {
+                let mut store = state.load(path)?;
                 if !store.secrets.contains_key(locator.as_str()) {
                     return Ok(DeleteSecretOutcome::NotFound);
                 }
@@ -312,7 +331,7 @@ impl SecretAdministrator for LocalFileBackend {
                     });
                 }
                 store.secrets.remove(locator.as_str());
-                state.save(&store)?;
+                state.save(path, &store)?;
                 Ok(DeleteSecretOutcome::Deleted)
             })
         })
@@ -450,50 +469,34 @@ fn insecure(backend: &SecretBackendId, problem: LocalFileSecurityProblem) -> Sec
 
 #[cfg(unix)]
 fn claim_or_validate(path: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    claim_or_validate_with_hook(path, backend, || Ok(()))
+}
 
-    let mut file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+#[cfg(unix)]
+fn claim_or_validate_with_hook(
+    path: &Path,
+    backend: &SecretBackendId,
+    before_commit: impl FnOnce() -> io::Result<()>,
+) -> Result<(), SecretError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
             read_store(path, backend)?;
-            return Ok(());
+            Ok(())
         }
-        Err(_) => {
-            return Err(backend_failure(
-                backend,
-                "failed to claim local secret store",
-            ));
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let store = LocalFileStore {
+                format_version: FORMAT_VERSION,
+                backend_id: backend.clone(),
+                secrets: HashMap::new(),
+            };
+            write_store_with_hooks(path, &store, before_commit, sync_directory)
+                .map_err(|error| map_write_error(backend, error))
         }
-    };
-    let store = LocalFileStore {
-        format_version: FORMAT_VERSION,
-        backend_id: backend.clone(),
-        secrets: HashMap::new(),
-    };
-    let written = serde_json::to_writer(&mut file, &store)
-        .map_err(|_| ())
-        .and_then(|()| file.write_all(b"\n").map_err(|_| ()))
-        .and_then(|()| file.sync_all().map_err(|_| ()))
-        .is_ok();
-    if !written {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(backend_failure(
+        Err(_) => Err(backend_failure(
             backend,
-            "failed to claim local secret store",
-        ));
+            "failed to inspect local secret store",
+        )),
     }
-    if sync_directory(path.parent().expect("store path has a parent")).is_err() {
-        return Err(SecretError::UncertainWrite {
-            backend: backend.clone(),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -739,8 +742,6 @@ mod tests {
         let first = Arc::new(LocalFileBackend::from_config(&settings).unwrap());
         let aliased = config("dev-local", &temp.path().join("store/./secrets.json"));
         let second = Arc::new(LocalFileBackend::from_config(&aliased).unwrap());
-        assert_eq!(first.state.path, second.state.path);
-        assert!(Arc::ptr_eq(&first.state.lock, &second.state.lock));
         let put = |backend: Arc<LocalFileBackend>, locator: &'static str| async move {
             backend
                 .put(
@@ -753,6 +754,13 @@ mod tests {
         let (left, right) = tokio::join!(put(first.clone(), "left"), put(second.clone(), "right"));
         left.unwrap();
         right.unwrap();
+        let first_initialized = first.state.initialized().unwrap();
+        let second_initialized = second.state.initialized().unwrap();
+        assert_eq!(first_initialized.path, second_initialized.path);
+        assert!(Arc::ptr_eq(
+            &first_initialized.lock,
+            &second_initialized.lock
+        ));
         first
             .resolve(&SecretLocator::new("left").unwrap(), &context())
             .await
@@ -831,9 +839,11 @@ mod tests {
 
         let temp = tempdir().unwrap();
         let path = temp.path().join("store/secrets.json");
-        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(&path, b"{}").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
 
         assert!(matches!(
             backend.probe().await,
@@ -850,10 +860,11 @@ mod tests {
 
         let temp = tempdir().unwrap();
         let path = temp.path().join("store/secrets.json");
-        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+        fs::create_dir(path.parent().unwrap()).unwrap();
         let target = temp.path().join("target.json");
         fs::write(&target, b"{}").unwrap();
         symlink(target, &path).unwrap();
+        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
 
         assert!(matches!(
             backend.probe().await,
@@ -885,8 +896,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn every_new_ancestor_is_private() {
+    #[tokio::test]
+    async fn every_new_ancestor_is_private() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempdir().unwrap();
@@ -896,6 +907,9 @@ mod tests {
             temp.path().join("a/b/c"),
         ];
         LocalFileBackend::from_config(&config("dev-local", &ancestors[2].join("store.json")))
+            .unwrap()
+            .probe()
+            .await
             .unwrap();
 
         for ancestor in ancestors {
@@ -904,6 +918,46 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[tokio::test]
+    async fn construction_is_pure_and_first_use_initializes_storage() {
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("not-created-at-construction");
+        let backend =
+            LocalFileBackend::from_config(&config("dev-local", &parent.join("secrets.json")))
+                .unwrap();
+
+        assert!(!parent.exists());
+        backend.probe().await.unwrap();
+        assert!(parent.is_dir());
+        assert!(parent.join("secrets.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn failed_initial_claim_leaves_no_file_and_next_access_recovers() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFileBackend::from_config(&config(
+            "dev-local",
+            &temp.path().join("store/secrets.json"),
+        ))
+        .unwrap();
+        let initialized = backend.state.initialized().unwrap();
+        let _process_guard = initialized.lock.lock().unwrap();
+        let file_guard = lock_exclusive(&lock_path(&initialized.path)).unwrap();
+
+        assert!(matches!(
+            claim_or_validate_with_hook(&initialized.path, &backend.state.id, || Err(
+                io::Error::other("initial claim fault")
+            )),
+            Err(SecretError::BackendFailure { .. })
+        ));
+        assert!(!initialized.path.exists());
+        drop(file_guard);
+        drop(_process_guard);
+
+        backend.probe().await.unwrap();
+        assert!(initialized.path.is_file());
     }
 
     #[tokio::test]
@@ -1022,13 +1076,14 @@ mod tests {
         let path = temp.path().join("store/secrets.json");
         let config = config("dev-local", &path);
         let backend = LocalFileBackend::from_config(&config).unwrap();
+        let initialized = backend.state.initialized().unwrap();
         let store = LocalFileStore {
             format_version: FORMAT_VERSION,
             backend_id: backend.state.id.clone(),
             secrets: HashMap::new(),
         };
         let error = write_store_with_hooks(
-            &backend.state.path,
+            &initialized.path,
             &store,
             || Ok(()),
             |_| Err(io::Error::other("post-commit fault")),
@@ -1039,7 +1094,7 @@ mod tests {
             map_write_error(&backend.state.id, error),
             SecretError::UncertainWrite { .. }
         ));
-        assert!(backend.state.path.exists());
+        assert!(initialized.path.exists());
     }
 
     #[test]
@@ -1047,8 +1102,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("store/secrets.json");
         let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
-        fs::write(&backend.state.path, format!("not-json-{CANARY}")).unwrap();
-        let Err(error) = backend.state.load() else {
+        let initialized = backend.state.initialized().unwrap();
+        fs::write(&initialized.path, format!("not-json-{CANARY}")).unwrap();
+        let Err(error) = backend.state.load(&initialized.path) else {
             panic!("invalid JSON must fail closed")
         };
 

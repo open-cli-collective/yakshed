@@ -11,6 +11,7 @@ use std::{
 use async_trait::async_trait;
 use secrecy::SecretString;
 use tokio::sync::{Barrier, Semaphore};
+use yakshed_application::{AppConfig, ConfigValidationError};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
     OperationId, ProviderStateRootId,
@@ -22,12 +23,12 @@ use yakshed_secrets::{
     SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackend, SecretBackendDescriptor,
     SecretBackendHandle, SecretBackendId, SecretBackendSettings, SecretBackendStatus, SecretError,
     SecretLocator, SecretOperation, SecretReference, SecretResolver, shape_process_environment,
+    supported_backend_kinds,
 };
 
 #[cfg(all(feature = "dev-secrets", unix))]
 use yakshed_secrets::LocalFileBackend;
-#[cfg(not(feature = "dev-secrets"))]
-use yakshed_secrets::{SecretBackendConfigurationError, validate_backend_configuration};
+use yakshed_secrets::SecretBackendConfigurationError;
 
 const CONNECTION_A: &str = "0193f26e-7a72-7d42-bf77-0de14c4cc111";
 const CONNECTION_B: &str = "0193f26e-7a72-7d42-bf77-0de14c4cc222";
@@ -113,25 +114,87 @@ fn domain_reference_values_reject_unsafe_input() {
     assert_eq!(locator("opaque/path").as_str(), "opaque/path");
 }
 
-#[cfg(not(feature = "dev-secrets"))]
 #[test]
-fn local_file_config_requires_dev_secrets_feature() {
+fn validation_rejects_backend_kind_absent_from_capabilities() {
+    let config = AppConfig {
+        secret_backends: vec![SecretBackend {
+            id: backend_id("dev-local"),
+            settings: SecretBackendSettings::LocalFile {
+                path: "/tmp/yakshed-dev-secrets.json".to_owned(),
+            },
+        }],
+        ..AppConfig::default()
+    };
+
+    assert!(matches!(
+        config.validate(&["memory"]),
+        Err(ConfigValidationError::SecretBackend(
+            SecretBackendConfigurationError::UnsupportedKind {
+                kind: "local-file",
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
+fn relative_local_file_path_is_rejected_by_validation() {
+    let config = AppConfig {
+        secret_backends: vec![SecretBackend {
+            id: backend_id("dev-local"),
+            settings: SecretBackendSettings::LocalFile {
+                path: "relative/secrets.json".to_owned(),
+            },
+        }],
+        ..AppConfig::default()
+    };
+
+    assert!(matches!(
+        config.validate(&["local-file"]),
+        Err(ConfigValidationError::SecretBackend(
+            SecretBackendConfigurationError::AbsolutePathRequired { .. }
+        ))
+    ));
+}
+
+#[test]
+fn build_capabilities_report_local_file_exactly_when_available() {
+    #[cfg(all(feature = "dev-secrets", unix))]
+    assert_eq!(supported_backend_kinds(), &["memory", "local-file"]);
+    #[cfg(not(all(feature = "dev-secrets", unix)))]
+    assert_eq!(supported_backend_kinds(), &["memory"]);
+}
+
+#[cfg(all(feature = "dev-secrets", unix))]
+#[test]
+fn real_build_capabilities_accept_local_file_config() {
+    let config = AppConfig {
+        secret_backends: vec![SecretBackend {
+            id: backend_id("dev-local"),
+            settings: SecretBackendSettings::LocalFile {
+                path: "/tmp/yakshed-dev-secrets.json".to_owned(),
+            },
+        }],
+        ..AppConfig::default()
+    };
+
+    assert!(config.validate(supported_backend_kinds()).is_ok());
+}
+
+#[cfg(all(feature = "dev-secrets", unix))]
+#[test]
+fn relative_local_file_path_is_rejected_at_construction() {
     let config = SecretBackend {
         id: backend_id("dev-local"),
         settings: SecretBackendSettings::LocalFile {
-            path: "/tmp/yakshed-dev-secrets.json".to_owned(),
+            path: "relative/secrets.json".to_owned(),
         },
     };
 
-    let error = validate_backend_configuration(&config).unwrap_err();
     assert!(matches!(
-        error,
-        SecretBackendConfigurationError::MissingFeature {
-            feature: "dev-secrets",
-            ..
-        }
+        LocalFileBackend::from_config(&config),
+        Err(SecretBackendConfigurationError::AbsolutePathRequired { .. })
     ));
-    assert!(error.to_string().contains("dev-secrets"));
 }
 
 #[cfg(all(feature = "dev-secrets", unix))]

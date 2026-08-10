@@ -244,6 +244,7 @@ pub struct ConfigStore {
 
 struct StoreInner {
     config_path: PathBuf,
+    supported_backend_kinds: &'static [&'static str],
     state: RwLock<ConfigSnapshot>,
     updates: Mutex<()>,
     #[cfg(test)]
@@ -252,11 +253,14 @@ struct StoreInner {
 
 impl ConfigStore {
     /// Opens or creates the schema-v1 config beneath the injected config root.
-    pub fn open(paths: AppPaths) -> Result<Self, ConfigError> {
+    pub fn open(
+        paths: AppPaths,
+        supported_backend_kinds: &'static [&'static str],
+    ) -> Result<Self, ConfigError> {
         paths.create_config_root()?;
         let config_path = paths.config_root.join(CONFIG_FILE);
         let config = if config_path.exists() {
-            read_config(&config_path)?
+            read_config(&config_path, supported_backend_kinds)?
         } else {
             let config = AppConfig::default();
             write_config(&config_path, &config)?;
@@ -266,6 +270,7 @@ impl ConfigStore {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 config_path,
+                supported_backend_kinds,
                 state: RwLock::new(ConfigSnapshot {
                     revision: ConfigRevision::INITIAL,
                     config,
@@ -323,7 +328,7 @@ impl StoreInner {
 
         let mut config = current.config;
         apply_change(&mut config, change);
-        validate_config(&config)?;
+        validate_config(&config, self.supported_backend_kinds)?;
         let revision = current
             .revision
             .get()
@@ -377,7 +382,7 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
     }
 }
 
-fn read_config(path: &Path) -> Result<AppConfig, ConfigError> {
+fn read_config(path: &Path, supported_backend_kinds: &[&str]) -> Result<AppConfig, ConfigError> {
     let source = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_owned(),
         source,
@@ -386,12 +391,15 @@ fn read_config(path: &Path) -> Result<AppConfig, ConfigError> {
     let value = migrate(value)?;
     let config = AppConfig::try_from(value.try_into::<ConfigDto>().map_err(ConfigError::Parse)?)
         .map_err(|error| ConfigError::Validation(error.to_string()))?;
-    validate_config(&config)?;
+    validate_config(&config, supported_backend_kinds)?;
     Ok(config)
 }
 
-fn validate_config(config: &AppConfig) -> Result<(), ConfigError> {
-    match config.validate() {
+fn validate_config(
+    config: &AppConfig,
+    supported_backend_kinds: &[&str],
+) -> Result<(), ConfigError> {
+    match config.validate(supported_backend_kinds) {
         Ok(()) => Ok(()),
         Err(ConfigValidationError::SecretBackend(error)) => {
             Err(ConfigError::SecretBackendConfiguration(error))
@@ -689,7 +697,7 @@ mod tests {
     async fn temp_permission_failure_preserves_previous_file_and_revision() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
-        let store = ConfigStore::open(paths.clone()).unwrap();
+        let store = ConfigStore::open(paths.clone(), &[]).unwrap();
         let before = fs::read(paths.config_root.join(CONFIG_FILE)).unwrap();
         *store
             .inner
@@ -716,7 +724,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn delayed_write_does_not_block_unrelated_runtime_work() {
         let temp = tempdir().unwrap();
-        let store = ConfigStore::open(AppPaths::for_test(temp.path())).unwrap();
+        let store = ConfigStore::open(AppPaths::for_test(temp.path()), &[]).unwrap();
         let started = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         *store

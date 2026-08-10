@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-[features]
-default = []
-dev-secrets = []
-
 [dependencies]
 yakshed-domain.workspace = true
 

@@ -573,6 +573,7 @@ path = "/Users/example/.local/share/yakshed/dev-secrets.json"
 
 - compiled only with the non-default `dev-secrets` Cargo feature;
 - supported only on Unix, where YakShed enforces private directory and file permission bits;
+- configured with an absolute path so behavior never depends on the process working directory;
 - allowed only for deliberate development builds and never auto-selected or used as a fallback;
 - refused with a typed configuration error naming the missing feature when ordinary builds reference it;
 - stores plaintext secrets in a private local file and is not suitable for release configuration.

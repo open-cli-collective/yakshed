@@ -1,14 +1,12 @@
 //! Application use cases, orchestration, snapshots, revisions, and application-owned ports, independent of Tauri commands and provider wire protocols.
 
+use std::path::Path;
 use std::{collections::HashSet, error::Error, fmt};
 
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, SecretBackend, SecretBackendId,
     SecretBackendSettings,
 };
-
-pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
-pub const DEV_SECRETS_FEATURE: &str = "dev-secrets";
 
 /// Canonical non-secret application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -19,7 +17,7 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+    pub fn validate(&self, supported_backend_kinds: &[&str]) -> Result<(), ConfigValidationError> {
         if self.ui.theme.trim().is_empty() {
             return Err(ConfigValidationError::invalid("ui.theme cannot be empty"));
         }
@@ -30,7 +28,7 @@ impl AppConfig {
             backend
                 .validate()
                 .map_err(|error| ConfigValidationError::invalid(error.to_string()))?;
-            validate_backend_configuration(backend)?;
+            validate_backend_configuration(backend, supported_backend_kinds)?;
             if let SecretBackendSettings::LocalFile { path } = &backend.settings
                 && !local_file_paths.insert(path)
             {
@@ -160,19 +158,9 @@ impl From<SecretBackendConfigurationError> for ConfigValidationError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SecretBackendConfigurationError {
-    MissingFeature {
+    UnsupportedKind {
         backend: SecretBackendId,
-        feature: &'static str,
-    },
-    UnsupportedPlatform {
-        backend: SecretBackendId,
-        requirement: &'static str,
-    },
-    InvalidSettings {
-        backend: SecretBackendId,
-    },
-    InvalidPath {
-        backend: SecretBackendId,
+        kind: &'static str,
     },
     WrongKind {
         backend: SecretBackendId,
@@ -180,24 +168,19 @@ pub enum SecretBackendConfigurationError {
     DuplicateLocalFilePath {
         backend: SecretBackendId,
     },
+    AbsolutePathRequired {
+        backend: SecretBackendId,
+    },
 }
 
 impl fmt::Display for SecretBackendConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingFeature { backend, feature } => write!(
-                formatter,
-                "secret backend {backend} requires cargo feature {feature}"
-            ),
-            Self::UnsupportedPlatform {
-                backend,
-                requirement,
-            } => write!(formatter, "secret backend {backend} requires {requirement}"),
-            Self::InvalidSettings { backend } => {
-                write!(formatter, "secret backend {backend} has invalid settings")
-            }
-            Self::InvalidPath { backend } => {
-                write!(formatter, "secret backend {backend} has an invalid path")
+            Self::UnsupportedKind { backend, kind } => {
+                write!(
+                    formatter,
+                    "secret backend {backend} uses unsupported kind {kind}"
+                )
             }
             Self::WrongKind { backend } => {
                 write!(formatter, "secret backend {backend} is not local-file")
@@ -206,6 +189,12 @@ impl fmt::Display for SecretBackendConfigurationError {
                 formatter,
                 "secret backend {backend} duplicates another local-file path"
             ),
+            Self::AbsolutePathRequired { backend } => {
+                write!(
+                    formatter,
+                    "secret backend {backend} requires an absolute path"
+                )
+            }
         }
     }
 }
@@ -214,29 +203,22 @@ impl Error for SecretBackendConfigurationError {}
 
 pub fn validate_backend_configuration(
     backend: &SecretBackend,
+    supported_backend_kinds: &[&str],
 ) -> Result<(), SecretBackendConfigurationError> {
-    if !matches!(backend.settings, SecretBackendSettings::LocalFile { .. }) {
-        return Ok(());
-    }
-    #[cfg(not(feature = "dev-secrets"))]
-    return Err(SecretBackendConfigurationError::MissingFeature {
-        backend: backend.id.clone(),
-        feature: DEV_SECRETS_FEATURE,
-    });
-    #[cfg(all(feature = "dev-secrets", not(unix)))]
-    return Err(SecretBackendConfigurationError::UnsupportedPlatform {
-        backend: backend.id.clone(),
-        requirement: "Unix private file permissions",
-    });
-    #[cfg(all(feature = "dev-secrets", unix))]
+    if let SecretBackendSettings::LocalFile { path } = &backend.settings
+        && !Path::new(path).is_absolute()
     {
-        backend
-            .validate()
-            .map_err(|_| SecretBackendConfigurationError::InvalidSettings {
-                backend: backend.id.clone(),
-            })?;
+        return Err(SecretBackendConfigurationError::AbsolutePathRequired {
+            backend: backend.id.clone(),
+        });
     }
-    #[cfg(all(feature = "dev-secrets", unix))]
+    let kind = backend.kind();
+    if !supported_backend_kinds.contains(&kind) {
+        return Err(SecretBackendConfigurationError::UnsupportedKind {
+            backend: backend.id.clone(),
+            kind,
+        });
+    }
     Ok(())
 }
 
@@ -266,6 +248,6 @@ mod tests {
             ..AppConfig::default()
         };
 
-        assert!(config.validate().is_err());
+        assert!(config.validate(&[]).is_err());
     }
 }
