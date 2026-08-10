@@ -1,7 +1,7 @@
-use yakshed_domain::{ApprovalDecision, ConnectionId};
+use yakshed_domain::ApprovalDecision;
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessError, HarnessEvent, HarnessInput,
-    HarnessRunTerminal, ProviderResponse, RunOptions, RuntimeHandle, RuntimePath, SessionQuery,
+    HarnessRunTerminal, ProviderResponse, RunOptions, RuntimeHandle, SessionQuery,
     StartSessionSpec,
 };
 
@@ -13,6 +13,7 @@ pub enum ContractScenario {
     InterruptibleRun,
     CrashAfterAccepted,
     UnknownNativeItem,
+    MalformedNativeItem,
     Overloaded,
     Disconnected,
     CredentialCanaryEvent,
@@ -25,26 +26,19 @@ pub trait HarnessContractFixture {
     fn create(scenario: ContractScenario) -> Self;
     fn adapter(&self) -> &Self::Adapter;
     fn runtime(&self) -> &RuntimeHandle;
+    fn session_spec(&self) -> StartSessionSpec;
     fn expected_capabilities(&self) -> HarnessCapabilities;
     fn expected_unknown_item_type(&self) -> &str;
     fn expected_unknown_payload(&self) -> &str;
+    fn expected_malformed_item_type(&self) -> &str;
+    fn expected_malformed_payload(&self) -> &str;
     fn credential_canary(&self) -> &str;
-}
-
-fn session_spec() -> StartSessionSpec {
-    StartSessionSpec {
-        connection_id: "0193f26e-7a72-7000-8000-00000000aaa1"
-            .parse::<ConnectionId>()
-            .unwrap(),
-        working_directory: RuntimePath::new("contract-runtime://workspace").unwrap(),
-        title: "contract session".to_owned(),
-    }
 }
 
 async fn session<F: HarnessContractFixture>(fixture: &F) -> yakshed_harness::ProviderSession {
     fixture
         .adapter()
-        .start_session(fixture.runtime(), session_spec())
+        .start_session(fixture.runtime(), fixture.session_spec())
         .await
         .unwrap()
 }
@@ -379,6 +373,43 @@ pub async fn unknown_native_items_are_preserved<F: HarnessContractFixture>() {
         }
         event => panic!("expected unknown event, got {event:?}"),
     }
+}
+
+pub async fn malformed_native_items_are_preserved_and_stream_continues<
+    F: HarnessContractFixture,
+>() {
+    let fixture = F::create(ContractScenario::MalformedNativeItem);
+    let mut stream = fixture.adapter().subscribe().unwrap();
+    let session = session(&fixture).await;
+    fixture
+        .adapter()
+        .start_run(
+            &session,
+            HarnessInput::new("malformed").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    match next(&mut stream).await {
+        HarnessEvent::MalformedNativePayload {
+            item_type, native, ..
+        } => {
+            assert_eq!(item_type, fixture.expected_malformed_item_type());
+            assert_eq!(native.sanitized_raw(), fixture.expected_malformed_payload());
+        }
+        event => panic!("expected malformed native payload, got {event:?}"),
+    }
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal {
+            state: HarnessRunTerminal::Completed,
+            ..
+        }
+    ));
 }
 
 pub async fn unavailable_runtimes_return_typed_errors<F: HarnessContractFixture>() {

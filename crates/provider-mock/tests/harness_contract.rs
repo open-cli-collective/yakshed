@@ -3,7 +3,9 @@ mod contract_suite;
 
 use contract_suite::{ContractScenario, HarnessContractFixture};
 use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
-use yakshed_harness::{HarnessCapabilities, ProviderRequestId, RuntimeHandle};
+use yakshed_harness::{
+    HarnessCapabilities, ProviderRequestId, RuntimeHandle, RuntimePath, StartSessionSpec,
+};
 
 struct MockFixture {
     adapter: MockHarness,
@@ -80,6 +82,13 @@ impl HarnessContractFixture for MockFixture {
                     .with_fault(MockHarnessFault::EmitUnknownEvent),
                 None,
             ),
+            ContractScenario::MalformedNativeItem => (
+                MockRunPlan::new(vec![
+                    MockScriptStep::malformed("mock.malformed", "{not-json"),
+                    MockScriptStep::complete(),
+                ]),
+                None,
+            ),
             ContractScenario::Overloaded => (
                 MockRunPlan::new(Vec::new()),
                 Some(MockHarnessFault::Overloaded),
@@ -103,10 +112,17 @@ impl HarnessContractFixture for MockFixture {
                 Some(MockHarnessFault::ProtocolFailure),
             ),
         };
+        let runtime = RuntimeHandle::new("mock-runtime").unwrap();
         Self {
-            adapter: MockHarness::new(capabilities(), vec![plan], runtime_fault)
+            adapter: MockHarness::new(capabilities(), vec![plan], None)
+                .with_runtime(
+                    runtime.clone(),
+                    "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
+                    None,
+                    runtime_fault.into_iter().collect(),
+                )
                 .with_native_redaction(CREDENTIAL_CANARY),
-            runtime: RuntimeHandle::new("mock-runtime").unwrap(),
+            runtime,
         }
     }
 
@@ -116,6 +132,13 @@ impl HarnessContractFixture for MockFixture {
 
     fn runtime(&self) -> &RuntimeHandle {
         &self.runtime
+    }
+
+    fn session_spec(&self) -> StartSessionSpec {
+        StartSessionSpec {
+            working_directory: RuntimePath::new("mock-runtime://workspace").unwrap(),
+            title: "mock contract session".to_owned(),
+        }
     }
 
     fn expected_capabilities(&self) -> HarnessCapabilities {
@@ -128,6 +151,14 @@ impl HarnessContractFixture for MockFixture {
 
     fn expected_unknown_payload(&self) -> &str {
         r#"{"type":"mock.future-item","answer":42}"#
+    }
+
+    fn expected_malformed_item_type(&self) -> &str {
+        "mock.malformed"
+    }
+
+    fn expected_malformed_payload(&self) -> &str {
+        "{not-json"
     }
 
     fn credential_canary(&self) -> &str {
@@ -178,6 +209,12 @@ async fn crash_mid_run_is_a_typed_terminal_event() {
 #[tokio::test]
 async fn unknown_native_items_are_preserved() {
     contract_suite::unknown_native_items_are_preserved::<MockFixture>().await;
+}
+
+#[tokio::test]
+async fn malformed_native_items_are_preserved_and_stream_continues() {
+    contract_suite::malformed_native_items_are_preserved_and_stream_continues::<MockFixture>()
+        .await;
 }
 
 #[tokio::test]

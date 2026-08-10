@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(test)]
 use tokio::sync::oneshot;
+use yakshed_domain::ConnectionId;
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessDescriptor, HarnessError, HarnessEvent,
     HarnessEventSender, HarnessInput, HarnessRunTerminal, NativePayload, Page, ProviderEventStream,
@@ -86,6 +87,10 @@ pub enum MockScriptStep {
         item_type: String,
         native: String,
     },
+    Malformed {
+        item_type: String,
+        native: String,
+    },
 }
 
 impl MockScriptStep {
@@ -161,6 +166,13 @@ impl MockScriptStep {
             native: native.into(),
         }
     }
+
+    pub fn malformed(item_type: impl Into<String>, native: impl Into<String>) -> Self {
+        Self::Malformed {
+            item_type: item_type.into(),
+            native: native.into(),
+        }
+    }
 }
 
 struct RunRecord {
@@ -168,6 +180,30 @@ struct RunRecord {
     delayed: bool,
     steps: VecDeque<MockScriptStep>,
     fault: Option<MockHarnessFault>,
+    pending: Option<PendingDelivery>,
+}
+
+#[derive(Clone)]
+struct PendingDelivery {
+    event: HarnessEvent,
+    commit: DeliveryCommit,
+}
+
+#[derive(Clone)]
+enum DeliveryCommit {
+    Step {
+        terminal_after: Option<PendingTerminal>,
+    },
+    Standalone,
+    Terminal {
+        consume_step: bool,
+    },
+}
+
+#[derive(Clone)]
+struct PendingTerminal {
+    state: HarnessRunTerminal,
+    native: String,
 }
 
 struct RequestRecord {
@@ -195,7 +231,10 @@ struct State {
     plans: VecDeque<MockRunPlan>,
     runs: HashMap<ProviderRunHandle, RunRecord>,
     requests: HashMap<ProviderRequestHandle, RequestRecord>,
-    runtime_fault: Option<MockHarnessFault>,
+    runtime_connections: HashMap<RuntimeHandle, ConnectionId>,
+    runtime_capabilities: HashMap<RuntimeHandle, HarnessCapabilities>,
+    runtime_faults: HashMap<RuntimeHandle, VecDeque<MockHarnessFault>>,
+    default_runtime_faults: VecDeque<MockHarnessFault>,
 }
 
 pub struct MockHarness {
@@ -208,12 +247,20 @@ pub struct MockHarness {
     native_redactions: Vec<String>,
     #[cfg(test)]
     steer_pause: Mutex<Option<SteerPause>>,
+    #[cfg(test)]
+    delivery_probe: Mutex<Option<DeliveryProbe>>,
 }
 
 #[cfg(test)]
 struct SteerPause {
     checked: oneshot::Sender<()>,
     resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct DeliveryProbe {
+    remaining: usize,
+    reached: oneshot::Sender<()>,
 }
 
 impl MockHarness {
@@ -233,14 +280,41 @@ impl MockHarness {
                 plans: plans.into(),
                 runs: HashMap::new(),
                 requests: HashMap::new(),
-                runtime_fault,
+                runtime_connections: HashMap::new(),
+                runtime_capabilities: HashMap::new(),
+                runtime_faults: HashMap::new(),
+                default_runtime_faults: runtime_fault.into_iter().collect(),
             }),
             events,
             subscription: Mutex::new(Some(subscription)),
             native_redactions: Vec::new(),
             #[cfg(test)]
             steer_pause: Mutex::new(None),
+            #[cfg(test)]
+            delivery_probe: Mutex::new(None),
         }
+    }
+
+    pub fn with_runtime(
+        mut self,
+        runtime: RuntimeHandle,
+        connection_id: ConnectionId,
+        capabilities: Option<HarnessCapabilities>,
+        faults: Vec<MockHarnessFault>,
+    ) -> Self {
+        let state = self.state.get_mut();
+        state
+            .runtime_connections
+            .insert(runtime.clone(), connection_id);
+        if let Some(capabilities) = capabilities {
+            state
+                .runtime_capabilities
+                .insert(runtime.clone(), capabilities);
+        }
+        if !faults.is_empty() {
+            state.runtime_faults.insert(runtime, faults.into());
+        }
+        self
     }
 
     #[cfg(test)]
@@ -255,6 +329,35 @@ impl MockHarness {
             resume: resume_receiver,
         });
         (checked_receiver, resume_sender)
+    }
+
+    #[cfg(test)]
+    fn probe_delivery(&self, delivery_number: usize) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        *self
+            .delivery_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DeliveryProbe {
+            remaining: delivery_number,
+            reached: sender,
+        });
+        receiver
+    }
+
+    #[cfg(test)]
+    fn note_delivery_attempt(&self) {
+        let mut probe = self
+            .delivery_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = probe.as_mut() else {
+            return;
+        };
+        current.remaining -= 1;
+        if current.remaining == 0 {
+            let reached = probe.take().expect("delivery probe exists").reached;
+            let _ = reached.send(());
+        }
     }
 
     pub fn with_native_redaction(mut self, value: impl Into<String>) -> Self {
@@ -274,8 +377,22 @@ impl MockHarness {
         NativePayload::sanitized(self.redact(value))
     }
 
-    async fn check_runtime(&self) -> Result<(), HarnessError> {
-        let fault = self.state.lock().await.runtime_fault.take();
+    async fn check_runtime(
+        &self,
+        runtime: &RuntimeHandle,
+    ) -> Result<HarnessCapabilities, HarnessError> {
+        let mut state = self.state.lock().await;
+        if !state.runtime_connections.contains_key(runtime) {
+            return Err(HarnessError::NotFound {
+                entity: "runtime",
+                id: runtime.to_string(),
+            });
+        }
+        let fault = state
+            .runtime_faults
+            .get_mut(runtime)
+            .and_then(VecDeque::pop_front)
+            .or_else(|| state.default_runtime_faults.pop_front());
         match fault {
             Some(MockHarnessFault::Overloaded) => Err(HarnessError::Overloaded),
             Some(MockHarnessFault::Disconnected) => Err(HarnessError::Disconnected),
@@ -287,69 +404,133 @@ impl MockHarness {
                         .map_or("unknown", String::as_str)
                 ))),
             }),
-            _ => Ok(()),
+            _ => Ok(state
+                .runtime_capabilities
+                .get(runtime)
+                .copied()
+                .unwrap_or(self.capabilities)),
         }
     }
 
-    async fn emit_terminal(
+    fn terminal_delivery(
         &self,
         run: ProviderRunHandle,
         state: HarnessRunTerminal,
         native: impl Into<String>,
-    ) -> Result<(), HarnessError> {
-        self.events
-            .send(HarnessEvent::RunTerminal {
+        consume_step: bool,
+    ) -> PendingDelivery {
+        PendingDelivery {
+            event: HarnessEvent::RunTerminal {
                 run,
                 state,
                 native: self.native(native),
-            })
-            .await
+            },
+            commit: DeliveryCommit::Terminal { consume_step },
+        }
+    }
+
+    async fn flush_pending(
+        &self,
+        state: &mut State,
+        run_handle: &ProviderRunHandle,
+    ) -> Result<bool, HarnessError> {
+        let pending = state
+            .runs
+            .get(run_handle)
+            .and_then(|run| run.pending.clone());
+        let Some(pending) = pending else {
+            return Ok(false);
+        };
+
+        #[cfg(test)]
+        self.note_delivery_attempt();
+        self.events.send(pending.event).await?;
+        let run = state
+            .runs
+            .get_mut(run_handle)
+            .expect("pending delivery belongs to an existing run");
+        match pending.commit {
+            DeliveryCommit::Step { terminal_after } => {
+                run.steps.pop_front();
+                run.pending = terminal_after.map(|terminal| {
+                    self.terminal_delivery(
+                        run_handle.clone(),
+                        terminal.state,
+                        terminal.native,
+                        false,
+                    )
+                });
+                Ok(false)
+            }
+            DeliveryCommit::Standalone => {
+                run.pending = None;
+                Ok(false)
+            }
+            DeliveryCommit::Terminal { consume_step } => {
+                if consume_step {
+                    run.steps.pop_front();
+                }
+                run.pending = None;
+                run.active = false;
+                Ok(true)
+            }
+        }
     }
 
     async fn process_run(&self, run_handle: &ProviderRunHandle) -> Result<(), HarnessError> {
         loop {
             let mut state = self.state.lock().await;
-            let step = {
-                let run = state
-                    .runs
-                    .get_mut(run_handle)
-                    .ok_or(HarnessError::NotFound {
-                        entity: "run",
-                        id: run_handle.to_string(),
-                    })?;
-                if !run.active {
-                    return Ok(());
-                }
-                if run.fault == Some(MockHarnessFault::DelayApproval)
-                    && matches!(run.steps.front(), Some(MockScriptStep::Approval { .. }))
-                {
-                    run.delayed = true;
-                    return Ok(());
-                }
-                run.steps.pop_front()
-            };
+            if self.flush_pending(&mut state, run_handle).await? {
+                return Ok(());
+            }
+            if state
+                .runs
+                .get(run_handle)
+                .is_some_and(|run| run.pending.is_some())
+            {
+                continue;
+            }
+            let run = state
+                .runs
+                .get_mut(run_handle)
+                .ok_or(HarnessError::NotFound {
+                    entity: "run",
+                    id: run_handle.to_string(),
+                })?;
+            if !run.active {
+                return Ok(());
+            }
+            if run.fault == Some(MockHarnessFault::DelayApproval)
+                && matches!(run.steps.front(), Some(MockScriptStep::Approval { .. }))
+            {
+                run.delayed = true;
+                return Ok(());
+            }
+            let step = run.steps.front().cloned();
             let Some(step) = step else {
                 return Ok(());
             };
-            match step {
-                MockScriptStep::Message { chunk, native } => {
-                    self.events
-                        .send(HarnessEvent::MessageDelta {
-                            run: run_handle.clone(),
-                            chunk,
-                            native: self.native(native),
-                        })
-                        .await?;
-                }
-                MockScriptStep::MessageCompleted { text, native } => {
-                    self.events
-                        .send(HarnessEvent::MessageCompleted {
-                            run: run_handle.clone(),
-                            text,
-                            native: self.native(native),
-                        })
-                        .await?;
-                }
+            let pending = match step {
+                MockScriptStep::Message { chunk, native } => PendingDelivery {
+                    event: HarnessEvent::MessageDelta {
+                        run: run_handle.clone(),
+                        chunk,
+                        native: self.native(native),
+                    },
+                    commit: DeliveryCommit::Step {
+                        terminal_after: None,
+                    },
+                },
+                MockScriptStep::MessageCompleted { text, native } => PendingDelivery {
+                    event: HarnessEvent::MessageCompleted {
+                        run: run_handle.clone(),
+                        text,
+                        native: self.native(native),
+                    },
+                    commit: DeliveryCommit::Step {
+                        terminal_after: None,
+                    },
+                },
                 MockScriptStep::Approval {
                     request_id,
                     summary,
@@ -369,13 +550,16 @@ impl MockHarness {
                             "duplicate provider request id: {request}"
                         )));
                     }
-                    self.events
-                        .send(HarnessEvent::ApprovalRequested {
+                    PendingDelivery {
+                        event: HarnessEvent::ApprovalRequested {
                             request,
                             summary,
                             native: self.native(native),
-                        })
-                        .await?;
+                        },
+                        commit: DeliveryCommit::Step {
+                            terminal_after: None,
+                        },
+                    }
                 }
                 MockScriptStep::UserInput {
                     request_id,
@@ -396,13 +580,16 @@ impl MockHarness {
                             "duplicate provider request id: {request}"
                         )));
                     }
-                    self.events
-                        .send(HarnessEvent::UserInputRequested {
+                    PendingDelivery {
+                        event: HarnessEvent::UserInputRequested {
                             request,
                             prompt,
                             native: self.native(native),
-                        })
-                        .await?;
+                        },
+                        commit: DeliveryCommit::Step {
+                            terminal_after: None,
+                        },
+                    }
                 }
                 MockScriptStep::AwaitResponse(request_id) => {
                     let request =
@@ -412,89 +599,97 @@ impl MockHarness {
                         .get(&request)
                         .is_some_and(|request| request.response.is_some());
                     if !answered {
-                        state
-                            .runs
-                            .get_mut(run_handle)
-                            .expect("run exists while processing")
-                            .steps
-                            .push_front(MockScriptStep::AwaitResponse(request_id));
                         return Ok(());
                     }
+                    state
+                        .runs
+                        .get_mut(run_handle)
+                        .expect("run exists while processing")
+                        .steps
+                        .pop_front();
+                    continue;
                 }
                 MockScriptStep::FileMutation {
                     path,
                     summary,
                     native,
                 } => {
-                    self.events
-                        .send(HarnessEvent::FileMutation {
+                    let terminal_after = if state.runs.get(run_handle).is_some_and(|run| {
+                        run.fault == Some(MockHarnessFault::ExitAfterFileMutation)
+                    }) {
+                        state
+                            .runs
+                            .get_mut(run_handle)
+                            .expect("run exists while processing")
+                            .fault = None;
+                        Some(PendingTerminal {
+                            state: HarnessRunTerminal::Crashed {
+                                diagnostic: SanitizedDiagnostic::sanitized(
+                                    "mock runtime exited after file mutation",
+                                ),
+                            },
+                            native: r#"{"type":"runtime.exit"}"#.to_owned(),
+                        })
+                    } else {
+                        None
+                    };
+                    PendingDelivery {
+                        event: HarnessEvent::FileMutation {
                             run: run_handle.clone(),
                             path,
                             summary,
                             native: self.native(native),
-                        })
-                        .await?;
-                    let should_exit = {
-                        let run = state
-                            .runs
-                            .get_mut(run_handle)
-                            .expect("run exists while processing");
-                        if run.fault == Some(MockHarnessFault::ExitAfterFileMutation) {
-                            run.active = false;
-                            run.fault = None;
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if should_exit {
-                        return self
-                            .emit_terminal(
-                                run_handle.clone(),
-                                HarnessRunTerminal::Crashed {
-                                    diagnostic: SanitizedDiagnostic::sanitized(
-                                        "mock runtime exited after file mutation",
-                                    ),
-                                },
-                                r#"{"type":"runtime.exit"}"#,
-                            )
-                            .await;
+                        },
+                        commit: DeliveryCommit::Step { terminal_after },
                     }
                 }
                 MockScriptStep::CommandOutput {
                     command,
                     chunk,
                     native,
-                } => {
-                    self.events
-                        .send(HarnessEvent::CommandOutput {
-                            run: run_handle.clone(),
-                            command,
-                            chunk,
-                            native: self.native(native),
-                        })
-                        .await?;
-                }
-                MockScriptStep::Complete { native } => {
-                    state
-                        .runs
-                        .get_mut(run_handle)
-                        .expect("run exists while processing")
-                        .active = false;
-                    return self
-                        .emit_terminal(run_handle.clone(), HarnessRunTerminal::Completed, native)
-                        .await;
-                }
-                MockScriptStep::Unknown { item_type, native } => {
-                    self.events
-                        .send(HarnessEvent::Unknown {
-                            run: Some(run_handle.clone()),
-                            item_type,
-                            native: self.native(native),
-                        })
-                        .await?;
-                }
-            }
+                } => PendingDelivery {
+                    event: HarnessEvent::CommandOutput {
+                        run: run_handle.clone(),
+                        command,
+                        chunk,
+                        native: self.native(native),
+                    },
+                    commit: DeliveryCommit::Step {
+                        terminal_after: None,
+                    },
+                },
+                MockScriptStep::Complete { native } => self.terminal_delivery(
+                    run_handle.clone(),
+                    HarnessRunTerminal::Completed,
+                    native,
+                    true,
+                ),
+                MockScriptStep::Unknown { item_type, native } => PendingDelivery {
+                    event: HarnessEvent::Unknown {
+                        run: Some(run_handle.clone()),
+                        item_type,
+                        native: self.native(native),
+                    },
+                    commit: DeliveryCommit::Step {
+                        terminal_after: None,
+                    },
+                },
+                MockScriptStep::Malformed { item_type, native } => PendingDelivery {
+                    event: HarnessEvent::MalformedNativePayload {
+                        run: Some(run_handle.clone()),
+                        item_type,
+                        native: self.native(native),
+                    },
+                    commit: DeliveryCommit::Step {
+                        terminal_after: None,
+                    },
+                },
+            };
+            state
+                .runs
+                .get_mut(run_handle)
+                .expect("run exists while processing")
+                .pending = Some(pending);
         }
     }
 
@@ -526,10 +721,9 @@ impl HarnessAdapter for MockHarness {
 
     async fn capabilities(
         &self,
-        _runtime: &RuntimeHandle,
+        runtime: &RuntimeHandle,
     ) -> Result<HarnessCapabilities, HarnessError> {
-        self.check_runtime().await?;
-        Ok(self.capabilities)
+        self.check_runtime(runtime).await
     }
 
     async fn list_sessions(
@@ -537,7 +731,7 @@ impl HarnessAdapter for MockHarness {
         runtime: &RuntimeHandle,
         query: SessionQuery,
     ) -> Result<Page<ProviderSessionSummary>, HarnessError> {
-        self.check_runtime().await?;
+        self.check_runtime(runtime).await?;
         if query.limit == 0 || query.limit > 200 {
             return Err(HarnessError::InvalidInput(
                 "session page size must be between 1 and 200".to_owned(),
@@ -579,20 +773,24 @@ impl HarnessAdapter for MockHarness {
         runtime: &RuntimeHandle,
         spec: StartSessionSpec,
     ) -> Result<ProviderSession, HarnessError> {
-        self.check_runtime().await?;
+        self.check_runtime(runtime).await?;
         if spec.title.trim().is_empty() {
             return Err(HarnessError::InvalidInput(
                 "session requires a title".to_owned(),
             ));
         }
         let mut state = self.state.lock().await;
+        let connection_id = *state
+            .runtime_connections
+            .get(runtime)
+            .expect("checked runtime remains registered");
         let sequence = state.next_session.entry(runtime.clone()).or_insert(1);
         let id = ProviderSessionId::new(format!("session-{sequence:04}"))?;
         *sequence += 1;
         let session = ProviderSession {
             id,
             runtime: runtime.clone(),
-            connection_id: spec.connection_id,
+            connection_id,
             working_directory: spec.working_directory,
             title: spec.title,
         };
@@ -611,7 +809,7 @@ impl HarnessAdapter for MockHarness {
         runtime: &RuntimeHandle,
         id: &ProviderSessionId,
     ) -> Result<ProviderSession, HarnessError> {
-        self.check_runtime().await?;
+        self.check_runtime(runtime).await?;
         self.state
             .lock()
             .await
@@ -631,7 +829,7 @@ impl HarnessAdapter for MockHarness {
         _input: HarnessInput,
         _options: RunOptions,
     ) -> Result<ProviderRunHandle, HarnessError> {
-        self.check_runtime().await?;
+        self.check_runtime(&session.runtime).await?;
         let (run_id, fault) = {
             let mut state = self.state.lock().await;
             if !state
@@ -674,6 +872,7 @@ impl HarnessAdapter for MockHarness {
                     delayed: false,
                     steps: plan.steps,
                     fault,
+                    pending: None,
                 },
             );
             (run_handle, fault)
@@ -692,8 +891,7 @@ impl HarnessAdapter for MockHarness {
                     .runs
                     .get_mut(&run_id)
                     .expect("new run exists")
-                    .active = false;
-                self.emit_terminal(
+                    .pending = Some(self.terminal_delivery(
                     run_id.clone(),
                     HarnessRunTerminal::Crashed {
                         diagnostic: SanitizedDiagnostic::sanitized(
@@ -701,27 +899,42 @@ impl HarnessAdapter for MockHarness {
                         ),
                     },
                     r#"{"type":"runtime.exit"}"#,
-                )
-                .await?;
+                    false,
+                ));
+                self.process_run(&run_id).await?;
             }
             Some(MockHarnessFault::EmitUnknownEvent) => {
-                self.events
-                    .send(HarnessEvent::Unknown {
+                self.state
+                    .lock()
+                    .await
+                    .runs
+                    .get_mut(&run_id)
+                    .expect("new run exists")
+                    .pending = Some(PendingDelivery {
+                    event: HarnessEvent::Unknown {
                         run: Some(run_id.clone()),
                         item_type: "mock.future-item".to_owned(),
                         native: self.native(r#"{"type":"mock.future-item","answer":42}"#),
-                    })
-                    .await?;
+                    },
+                    commit: DeliveryCommit::Standalone,
+                });
                 self.process_run(&run_id).await?;
             }
             Some(MockHarnessFault::EmitMalformedNativePayload) => {
-                self.events
-                    .send(HarnessEvent::MalformedNativePayload {
+                self.state
+                    .lock()
+                    .await
+                    .runs
+                    .get_mut(&run_id)
+                    .expect("new run exists")
+                    .pending = Some(PendingDelivery {
+                    event: HarnessEvent::MalformedNativePayload {
                         run: Some(run_id.clone()),
                         item_type: "mock.malformed".to_owned(),
                         native: self.native("{not-json"),
-                    })
-                    .await?;
+                    },
+                    commit: DeliveryCommit::Standalone,
+                });
                 self.process_run(&run_id).await?;
             }
             Some(MockHarnessFault::NeverComplete) => {}
@@ -735,8 +948,13 @@ impl HarnessAdapter for MockHarness {
         run: &ProviderRunHandle,
         input: HarnessInput,
     ) -> Result<(), HarnessError> {
-        let state = self.state.lock().await;
-        if !state.runs.get(run).is_some_and(|run| run.active) {
+        let mut state = self.state.lock().await;
+        if self.flush_pending(&mut state, run).await?
+            || !state
+                .runs
+                .get(run)
+                .is_some_and(|run| run.active && run.pending.is_none())
+        {
             return Err(HarnessError::Conflict(format!("run is not active: {run}")));
         }
         #[cfg(test)]
@@ -750,40 +968,54 @@ impl HarnessAdapter for MockHarness {
             let _ = pause.checked.send(());
             let _ = pause.resume.await;
         }
-        let result = self
-            .events
-            .send(HarnessEvent::MessageDelta {
+        state.runs.get_mut(run).expect("checked run exists").pending = Some(PendingDelivery {
+            event: HarnessEvent::MessageDelta {
                 run: run.clone(),
                 chunk: input.as_str().to_owned(),
                 native: self.native(r#"{"type":"run.steer"}"#),
-            })
-            .await;
-        drop(state);
-        result
+            },
+            commit: DeliveryCommit::Standalone,
+        });
+        self.flush_pending(&mut state, run).await.map(|_| ())
     }
 
     async fn interrupt(&self, run: &ProviderRunHandle) -> Result<(), HarnessError> {
         let mut state = self.state.lock().await;
-        let record = state
-            .runs
-            .get_mut(run)
-            .ok_or_else(|| HarnessError::NotFound {
+        if !state.runs.contains_key(run) {
+            return Err(HarnessError::NotFound {
                 entity: "run",
                 id: run.to_string(),
-            })?;
-        if !record.active {
+            });
+        }
+        if state
+            .runs
+            .get(run)
+            .and_then(|record| record.pending.as_ref())
+            .is_some()
+        {
+            let terminal = self.flush_pending(&mut state, run).await?;
+            if terminal {
+                return Ok(());
+            }
+            if state
+                .runs
+                .get(run)
+                .is_some_and(|record| record.pending.is_some())
+            {
+                return self.flush_pending(&mut state, run).await.map(|_| ());
+            }
+        }
+        if !state.runs.get(run).is_some_and(|record| record.active) {
             return Err(HarnessError::Conflict(format!("run is not active: {run}")));
         }
-        record.active = false;
-        let result = self
-            .emit_terminal(
+        state.runs.get_mut(run).expect("checked run exists").pending =
+            Some(self.terminal_delivery(
                 run.clone(),
                 HarnessRunTerminal::Interrupted,
                 r#"{"type":"run.interrupted"}"#,
-            )
-            .await;
-        drop(state);
-        result
+                false,
+            ));
+        self.flush_pending(&mut state, run).await.map(|_| ())
     }
 
     async fn respond_to_request(
@@ -801,11 +1033,6 @@ impl HarnessAdapter for MockHarness {
                         entity: "provider request",
                         id: request.to_string(),
                     })?;
-            if record.response.is_some() {
-                return Err(HarnessError::Conflict(format!(
-                    "provider request already answered: {request}"
-                )));
-            }
             if !matches!(
                 (&record.kind, &response),
                 (RequestKind::Approval, ProviderResponse::Approval(_))
@@ -815,7 +1042,15 @@ impl HarnessAdapter for MockHarness {
                     "response kind does not match provider request: {request}"
                 )));
             }
-            record.response = Some(response);
+            if let Some(existing) = &record.response {
+                if existing != &response {
+                    return Err(HarnessError::Conflict(format!(
+                        "provider request already answered differently: {request}"
+                    )));
+                }
+            } else {
+                record.response = Some(response);
+            }
             record.run.clone()
         };
         self.process_run(&run).await
@@ -837,19 +1072,196 @@ mod tests {
     use super::*;
     use yakshed_harness::RuntimePath;
 
+    fn configured_mock(plans: Vec<MockRunPlan>) -> MockHarness {
+        MockHarness::new(HarnessCapabilities::default(), plans, None).with_runtime(
+            RuntimeHandle::new("runtime-a").unwrap(),
+            "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
+            None,
+            Vec::new(),
+        )
+    }
+
+    async fn test_session(mock: &MockHarness) -> ProviderSession {
+        mock.start_session(
+            &RuntimeHandle::new("runtime-a").unwrap(),
+            StartSessionSpec {
+                working_directory: RuntimePath::new("runtime-a://workspace").unwrap(),
+                title: "test".to_owned(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_backpressured_drive_replays_staged_step_without_loss_or_duplication() {
+        let steps = (0..yakshed_harness::EVENT_BUFFER_CAPACITY)
+            .map(|index| MockScriptStep::message(format!("chunk-{index}")))
+            .chain(std::iter::once(MockScriptStep::complete()))
+            .collect();
+        let mock = configured_mock(vec![MockRunPlan::new(steps)]);
+        let session = test_session(&mock).await;
+        let mut stream = mock.subscribe().unwrap();
+        let reached_backpressure = mock.probe_delivery(yakshed_harness::EVENT_BUFFER_CAPACITY);
+        let mut start = Box::pin(mock.start_run(
+            &session,
+            HarnessInput::new("fill").unwrap(),
+            RunOptions::default(),
+        ));
+        tokio::select! {
+            biased;
+            result = &mut start => panic!("drive completed before cancellation: {result:?}"),
+            result = reached_backpressure => result.unwrap(),
+        }
+        drop(start);
+
+        let run = ProviderRunHandle::new(
+            session.runtime.clone(),
+            session.id.clone(),
+            ProviderRunId::new("run-0001").unwrap(),
+        );
+        let mut chunks = Vec::new();
+        for _ in 0..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            if let Some(HarnessEvent::MessageDelta { chunk, .. }) = stream.recv().await {
+                chunks.push(chunk);
+            }
+        }
+        mock.process_run(&run).await.unwrap();
+        loop {
+            match stream.recv().await.unwrap() {
+                HarnessEvent::MessageDelta { chunk, .. } => chunks.push(chunk),
+                HarnessEvent::RunTerminal {
+                    state: HarnessRunTerminal::Completed,
+                    ..
+                } => break,
+                event => panic!("unexpected event after re-drive: {event:?}"),
+            }
+        }
+        assert_eq!(
+            chunks,
+            (0..yakshed_harness::EVENT_BUFFER_CAPACITY)
+                .map(|index| format!("chunk-{index}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_response_drive_resumes_when_the_same_response_is_retried() {
+        let request_id = ProviderRequestId::new("request-0001").unwrap();
+        let steps = std::iter::once(MockScriptStep::approval(request_id.clone(), "approve"))
+            .chain(std::iter::once(MockScriptStep::await_response(request_id)))
+            .chain(
+                (0..yakshed_harness::EVENT_BUFFER_CAPACITY)
+                    .map(|index| MockScriptStep::message(format!("chunk-{index}"))),
+            )
+            .chain(std::iter::once(MockScriptStep::complete()))
+            .collect();
+        let mock = configured_mock(vec![MockRunPlan::new(steps)]);
+        let session = test_session(&mock).await;
+        let mut stream = mock.subscribe().unwrap();
+        mock.start_run(
+            &session,
+            HarnessInput::new("start").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+        stream.recv().await.unwrap();
+        let request = match stream.recv().await.unwrap() {
+            HarnessEvent::ApprovalRequested { request, .. } => request,
+            event => panic!("expected approval, got {event:?}"),
+        };
+
+        let response = ProviderResponse::Approval(yakshed_domain::ApprovalDecision::Approved);
+        let reached_backpressure = mock.probe_delivery(yakshed_harness::EVENT_BUFFER_CAPACITY + 1);
+        let mut respond = Box::pin(mock.respond_to_request(request.clone(), response.clone()));
+        tokio::select! {
+            biased;
+            result = &mut respond => panic!("response drive completed before cancellation: {result:?}"),
+            result = reached_backpressure => result.unwrap(),
+        }
+        drop(respond);
+        for _ in 0..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            stream.recv().await.unwrap();
+        }
+
+        mock.respond_to_request(request, response).await.unwrap();
+        assert!(matches!(
+            stream.recv().await,
+            Some(HarnessEvent::RunTerminal {
+                state: HarnessRunTerminal::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_backpressured_interrupt_retries_one_terminal_event() {
+        let mock = configured_mock(vec![
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+        ]);
+        let session = test_session(&mock).await;
+        let mut stream = mock.subscribe().unwrap();
+        let run = mock
+            .start_run(
+                &session,
+                HarnessInput::new("start").unwrap(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        for index in 1..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            mock.steer(&run, HarnessInput::new(format!("steer-{index}")).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let reached_backpressure = mock.probe_delivery(1);
+        let mut interrupt = Box::pin(mock.interrupt(&run));
+        tokio::select! {
+            biased;
+            result = &mut interrupt => panic!("interrupt completed before cancellation: {result:?}"),
+            result = reached_backpressure => result.unwrap(),
+        }
+        drop(interrupt);
+        for _ in 0..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            stream.recv().await.unwrap();
+        }
+
+        mock.interrupt(&run).await.unwrap();
+        assert!(matches!(
+            stream.recv().await,
+            Some(HarnessEvent::RunTerminal {
+                state: HarnessRunTerminal::Interrupted,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mock.interrupt(&run).await,
+            Err(HarnessError::Conflict(_))
+        ));
+    }
+
     #[tokio::test]
     async fn steer_checked_before_interrupt_cannot_emit_after_terminal() {
-        let mock = Arc::new(MockHarness::new(
-            HarnessCapabilities::default(),
-            vec![MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete)],
-            None,
-        ));
+        let mock = Arc::new(
+            MockHarness::new(
+                HarnessCapabilities::default(),
+                vec![MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete)],
+                None,
+            )
+            .with_runtime(
+                RuntimeHandle::new("runtime-a").unwrap(),
+                "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
+                None,
+                Vec::new(),
+            ),
+        );
         let runtime = RuntimeHandle::new("runtime-a").unwrap();
         let session = mock
             .start_session(
                 &runtime,
                 StartSessionSpec {
-                    connection_id: "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
                     working_directory: RuntimePath::new("runtime-a://workspace").unwrap(),
                     title: "race".to_owned(),
                 },

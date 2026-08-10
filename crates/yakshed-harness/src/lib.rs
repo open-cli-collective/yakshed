@@ -178,8 +178,10 @@ impl fmt::Display for ProviderRequestHandle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Session settings that are independent of connection ownership.
+///
+/// The runtime handle is the sole authority for the session's connection binding.
 pub struct StartSessionSpec {
-    pub connection_id: ConnectionId,
     pub working_directory: RuntimePath,
     pub title: String,
 }

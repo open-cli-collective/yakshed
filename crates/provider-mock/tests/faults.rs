@@ -10,6 +10,19 @@ fn runtime() -> RuntimeHandle {
     RuntimeHandle::new("mock-runtime").unwrap()
 }
 
+fn mock(
+    capabilities: HarnessCapabilities,
+    plans: Vec<MockRunPlan>,
+    fault: Option<MockHarnessFault>,
+) -> MockHarness {
+    MockHarness::new(capabilities, plans, None).with_runtime(
+        runtime(),
+        "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
+        None,
+        fault.into_iter().collect(),
+    )
+}
+
 async fn session(mock: &MockHarness) -> yakshed_harness::ProviderSession {
     session_at(mock, &runtime()).await
 }
@@ -21,7 +34,6 @@ async fn session_at(
     mock.start_session(
         runtime,
         StartSessionSpec {
-            connection_id: "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
             working_directory: RuntimePath::new(format!("{}://workspace", runtime.as_str()))
                 .unwrap(),
             title: "fault test".to_owned(),
@@ -38,7 +50,7 @@ async fn next(stream: &mut yakshed_harness::ProviderEventStream) -> HarnessEvent
 #[tokio::test]
 async fn delay_approval_is_released_without_a_timer_race() {
     let request_id = ProviderRequestId::new("delayed-request").unwrap();
-    let mock = MockHarness::new(
+    let mock = mock(
         HarnessCapabilities::default(),
         vec![
             MockRunPlan::new(vec![
@@ -79,7 +91,7 @@ async fn delay_approval_is_released_without_a_timer_race() {
 
 #[tokio::test]
 async fn exit_after_file_mutation_stops_the_remaining_script() {
-    let mock = MockHarness::new(
+    let mock = mock(
         HarnessCapabilities::default(),
         vec![
             MockRunPlan::new(vec![
@@ -108,18 +120,18 @@ async fn exit_after_file_mutation_stops_the_remaining_script() {
         next(&mut stream).await,
         HarnessEvent::FileMutation { .. }
     ));
-    assert!(matches!(
-        next(&mut stream).await,
+    match next(&mut stream).await {
         HarnessEvent::RunTerminal {
             state: HarnessRunTerminal::Crashed { .. },
             ..
-        }
-    ));
+        } => {}
+        event => panic!("expected crashed terminal, got {event:?}"),
+    }
 }
 
 #[tokio::test]
 async fn malformed_native_payload_is_visible_and_preserved() {
-    let mock = MockHarness::new(
+    let mock = mock(
         HarnessCapabilities::default(),
         vec![
             MockRunPlan::new(vec![MockScriptStep::complete()])
@@ -154,7 +166,7 @@ async fn bounded_event_buffer_backpressures_the_producer() {
         .map(|index| MockScriptStep::message(format!("chunk-{index}")))
         .chain(std::iter::once(MockScriptStep::complete()))
         .collect();
-    let mock = MockHarness::new(
+    let mock = mock(
         HarnessCapabilities::default(),
         vec![MockRunPlan::new(steps)],
         None,
@@ -191,7 +203,7 @@ async fn bounded_event_buffer_backpressures_the_producer() {
 
 #[tokio::test]
 async fn scripted_events_keep_the_declared_legal_order() {
-    let mock = MockHarness::new(
+    let mock = mock(
         HarnessCapabilities::default(),
         vec![MockRunPlan::new(vec![
             MockScriptStep::command_output("build", "first"),
@@ -235,7 +247,7 @@ async fn scripted_events_keep_the_declared_legal_order() {
 
 #[tokio::test]
 async fn a_run_fault_plan_is_scoped_and_consumed_once() {
-    let mock = MockHarness::new(
+    let mock = mock(
         HarnessCapabilities::default(),
         vec![
             MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::ExitAfterRunAccepted),
@@ -281,7 +293,7 @@ async fn a_run_fault_plan_is_scoped_and_consumed_once() {
 
 #[tokio::test]
 async fn session_pagination_crosses_9999_to_10000_in_creation_order() {
-    let mock = MockHarness::new(HarnessCapabilities::default(), Vec::new(), None);
+    let mock = mock(HarnessCapabilities::default(), Vec::new(), None);
     for _ in 0..10_001 {
         session(&mock).await;
     }
@@ -313,13 +325,26 @@ async fn identical_native_ids_are_isolated_by_runtime_and_session_scope() {
             MockScriptStep::complete(),
         ])
     };
-    let mock = MockHarness::new(HarnessCapabilities::default(), vec![plan(), plan()], None);
-    let mut stream = mock.subscribe().unwrap();
     let runtime_a = RuntimeHandle::new("runtime-a").unwrap();
     let runtime_b = RuntimeHandle::new("runtime-b").unwrap();
+    let mock = MockHarness::new(HarnessCapabilities::default(), vec![plan(), plan()], None)
+        .with_runtime(
+            runtime_a.clone(),
+            "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
+            None,
+            Vec::new(),
+        )
+        .with_runtime(
+            runtime_b.clone(),
+            "0193f26e-7a72-7000-8000-00000000aaa2".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+    let mut stream = mock.subscribe().unwrap();
     let session_a = session_at(&mock, &runtime_a).await;
     let session_b = session_at(&mock, &runtime_b).await;
     assert_eq!(session_a.id, session_b.id);
+    assert_ne!(session_a.connection_id, session_b.connection_id);
 
     let run_a = mock
         .start_run(
@@ -381,4 +406,38 @@ async fn identical_native_ids_are_isolated_by_runtime_and_session_scope() {
         next(&mut stream).await,
         HarnessEvent::RunTerminal { run, .. } if run == run_b
     ));
+}
+
+#[tokio::test]
+async fn runtime_faults_and_capabilities_are_scoped_to_the_registered_runtime() {
+    let runtime_a = RuntimeHandle::new("runtime-a").unwrap();
+    let runtime_b = RuntimeHandle::new("runtime-b").unwrap();
+    let capabilities_a = HarnessCapabilities {
+        mid_run_steering: true,
+        ..HarnessCapabilities::default()
+    };
+    let capabilities_b = HarnessCapabilities {
+        user_input_requests: true,
+        ..HarnessCapabilities::default()
+    };
+    let mock = MockHarness::new(HarnessCapabilities::default(), Vec::new(), None)
+        .with_runtime(
+            runtime_a.clone(),
+            "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
+            Some(capabilities_a),
+            vec![MockHarnessFault::Overloaded],
+        )
+        .with_runtime(
+            runtime_b.clone(),
+            "0193f26e-7a72-7000-8000-00000000aaa2".parse().unwrap(),
+            Some(capabilities_b),
+            Vec::new(),
+        );
+
+    assert!(matches!(
+        mock.capabilities(&runtime_a).await,
+        Err(yakshed_harness::HarnessError::Overloaded)
+    ));
+    assert_eq!(mock.capabilities(&runtime_b).await.unwrap(), capabilities_b);
+    assert_eq!(mock.capabilities(&runtime_a).await.unwrap(), capabilities_a);
 }
