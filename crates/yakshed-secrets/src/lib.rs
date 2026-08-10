@@ -284,10 +284,6 @@ pub enum SecretError {
     UncertainWrite {
         backend: SecretBackendId,
     },
-    BackendIdentityMismatch {
-        backend: SecretBackendId,
-        file_backend: SecretBackendId,
-    },
     InvalidBinding {
         connection_id: ConnectionId,
         slot: CredentialSlot,
@@ -345,12 +341,6 @@ impl fmt::Display for SecretError {
                 write!(
                     formatter,
                     "secret backend write outcome uncertain: {backend}"
-                )
-            }
-            Self::BackendIdentityMismatch { backend, .. } => {
-                write!(
-                    formatter,
-                    "secret backend file identity mismatch: {backend}"
                 )
             }
             Self::InvalidBinding {
