@@ -9,10 +9,11 @@ use tokio::sync::oneshot;
 use yakshed_domain::ConnectionId;
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessDescriptor, HarnessError, HarnessEvent,
-    HarnessEventSender, HarnessInput, HarnessRunTerminal, NativePayload, Page, ProviderEventStream,
-    ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle, ProviderRunId,
-    ProviderSession, ProviderSessionId, ProviderSessionSummary, RunOptions, RuntimeHandle,
-    SanitizedDiagnostic, SessionPageCursor, SessionQuery, StartSessionSpec, event_channel,
+    HarnessEventPermit, HarnessEventSender, HarnessInput, HarnessRunTerminal, NativePayload, Page,
+    ProviderEventStream, ProviderRequestHandle, ProviderRequestId, ProviderResponse,
+    ProviderRunHandle, ProviderRunId, ProviderSession, ProviderSessionId, ProviderSessionSummary,
+    RunOptions, RuntimeHandle, SanitizedDiagnostic, SessionPageCursor, SessionQuery,
+    StartSessionSpec, event_channel,
 };
 
 /// Deterministic run/runtime faults. `DelayApproval` is released manually rather than by sleep.
@@ -183,13 +184,13 @@ struct RunRecord {
     pending: Option<PendingDelivery>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct PendingDelivery {
     event: HarnessEvent,
     commit: DeliveryCommit,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 enum DeliveryCommit {
     Step {
         terminal_after: Option<PendingTerminal>,
@@ -200,10 +201,18 @@ enum DeliveryCommit {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct PendingTerminal {
     state: HarnessRunTerminal,
     native: String,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FlushResult {
+    None,
+    Changed,
+    Delivered,
+    Terminal,
 }
 
 struct RequestRecord {
@@ -455,22 +464,66 @@ impl MockHarness {
         }
     }
 
+    fn reject_immediate_run_fault(
+        &self,
+        fault: Option<MockHarnessFault>,
+    ) -> Result<(), HarnessError> {
+        match fault {
+            Some(MockHarnessFault::Overloaded) => Err(HarnessError::Overloaded),
+            Some(MockHarnessFault::Disconnected) => Err(HarnessError::Disconnected),
+            Some(MockHarnessFault::ProtocolFailure) => Err(HarnessError::Protocol {
+                diagnostic: SanitizedDiagnostic::sanitized(
+                    self.redact("mock run protocol failure"),
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    // Every event path validates, reserves without the state lock, then revalidates and
+    // commits with a synchronous permit send under the lock.
     async fn flush_pending(
         &self,
-        state: &mut State,
         run_handle: &ProviderRunHandle,
-    ) -> Result<bool, HarnessError> {
-        let pending = state
-            .runs
-            .get(run_handle)
-            .and_then(|run| run.pending.clone());
+    ) -> Result<FlushResult, HarnessError> {
+        let pending = {
+            let state = self.state.lock().await;
+            let run = state
+                .runs
+                .get(run_handle)
+                .ok_or_else(|| HarnessError::NotFound {
+                    entity: "run",
+                    id: run_handle.to_string(),
+                })?;
+            run.pending.clone()
+        };
         let Some(pending) = pending else {
-            return Ok(false);
+            return Ok(FlushResult::None);
         };
 
         #[cfg(test)]
         self.note_delivery_attempt();
-        self.events.send(pending.event).await?;
+        let permit = self.events.reserve().await?;
+        let mut state = self.state.lock().await;
+        if state
+            .runs
+            .get(run_handle)
+            .and_then(|run| run.pending.as_ref())
+            != Some(&pending)
+        {
+            return Ok(FlushResult::Changed);
+        }
+        Ok(self.commit_pending(&mut state, run_handle, pending, permit))
+    }
+
+    fn commit_pending(
+        &self,
+        state: &mut State,
+        run_handle: &ProviderRunHandle,
+        pending: PendingDelivery,
+        permit: HarnessEventPermit,
+    ) -> FlushResult {
+        permit.send(pending.event);
         let run = state
             .runs
             .get_mut(run_handle)
@@ -486,11 +539,11 @@ impl MockHarness {
                         false,
                     )
                 });
-                Ok(false)
+                FlushResult::Delivered
             }
             DeliveryCommit::Standalone => {
                 run.pending = None;
-                Ok(false)
+                FlushResult::Delivered
             }
             DeliveryCommit::Terminal { consume_step } => {
                 if consume_step {
@@ -498,44 +551,102 @@ impl MockHarness {
                 }
                 run.pending = None;
                 run.active = false;
-                Ok(true)
+                FlushResult::Terminal
             }
         }
     }
 
     async fn process_run(&self, run_handle: &ProviderRunHandle) -> Result<(), HarnessError> {
         loop {
-            let mut state = self.state.lock().await;
-            if self.flush_pending(&mut state, run_handle).await? {
-                return Ok(());
+            match self.flush_pending(run_handle).await? {
+                FlushResult::Terminal => return Ok(()),
+                FlushResult::Changed | FlushResult::Delivered => continue,
+                FlushResult::None => {}
             }
-            if state
-                .runs
-                .get(run_handle)
-                .is_some_and(|run| run.pending.is_some())
-            {
-                continue;
-            }
-            let run = state
-                .runs
-                .get_mut(run_handle)
-                .ok_or(HarnessError::NotFound {
-                    entity: "run",
-                    id: run_handle.to_string(),
-                })?;
-            if !run.active {
-                return Ok(());
-            }
-            if run.fault == Some(MockHarnessFault::DelayApproval)
-                && matches!(run.steps.front(), Some(MockScriptStep::Approval { .. }))
-            {
-                run.delayed = true;
-                return Ok(());
-            }
-            let step = run.steps.front().cloned();
+            let step = {
+                let mut state = self.state.lock().await;
+                let run = state
+                    .runs
+                    .get_mut(run_handle)
+                    .ok_or(HarnessError::NotFound {
+                        entity: "run",
+                        id: run_handle.to_string(),
+                    })?;
+                if !run.active {
+                    return Ok(());
+                }
+                if run.pending.is_some() {
+                    continue;
+                }
+                if run.fault == Some(MockHarnessFault::DelayApproval)
+                    && matches!(run.steps.front(), Some(MockScriptStep::Approval { .. }))
+                {
+                    run.delayed = true;
+                    return Ok(());
+                }
+                let step = run.steps.front().cloned();
+                match step.as_ref() {
+                    Some(MockScriptStep::AwaitResponse(request_id)) => {
+                        let request =
+                            ProviderRequestHandle::new(run_handle.clone(), request_id.clone());
+                        if state
+                            .requests
+                            .get(&request)
+                            .is_none_or(|request| request.response.is_none())
+                        {
+                            return Ok(());
+                        }
+                        state
+                            .runs
+                            .get_mut(run_handle)
+                            .expect("run exists while processing")
+                            .steps
+                            .pop_front();
+                        continue;
+                    }
+                    Some(
+                        MockScriptStep::Approval { request_id, .. }
+                        | MockScriptStep::UserInput { request_id, .. },
+                    ) => {
+                        let request =
+                            ProviderRequestHandle::new(run_handle.clone(), request_id.clone());
+                        if state.requests.contains_key(&request) {
+                            return Err(HarnessError::Conflict(format!(
+                                "duplicate provider request id: {request}"
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+                step
+            };
             let Some(step) = step else {
                 return Ok(());
             };
+            #[cfg(test)]
+            self.note_delivery_attempt();
+            let permit = self.events.reserve().await?;
+            let mut state = self.state.lock().await;
+            let run = state.runs.get(run_handle).ok_or(HarnessError::NotFound {
+                entity: "run",
+                id: run_handle.to_string(),
+            })?;
+            if !run.active {
+                return Ok(());
+            }
+            if run.pending.is_some() || run.steps.front() != Some(&step) {
+                continue;
+            }
+            if let MockScriptStep::Approval { request_id, .. }
+            | MockScriptStep::UserInput { request_id, .. } = &step
+            {
+                let request = ProviderRequestHandle::new(run_handle.clone(), request_id.clone());
+                if state.requests.contains_key(&request) {
+                    return Err(HarnessError::Conflict(format!(
+                        "duplicate provider request id: {request}"
+                    )));
+                }
+            }
             let pending = match step {
                 MockScriptStep::Message { chunk, native } => PendingDelivery {
                     event: HarnessEvent::MessageDelta {
@@ -563,7 +674,7 @@ impl MockHarness {
                     native,
                 } => {
                     let request = ProviderRequestHandle::new(run_handle.clone(), request_id);
-                    let previous = state.requests.insert(
+                    state.requests.insert(
                         request.clone(),
                         RequestRecord {
                             run: run_handle.clone(),
@@ -571,11 +682,6 @@ impl MockHarness {
                             response: None,
                         },
                     );
-                    if previous.is_some() {
-                        return Err(HarnessError::Conflict(format!(
-                            "duplicate provider request id: {request}"
-                        )));
-                    }
                     PendingDelivery {
                         event: HarnessEvent::ApprovalRequested {
                             request,
@@ -593,7 +699,7 @@ impl MockHarness {
                     native,
                 } => {
                     let request = ProviderRequestHandle::new(run_handle.clone(), request_id);
-                    let previous = state.requests.insert(
+                    state.requests.insert(
                         request.clone(),
                         RequestRecord {
                             run: run_handle.clone(),
@@ -601,11 +707,6 @@ impl MockHarness {
                             response: None,
                         },
                     );
-                    if previous.is_some() {
-                        return Err(HarnessError::Conflict(format!(
-                            "duplicate provider request id: {request}"
-                        )));
-                    }
                     PendingDelivery {
                         event: HarnessEvent::UserInputRequested {
                             request,
@@ -617,24 +718,7 @@ impl MockHarness {
                         },
                     }
                 }
-                MockScriptStep::AwaitResponse(request_id) => {
-                    let request =
-                        ProviderRequestHandle::new(run_handle.clone(), request_id.clone());
-                    let answered = state
-                        .requests
-                        .get(&request)
-                        .is_some_and(|request| request.response.is_some());
-                    if !answered {
-                        return Ok(());
-                    }
-                    state
-                        .runs
-                        .get_mut(run_handle)
-                        .expect("run exists while processing")
-                        .steps
-                        .pop_front();
-                    continue;
-                }
+                MockScriptStep::AwaitResponse(_) => unreachable!("await steps do not emit"),
                 MockScriptStep::FileMutation {
                     path,
                     summary,
@@ -711,11 +795,10 @@ impl MockHarness {
                     },
                 },
             };
-            state
-                .runs
-                .get_mut(run_handle)
-                .expect("run exists while processing")
-                .pending = Some(pending);
+            if self.commit_pending(&mut state, run_handle, pending, permit) == FlushResult::Terminal
+            {
+                return Ok(());
+            }
         }
     }
 
@@ -856,6 +939,20 @@ impl HarnessAdapter for MockHarness {
         _options: RunOptions,
     ) -> Result<ProviderRunHandle, HarnessError> {
         self.check_runtime(&session.runtime).await?;
+        {
+            let state = self.state.lock().await;
+            if !state
+                .sessions
+                .iter()
+                .any(|record| record.session == *session)
+            {
+                return Err(HarnessError::NotFound {
+                    entity: "session",
+                    id: session.id.to_string(),
+                });
+            }
+            self.reject_immediate_run_fault(state.plans.front().and_then(|plan| plan.fault))?;
+        }
         #[cfg(test)]
         self.note_acceptance_reserve();
         let acceptance = self.events.reserve().await?;
@@ -871,22 +968,11 @@ impl HarnessAdapter for MockHarness {
                     id: session.id.to_string(),
                 });
             }
+            self.reject_immediate_run_fault(state.plans.front().and_then(|plan| plan.fault))?;
             let plan = state
                 .plans
                 .pop_front()
                 .unwrap_or_else(|| MockRunPlan::new(vec![MockScriptStep::complete()]));
-            match plan.fault {
-                Some(MockHarnessFault::Overloaded) => return Err(HarnessError::Overloaded),
-                Some(MockHarnessFault::Disconnected) => return Err(HarnessError::Disconnected),
-                Some(MockHarnessFault::ProtocolFailure) => {
-                    return Err(HarnessError::Protocol {
-                        diagnostic: SanitizedDiagnostic::sanitized(
-                            self.redact("mock run protocol failure"),
-                        ),
-                    });
-                }
-                _ => {}
-            }
             let key = (session.runtime.clone(), session.id.clone());
             let sequence = state.next_run.entry(key).or_insert(1);
             let run_id = ProviderRunId::new(format!("run-{sequence:04}"))?;
@@ -951,74 +1037,94 @@ impl HarnessAdapter for MockHarness {
         run: &ProviderRunHandle,
         input: HarnessInput,
     ) -> Result<(), HarnessError> {
-        let mut state = self.state.lock().await;
-        if self.flush_pending(&mut state, run).await?
-            || !state
-                .runs
-                .get(run)
-                .is_some_and(|run| run.active && run.pending.is_none())
-        {
-            return Err(HarnessError::Conflict(format!("run is not active: {run}")));
-        }
-        #[cfg(test)]
-        let pause = self
-            .steer_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        #[cfg(test)]
-        if let Some(pause) = pause {
-            let _ = pause.checked.send(());
-            let _ = pause.resume.await;
-        }
-        state.runs.get_mut(run).expect("checked run exists").pending = Some(PendingDelivery {
-            event: HarnessEvent::MessageDelta {
+        loop {
+            match self.flush_pending(run).await? {
+                FlushResult::Terminal => {
+                    return Err(HarnessError::Conflict(format!("run is not active: {run}")));
+                }
+                FlushResult::Changed | FlushResult::Delivered => continue,
+                FlushResult::None => {}
+            }
+            {
+                let state = self.state.lock().await;
+                if !state.runs.get(run).is_some_and(|record| record.active) {
+                    return Err(HarnessError::Conflict(format!("run is not active: {run}")));
+                }
+            }
+            #[cfg(test)]
+            let pause = self
+                .steer_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                let _ = pause.checked.send(());
+                let _ = pause.resume.await;
+            }
+            let permit = self.events.reserve().await?;
+            let state = self.state.lock().await;
+            let Some(record) = state.runs.get(run) else {
+                return Err(HarnessError::NotFound {
+                    entity: "run",
+                    id: run.to_string(),
+                });
+            };
+            if !record.active {
+                return Err(HarnessError::Conflict(format!("run is not active: {run}")));
+            }
+            if record.pending.is_some() {
+                continue;
+            }
+            permit.send(HarnessEvent::MessageDelta {
                 run: run.clone(),
                 chunk: input.as_str().to_owned(),
                 native: self.native(r#"{"type":"run.steer"}"#),
-            },
-            commit: DeliveryCommit::Standalone,
-        });
-        self.flush_pending(&mut state, run).await.map(|_| ())
+            });
+            return Ok(());
+        }
     }
 
     async fn interrupt(&self, run: &ProviderRunHandle) -> Result<(), HarnessError> {
-        let mut state = self.state.lock().await;
-        if !state.runs.contains_key(run) {
-            return Err(HarnessError::NotFound {
+        loop {
+            match self.flush_pending(run).await? {
+                FlushResult::Terminal => return Ok(()),
+                FlushResult::Changed | FlushResult::Delivered => continue,
+                FlushResult::None => {}
+            }
+            {
+                let state = self.state.lock().await;
+                let record = state.runs.get(run).ok_or_else(|| HarnessError::NotFound {
+                    entity: "run",
+                    id: run.to_string(),
+                })?;
+                if !record.active {
+                    return Err(HarnessError::Conflict(format!("run is not active: {run}")));
+                }
+            }
+            #[cfg(test)]
+            self.note_delivery_attempt();
+            let permit = self.events.reserve().await?;
+            let mut state = self.state.lock().await;
+            let record = state.runs.get(run).ok_or_else(|| HarnessError::NotFound {
                 entity: "run",
                 id: run.to_string(),
-            });
-        }
-        if state
-            .runs
-            .get(run)
-            .and_then(|record| record.pending.as_ref())
-            .is_some()
-        {
-            let terminal = self.flush_pending(&mut state, run).await?;
-            if terminal {
-                return Ok(());
+            })?;
+            if !record.active {
+                return Err(HarnessError::Conflict(format!("run is not active: {run}")));
             }
-            if state
-                .runs
-                .get(run)
-                .is_some_and(|record| record.pending.is_some())
-            {
-                return self.flush_pending(&mut state, run).await.map(|_| ());
+            if record.pending.is_some() {
+                continue;
             }
-        }
-        if !state.runs.get(run).is_some_and(|record| record.active) {
-            return Err(HarnessError::Conflict(format!("run is not active: {run}")));
-        }
-        state.runs.get_mut(run).expect("checked run exists").pending =
-            Some(self.terminal_delivery(
+            let terminal = self.terminal_delivery(
                 run.clone(),
                 HarnessRunTerminal::Interrupted,
                 r#"{"type":"run.interrupted"}"#,
                 false,
-            ));
-        self.flush_pending(&mut state, run).await.map(|_| ())
+            );
+            self.commit_pending(&mut state, run, terminal, permit);
+            return Ok(());
+        }
     }
 
     async fn respond_to_request(
@@ -1094,6 +1200,142 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn saturated_mock(next_plan: MockRunPlan) -> (MockHarness, ProviderSession) {
+        let mock = configured_mock(vec![
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+            next_plan,
+        ]);
+        let session = test_session(&mock).await;
+        let run = mock
+            .start_run(
+                &session,
+                HarnessInput::new("fill").unwrap(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        for index in 1..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            mock.steer(&run, HarnessInput::new(format!("fill-{index}")).unwrap())
+                .await
+                .unwrap();
+        }
+        (mock, session)
+    }
+
+    #[tokio::test]
+    async fn saturated_stream_stale_session_fails_before_reserving_capacity() {
+        let (mock, mut stale_session) =
+            saturated_mock(MockRunPlan::new(vec![MockScriptStep::complete()])).await;
+        stale_session.id = ProviderSessionId::new("missing-session").unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            mock.start_run(
+                &stale_session,
+                HarnessInput::new("stale").unwrap(),
+                RunOptions::default(),
+            ),
+        )
+        .await
+        .expect("stale session validation waited for event capacity");
+        assert!(matches!(result, Err(HarnessError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn saturated_stream_rejecting_plan_fails_before_reserving_capacity() {
+        let (mock, session) =
+            saturated_mock(MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::Overloaded))
+                .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            mock.start_run(
+                &session,
+                HarnessInput::new("reject").unwrap(),
+                RunOptions::default(),
+            ),
+        )
+        .await
+        .expect("rejecting plan waited for event capacity");
+        assert_eq!(result, Err(HarnessError::Overloaded));
+        assert_eq!(mock.state.lock().await.plans.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn acceptance_and_staged_delivery_share_capacity_without_lock_inversion() {
+        let mock = configured_mock(vec![
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::ExitAfterRunAccepted),
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+        ]);
+        let session = test_session(&mock).await;
+        let mut stream = mock.subscribe().unwrap();
+        let filler = mock
+            .start_run(
+                &session,
+                HarnessInput::new("filler").unwrap(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        for index in 1..yakshed_harness::EVENT_BUFFER_CAPACITY - 1 {
+            mock.steer(&filler, HarnessInput::new(format!("fill-{index}")).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let terminal_reserve = mock.probe_delivery(1);
+        let mut crashing = Box::pin(mock.start_run(
+            &session,
+            HarnessInput::new("crash").unwrap(),
+            RunOptions::default(),
+        ));
+        tokio::select! {
+            biased;
+            result = &mut crashing => panic!("crash terminal did not backpressure: {result:?}"),
+            result = terminal_reserve => result.unwrap(),
+        }
+        drop(crashing);
+        let crash_run = mock
+            .state
+            .lock()
+            .await
+            .runs
+            .keys()
+            .find(|run| **run != filler)
+            .expect("accepted crash run exists")
+            .clone();
+
+        let acceptance_reserve = mock.probe_acceptance_reserve();
+        let mut accepting = Box::pin(mock.start_run(
+            &session,
+            HarnessInput::new("accepted").unwrap(),
+            RunOptions::default(),
+        ));
+        tokio::select! {
+            biased;
+            result = &mut accepting => panic!("acceptance did not backpressure: {result:?}"),
+            result = acceptance_reserve => result.unwrap(),
+        }
+        let delivery_reserve = mock.probe_delivery(1);
+        let mut flushing = Box::pin(mock.process_run(&crash_run));
+        tokio::select! {
+            biased;
+            result = &mut flushing => panic!("staged delivery did not backpressure: {result:?}"),
+            result = delivery_reserve => result.unwrap(),
+        }
+
+        stream.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut accepting)
+            .await
+            .expect("acceptance waited on the state lock after capacity was freed")
+            .unwrap();
+        stream.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut flushing)
+            .await
+            .expect("staged delivery did not progress after acceptance released the lock")
+            .unwrap();
+        assert!(!mock.state.lock().await.runs[&crash_run].active);
     }
 
     #[tokio::test]
@@ -1311,7 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steer_checked_before_interrupt_cannot_emit_after_terminal() {
+    async fn steer_revalidates_after_concurrent_interrupt_before_emitting() {
         let mock = Arc::new(
             MockHarness::new(
                 HarnessCapabilities::default(),
@@ -1359,21 +1601,13 @@ mod tests {
                 .await
         });
         checked.await.unwrap();
-        let mut interrupt = Box::pin(mock.interrupt(&run));
-        tokio::select! {
-            biased;
-            result = &mut interrupt => panic!("interrupt passed an in-flight steer: {result:?}"),
-            () = std::future::ready(()) => {}
-        }
+        mock.interrupt(&run).await.unwrap();
         resume.send(()).unwrap();
-        let (steer_result, interrupt_result) = tokio::join!(steer, interrupt);
-        steer_result.unwrap().unwrap();
-        interrupt_result.unwrap();
-
         assert!(matches!(
-            stream.recv().await,
-            Some(HarnessEvent::MessageDelta { chunk, .. }) if chunk == "steered"
+            steer.await.unwrap(),
+            Err(HarnessError::Conflict(_))
         ));
+
         assert!(matches!(
             stream.recv().await,
             Some(HarnessEvent::RunTerminal {
