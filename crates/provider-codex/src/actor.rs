@@ -83,13 +83,15 @@ impl RuntimeClient {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(CommandMessage::Respond {
-                request,
+                request: request.clone(),
                 response,
                 reply,
             })
             .await
-            .map_err(|_| HarnessError::Disconnected)?;
-        result.await.map_err(|_| HarnessError::Disconnected)?
+            .map_err(|_| provider_request_not_found(&request))?;
+        result
+            .await
+            .map_err(|_| provider_request_not_found(&request))?
     }
 
     pub async fn diagnostics(&self) -> Result<Vec<String>, HarnessError> {
@@ -147,6 +149,7 @@ enum ServerRequestKind {
 struct PendingServer {
     rpc_id: Value,
     kind: ServerRequestKind,
+    uncertain: bool,
 }
 
 enum Inbound {
@@ -301,11 +304,29 @@ async fn run_actor(
                         let _ = reply.send(());
                     }
                     Some(CommandMessage::Shutdown(reply)) => {
+                        settle_runtime(
+                            &mut pending,
+                            &mut server_requests,
+                            &mut runs,
+                            &mut reducer,
+                            &events,
+                            &sanitizer,
+                            Settlement::Shutdown,
+                        ).await;
                         child.kill_and_reap().await;
                         let _ = reply.send(());
                         break;
                     }
                     None => {
+                        settle_runtime(
+                            &mut pending,
+                            &mut server_requests,
+                            &mut runs,
+                            &mut reducer,
+                            &events,
+                            &sanitizer,
+                            Settlement::Shutdown,
+                        ).await;
                         child.kill_and_reap().await;
                         break;
                     }
@@ -314,25 +335,38 @@ async fn run_actor(
             inbound = inbound_rx.recv() => {
                 match inbound {
                     Some(Inbound::Frame { raw, value }) => {
-                        handle_frame(
+                        if handle_frame(
                             raw,
                             value,
                             &spec,
                             &sanitizer,
+                            &mut stdin,
                             &events,
+                            &mut diagnostics,
                             &mut pending,
                             &mut server_requests,
                             &mut loaded_sessions,
                             &mut runs,
                             &mut reducer,
-                        ).await;
+                        ).await.is_err() {
+                            child.kill_and_reap().await;
+                            settle_runtime(
+                                &mut pending,
+                                &mut server_requests,
+                                &mut runs,
+                                &mut reducer,
+                                &events,
+                                &sanitizer,
+                                Settlement::Crashed,
+                            ).await;
+                            break;
+                        }
                     }
                     Some(Inbound::Malformed(raw)) => {
                         let raw = sanitizer.sanitize(raw);
                         push_diagnostic(&mut diagnostics, raw.clone());
-                        let run = sole_active_run(&runs);
                         let _ = events.send(HarnessEvent::MalformedNativePayload {
-                            run,
+                            run: None,
                             item_type: "codex.malformed-frame".to_owned(),
                             native: NativePayload::sanitized(raw),
                         }).await;
@@ -340,9 +374,8 @@ async fn run_actor(
                     Some(Inbound::Oversized(prefix)) => {
                         let prefix = sanitizer.sanitize(prefix);
                         push_diagnostic(&mut diagnostics, prefix.clone());
-                        let run = sole_active_run(&runs);
                         let _ = events.send(HarnessEvent::MalformedNativePayload {
-                            run,
+                            run: None,
                             item_type: "codex.oversized-frame".to_owned(),
                             native: NativePayload::sanitized(prefix),
                         }).await;
@@ -352,12 +385,14 @@ async fn run_actor(
                     }
                     Some(Inbound::Eof) | None => {
                         child.kill_and_reap().await;
-                        disconnect(
+                        settle_runtime(
                             &mut pending,
-                            &runs,
+                            &mut server_requests,
+                            &mut runs,
+                            &mut reducer,
                             &events,
                             &sanitizer,
-                            "Codex App Server disconnected".to_owned(),
+                            Settlement::Crashed,
                         ).await;
                         break;
                     }
@@ -376,25 +411,27 @@ async fn handle_frame(
     value: Value,
     spec: &CodexRuntimeSpec,
     sanitizer: &Sanitizer,
+    stdin: &mut ChildStdin,
     events: &HarnessEventSender,
+    diagnostics: &mut VecDeque<String>,
     pending: &mut HashMap<u64, PendingClient>,
     server_requests: &mut HashMap<ProviderRequestHandle, PendingServer>,
     loaded_sessions: &mut HashSet<String>,
     runs: &mut HashMap<(String, String), ProviderRunHandle>,
     reducer: &mut Reducer,
-) {
+) -> Result<(), HarnessError> {
     if value.get("method").is_none() {
         let Some(id) = value.get("id").and_then(Value::as_u64) else {
-            return;
+            return Ok(());
         };
         let Some(pending_request) = pending.remove(&id) else {
-            return;
+            return Ok(());
         };
         if let Some(error) = value.get("error") {
             let _ = pending_request
                 .reply
                 .send(Err(classify_protocol_error(error, sanitizer)));
-            return;
+            return Ok(());
         }
         let mut result = value.get("result").cloned().unwrap_or_else(|| json!({}));
         sanitizer.sanitize_value(&mut result);
@@ -432,7 +469,7 @@ async fn handle_frame(
             RequestKind::Read => {}
         }
         let _ = pending_request.reply.send(Ok(result));
-        return;
+        return Ok(());
     }
 
     let method = value
@@ -440,67 +477,214 @@ async fn handle_frame(
         .and_then(Value::as_str)
         .unwrap_or("codex.unknown")
         .to_owned();
-    let run = run_for_message(&value, runs).or_else(|| sole_active_run(runs));
     let mut safe_value = value;
     sanitizer.sanitize_value(&mut safe_value);
+    let run = run_for_message(&safe_value, runs);
+    let sanitized = sanitizer.sanitize(raw);
+    let native = NativePayload::sanitized(sanitized.clone());
+
     let request = if safe_value.get("id").is_some() {
-        make_server_request(&safe_value, run.clone(), server_requests)
+        match validate_server_request(&safe_value, run.clone(), server_requests) {
+            Ok((handle, pending_server)) => {
+                server_requests.insert(handle.clone(), pending_server);
+                Some(handle)
+            }
+            Err(rejection) => {
+                write_protocol_error(
+                    stdin,
+                    safe_value.get("id").cloned().unwrap_or(Value::Null),
+                    rejection.code,
+                    rejection.message,
+                )
+                .await?;
+                push_diagnostic(diagnostics, sanitized);
+                let event = if rejection.code == -32601 {
+                    HarnessEvent::Unknown {
+                        run,
+                        item_type: method,
+                        native,
+                    }
+                } else {
+                    HarnessEvent::MalformedNativePayload {
+                        run,
+                        item_type: method,
+                        native,
+                    }
+                };
+                let _ = events.send(event).await;
+                return Ok(());
+            }
+        }
     } else {
+        if message_has_run_identity(&safe_value) && run.is_none() {
+            let _ = events
+                .send(HarnessEvent::Unknown {
+                    run: None,
+                    item_type: method,
+                    native,
+                })
+                .await;
+            return Ok(());
+        }
         None
     };
-    let sanitized = sanitizer.sanitize(raw);
+    let completes_run = method == "turn/completed";
     if let Some(event) = reducer.reduce(sanitized, &safe_value, run.clone(), request) {
         let terminal = matches!(event, HarnessEvent::RunTerminal { .. });
         let _ = events.send(event).await;
-        if terminal && let Some(run) = run {
+        if (terminal || completes_run)
+            && let Some(run) = run
+        {
             runs.remove(&(
                 run.session_id().as_str().to_owned(),
                 run.native_id().as_str().to_owned(),
             ));
+            server_requests.retain(|request, _| request.run() != &run);
+            reducer.retire_run(&run);
         }
-    } else if method.starts_with("item/") && safe_value.get("params").is_none() {
-        let _ = events
-            .send(HarnessEvent::MalformedNativePayload {
-                run,
-                item_type: method,
-                native: NativePayload::sanitized(sanitizer.sanitize(safe_value.to_string())),
-            })
-            .await;
     }
+    Ok(())
 }
 
-fn make_server_request(
+struct ServerRequestRejection {
+    code: i64,
+    message: &'static str,
+}
+
+fn validate_server_request(
     value: &Value,
     run: Option<ProviderRunHandle>,
     requests: &mut HashMap<ProviderRequestHandle, PendingServer>,
-) -> Option<ProviderRequestHandle> {
-    let run = run?;
-    let method = value.get("method")?.as_str()?;
-    let rpc_id = value.get("id")?.clone();
+) -> Result<(ProviderRequestHandle, PendingServer), ServerRequestRejection> {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or(ServerRequestRejection {
+            code: -32600,
+            message: "invalid request",
+        })?;
+    let kind = match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            validate_approval_params(value)?;
+            ServerRequestKind::Approval
+        }
+        "item/tool/requestUserInput" => ServerRequestKind::UserInput {
+            question_ids: validate_user_input_params(value)?,
+        },
+        _ => {
+            return Err(ServerRequestRejection {
+                code: -32601,
+                message: "method not supported",
+            });
+        }
+    };
+    let run = run.ok_or(ServerRequestRejection {
+        code: -32602,
+        message: "request does not identify an active run",
+    })?;
+    let rpc_id = value
+        .get("id")
+        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+        .cloned()
+        .ok_or(ServerRequestRejection {
+            code: -32600,
+            message: "invalid request id",
+        })?;
     let native_id = match &rpc_id {
         Value::String(value) => value.clone(),
         value => value.to_string(),
     };
-    let handle = ProviderRequestHandle::new(run, ProviderRequestId::new(native_id).ok()?);
-    let kind = match method {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            ServerRequestKind::Approval
-        }
-        "item/tool/requestUserInput" => ServerRequestKind::UserInput {
-            question_ids: value
-                .get("params")
-                .and_then(|params| params.get("questions"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|question| question.get("id").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect(),
+    let request_id = ProviderRequestId::new(native_id).map_err(|_| ServerRequestRejection {
+        code: -32600,
+        message: "invalid request id",
+    })?;
+    let handle = ProviderRequestHandle::new(run, request_id);
+    if requests.contains_key(&handle) {
+        return Err(ServerRequestRejection {
+            code: -32600,
+            message: "duplicate request id",
+        });
+    }
+    Ok((
+        handle,
+        PendingServer {
+            rpc_id,
+            kind,
+            uncertain: false,
         },
-        _ => return None,
-    };
-    requests.insert(handle.clone(), PendingServer { rpc_id, kind });
-    Some(handle)
+    ))
+}
+
+fn validate_approval_params(value: &Value) -> Result<(), ServerRequestRejection> {
+    let params = request_params(value)?;
+    let valid = params.get("itemId").and_then(Value::as_str).is_some()
+        && params.get("startedAtMs").and_then(Value::as_i64).is_some();
+    if valid { Ok(()) } else { Err(invalid_params()) }
+}
+
+fn validate_user_input_params(value: &Value) -> Result<Vec<String>, ServerRequestRejection> {
+    let params = request_params(value)?;
+    if params.get("itemId").and_then(Value::as_str).is_none()
+        || params.get("isBlocking").and_then(Value::as_bool).is_none()
+    {
+        return Err(invalid_params());
+    }
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .filter(|questions| !questions.is_empty())
+        .ok_or_else(invalid_params)?;
+    questions
+        .iter()
+        .map(|question| {
+            if question.get("header").and_then(Value::as_str).is_none()
+                || question.get("question").and_then(Value::as_str).is_none()
+            {
+                return Err(invalid_params());
+            }
+            question
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(invalid_params)
+        })
+        .collect()
+}
+
+fn request_params(
+    value: &Value,
+) -> Result<&serde_json::Map<String, Value>, ServerRequestRejection> {
+    let params = value
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid_params)?;
+    if params.get("threadId").and_then(Value::as_str).is_none()
+        || params.get("turnId").and_then(Value::as_str).is_none()
+    {
+        Err(invalid_params())
+    } else {
+        Ok(params)
+    }
+}
+
+fn invalid_params() -> ServerRequestRejection {
+    ServerRequestRejection {
+        code: -32602,
+        message: "invalid request parameters",
+    }
+}
+
+async fn write_protocol_error(
+    stdin: &mut ChildStdin,
+    id: Value,
+    code: i64,
+    message: &'static str,
+) -> Result<(), HarnessError> {
+    write_frame(
+        stdin,
+        &json!({"id": id, "error": {"code": code, "message": message}}),
+    )
+    .await
 }
 
 async fn respond_to_server_request(
@@ -510,11 +694,16 @@ async fn respond_to_server_request(
     response: ProviderResponse,
 ) -> Result<(), HarnessError> {
     let pending = requests
-        .get(request)
+        .get_mut(request)
         .ok_or_else(|| HarnessError::NotFound {
             entity: "provider request",
             id: request.to_string(),
         })?;
+    if pending.uncertain {
+        return Err(HarnessError::OutcomeUnknown {
+            operation: "provider/request/respond",
+        });
+    }
     let result = match (&pending.kind, response) {
         (ServerRequestKind::Approval, ProviderResponse::Approval(decision)) => json!({
             "decision": match decision {
@@ -535,7 +724,15 @@ async fn respond_to_server_request(
             ));
         }
     };
-    write_frame(stdin, &json!({"id": pending.rpc_id, "result": result})).await?;
+    if write_frame(stdin, &json!({"id": pending.rpc_id, "result": result}))
+        .await
+        .is_err()
+    {
+        pending.uncertain = true;
+        return Err(HarnessError::OutcomeUnknown {
+            operation: "provider/request/respond",
+        });
+    }
     requests.remove(request);
     Ok(())
 }
@@ -553,20 +750,30 @@ fn run_for_message(
     runs.get(&(thread.to_owned(), turn.to_owned())).cloned()
 }
 
-fn sole_active_run(
-    runs: &HashMap<(String, String), ProviderRunHandle>,
-) -> Option<ProviderRunHandle> {
-    (runs.len() == 1)
-        .then(|| runs.values().next().cloned())
-        .flatten()
+fn message_has_run_identity(value: &Value) -> bool {
+    value
+        .get("params")
+        .and_then(Value::as_object)
+        .is_some_and(|params| {
+            params.contains_key("threadId")
+                && (params.contains_key("turnId") || params.contains_key("turn"))
+        })
 }
 
-async fn disconnect(
+#[derive(Clone, Copy)]
+enum Settlement {
+    Shutdown,
+    Crashed,
+}
+
+async fn settle_runtime(
     pending: &mut HashMap<u64, PendingClient>,
-    runs: &HashMap<(String, String), ProviderRunHandle>,
+    server_requests: &mut HashMap<ProviderRequestHandle, PendingServer>,
+    runs: &mut HashMap<(String, String), ProviderRunHandle>,
+    reducer: &mut Reducer,
     events: &HarnessEventSender,
     sanitizer: &Sanitizer,
-    diagnostic: String,
+    settlement: Settlement,
 ) {
     for (_, pending) in pending.drain() {
         let error = if pending.mutation {
@@ -578,17 +785,33 @@ async fn disconnect(
         };
         let _ = pending.reply.send(Err(error));
     }
-    let diagnostic = sanitizer.sanitize(diagnostic);
-    for run in runs.values() {
-        let _ = events
-            .send(HarnessEvent::RunTerminal {
-                run: run.clone(),
-                state: HarnessRunTerminal::Crashed {
-                    diagnostic: SanitizedDiagnostic::sanitized(diagnostic.clone()),
+    server_requests.clear();
+    for (_, run) in runs.drain() {
+        reducer.retire_run(&run);
+        let (state, native) = match settlement {
+            Settlement::Shutdown => (
+                HarnessRunTerminal::Interrupted,
+                NativePayload::sanitized("{\"event\":\"runtime-shutdown\"}"),
+            ),
+            Settlement::Crashed => (
+                HarnessRunTerminal::Crashed {
+                    diagnostic: SanitizedDiagnostic::sanitized(
+                        sanitizer.sanitize("Codex App Server disconnected".to_owned()),
+                    ),
                 },
-                native: NativePayload::sanitized("{\"event\":\"process-exited\"}"),
-            })
+                NativePayload::sanitized("{\"event\":\"process-exited\"}"),
+            ),
+        };
+        let _ = events
+            .send(HarnessEvent::RunTerminal { run, state, native })
             .await;
+    }
+}
+
+fn provider_request_not_found(request: &ProviderRequestHandle) -> HarnessError {
+    HarnessError::NotFound {
+        entity: "provider request",
+        id: request.to_string(),
     }
 }
 

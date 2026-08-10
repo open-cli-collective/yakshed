@@ -89,12 +89,118 @@ fn golden_traces_reduce_to_normalized_snapshots() {
     }
 }
 
+#[test]
+fn reducer_scopes_colliding_item_ids_to_their_runs() {
+    let mut reducer = Reducer::default();
+    let run_a = run_named("turn-a");
+    let run_b = run_named("turn-b");
+    for (run, command) in [(&run_a, "command a"), (&run_b, "command b")] {
+        let value = serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "item": {"id": "command-1", "type": "commandExecution", "command": command}
+            }
+        });
+        assert!(
+            reducer
+                .reduce(value.to_string(), &value, Some(run.clone()), None)
+                .is_none()
+        );
+    }
+
+    for (run, expected) in [(&run_a, "command a"), (&run_b, "command b")] {
+        let value = serde_json::json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {"itemId": "command-1", "delta": "output"}
+        });
+        match reducer
+            .reduce(value.to_string(), &value, Some(run.clone()), None)
+            .unwrap()
+        {
+            HarnessEvent::CommandOutput {
+                run: actual,
+                command,
+                ..
+            } => {
+                assert_eq!(actual, *run);
+                assert_eq!(command, expected);
+            }
+            event => panic!("expected command output, got {event:?}"),
+        }
+    }
+
+    let completed = serde_json::json!({
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "id": "command-1",
+                "type": "commandExecution",
+                "command": "command a",
+                "aggregatedOutput": "output"
+            }
+        }
+    });
+    reducer.reduce(completed.to_string(), &completed, Some(run_a.clone()), None);
+    assert_eq!(command_for(&mut reducer, &run_a, "command-1"), "");
+
+    let terminal = serde_json::json!({
+        "method": "turn/completed",
+        "params": {"turn": {"status": "completed"}}
+    });
+    reducer.reduce(terminal.to_string(), &terminal, Some(run_b.clone()), None);
+    assert_eq!(command_for(&mut reducer, &run_b, "command-1"), "");
+}
+
+#[test]
+fn structurally_invalid_known_item_is_visible_and_recovery_continues() {
+    let mut reducer = Reducer::default();
+    let run = run();
+    let malformed = serde_json::json!({
+        "method": "item/agentMessage/delta",
+        "params": {"itemId": "message-1"}
+    });
+    assert!(matches!(
+        reducer.reduce(malformed.to_string(), &malformed, Some(run.clone()), None),
+        Some(HarnessEvent::MalformedNativePayload { .. })
+    ));
+
+    let terminal = serde_json::json!({
+        "method": "turn/completed",
+        "params": {"turn": {"status": "completed"}}
+    });
+    assert!(matches!(
+        reducer.reduce(terminal.to_string(), &terminal, Some(run), None),
+        Some(HarnessEvent::RunTerminal {
+            state: HarnessRunTerminal::Completed,
+            ..
+        })
+    ));
+}
+
 fn run() -> ProviderRunHandle {
+    run_named("turn-golden")
+}
+
+fn run_named(turn: &str) -> ProviderRunHandle {
     ProviderRunHandle::new(
         RuntimeHandle::new("golden-runtime").unwrap(),
         ProviderSessionId::new("thread-golden").unwrap(),
-        ProviderRunId::new("turn-golden").unwrap(),
+        ProviderRunId::new(turn).unwrap(),
     )
+}
+
+fn command_for(reducer: &mut Reducer, run: &ProviderRunHandle, item_id: &str) -> String {
+    let value = serde_json::json!({
+        "method": "item/commandExecution/outputDelta",
+        "params": {"itemId": item_id, "delta": "output"}
+    });
+    match reducer
+        .reduce(value.to_string(), &value, Some(run.clone()), None)
+        .unwrap()
+    {
+        HarnessEvent::CommandOutput { command, .. } => command,
+        event => panic!("expected command output, got {event:?}"),
+    }
 }
 
 fn snapshot(event: HarnessEvent) -> String {

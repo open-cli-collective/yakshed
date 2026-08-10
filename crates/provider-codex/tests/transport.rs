@@ -205,6 +205,204 @@ async fn disconnect_after_turn_start_write_is_outcome_unknown() {
 }
 
 #[tokio::test]
+async fn unsupported_and_malformed_server_requests_are_rejected_and_stream_continues() {
+    let test = adapter("request_boundary", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    test.adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut unknown = false;
+    let mut malformed = false;
+    loop {
+        match next(&mut stream).await {
+            HarnessEvent::Unknown { item_type, .. } if item_type == "codex/future/request" => {
+                unknown = true;
+            }
+            HarnessEvent::MalformedNativePayload { item_type, .. }
+                if item_type == "item/tool/requestUserInput" =>
+            {
+                malformed = true;
+            }
+            HarnessEvent::RunTerminal { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(unknown);
+    assert!(malformed);
+}
+
+#[tokio::test]
+async fn unknown_run_identity_never_projects_or_registers_an_approval() {
+    let test = adapter("uncorrelated_identity", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    test.adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut uncorrelated = false;
+    loop {
+        match next(&mut stream).await {
+            HarnessEvent::Unknown {
+                run: None,
+                item_type,
+                ..
+            } if item_type == "item/agentMessage/delta" => uncorrelated = true,
+            HarnessEvent::MessageDelta { .. } | HarnessEvent::ApprovalRequested { .. } => {
+                panic!("uncorrelated provider data was projected onto the active run")
+            }
+            HarnessEvent::RunTerminal { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(uncorrelated);
+}
+
+#[tokio::test]
+async fn structurally_malformed_notification_is_visible_before_terminal() {
+    let test = adapter("structural_malformed", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    test.adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::MalformedNativePayload { .. }
+    ));
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal { .. }
+    ));
+}
+
+#[tokio::test]
+async fn failed_provider_response_is_uncertain_and_never_resent() {
+    let test = adapter("response_disconnect", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    test.adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    let request = match next(&mut stream).await {
+        HarnessEvent::ApprovalRequested { request, .. } => request,
+        event => panic!("expected approval, got {event:?}"),
+    };
+    let response = ProviderResponse::Approval(ApprovalDecision::Approved);
+    assert!(matches!(
+        test.adapter
+            .respond_to_request(request.clone(), response.clone())
+            .await,
+        Err(HarnessError::OutcomeUnknown {
+            operation: "provider/request/respond"
+        })
+    ));
+    assert!(matches!(
+        test.adapter.respond_to_request(request, response).await,
+        Err(HarnessError::OutcomeUnknown {
+            operation: "provider/request/respond"
+        })
+    ));
+    test.adapter.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_settles_runs_mutations_and_provider_requests_before_acknowledging() {
+    let test = adapter("shutdown_settlement", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    test.adapter
+        .start_run(
+            &session,
+            HarnessInput::new("first").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    let approval = loop {
+        if let HarnessEvent::ApprovalRequested { request, .. } = next(&mut stream).await {
+            break request;
+        }
+    };
+
+    let second = test.adapter.start_run(
+        &session,
+        HarnessInput::new("second").unwrap(),
+        RunOptions::default(),
+    );
+    tokio::pin!(second);
+    loop {
+        tokio::select! {
+            result = &mut second => panic!("second turn unexpectedly settled: {result:?}"),
+            event = next(&mut stream) => {
+                if matches!(event, HarnessEvent::Unknown { ref item_type, .. } if item_type == "test/secondTurnReceived") {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (shutdown, second) = tokio::join!(test.adapter.shutdown(), &mut second);
+    shutdown.unwrap();
+    assert!(matches!(
+        second,
+        Err(HarnessError::OutcomeUnknown {
+            operation: "turn/start"
+        })
+    ));
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal { .. }
+    ));
+    assert!(matches!(
+        test.adapter
+            .respond_to_request(
+                approval,
+                ProviderResponse::Approval(ApprovalDecision::Approved)
+            )
+            .await,
+        Err(HarnessError::NotFound {
+            entity: "provider request",
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn declined_approval_uses_the_pinned_response_shape() {
     let test = adapter("approval_declined", 1024 * 1024, None);
     let mut stream = test.adapter.subscribe().unwrap();

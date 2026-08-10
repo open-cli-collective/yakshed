@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import threading
 
 
 SCENARIO = sys.argv[1]
@@ -16,6 +17,7 @@ if len(sys.argv) > 3:
 threads = []
 initialized = False
 active = None
+boundary_errors = set()
 
 
 def encoded(value):
@@ -121,7 +123,7 @@ def run_events():
                 },
             ]
         )
-    elif SCENARIO in ("approval", "approval_declined"):
+    elif SCENARIO in ("approval", "approval_declined", "shutdown_settlement"):
         emit_batch(
             [
                 {
@@ -141,6 +143,64 @@ def run_events():
                 },
             ]
         )
+    elif SCENARIO == "response_disconnect":
+        emit(
+            {
+                "id": "request-0001",
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    **common,
+                    "itemId": "command-1",
+                    "startedAtMs": 1,
+                    "command": "cargo test",
+                },
+            }
+        )
+        os.close(0)
+        threading.Event().wait()
+    elif SCENARIO == "request_boundary":
+        emit_batch(
+            [
+                {
+                    "id": "unknown-request",
+                    "method": "codex/future/request",
+                    "params": common,
+                },
+                {
+                    "id": "malformed-request",
+                    "method": "item/tool/requestUserInput",
+                    "params": {**common, "itemId": "input-1"},
+                },
+            ]
+        )
+    elif SCENARIO == "uncorrelated_identity":
+        unknown = {"threadId": "thread-unknown", "turnId": "turn-unknown"}
+        emit_batch(
+            [
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {**unknown, "itemId": "message-1", "delta": "wrong-run"},
+                },
+                {
+                    "id": "uncorrelated-approval",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        **unknown,
+                        "itemId": "command-1",
+                        "startedAtMs": 1,
+                        "command": "danger",
+                    },
+                },
+            ]
+        )
+    elif SCENARIO == "structural_malformed":
+        emit(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {**common, "itemId": "message-1"},
+            }
+        )
+        terminal()
     elif SCENARIO == "user_input":
         emit(
             {
@@ -264,6 +324,14 @@ for line in sys.stdin:
             selected = next(item for item in threads if item["id"] == message["params"]["threadId"])
             emit({"id": request_id, "result": {"thread": selected}})
         elif method == "turn/start":
+            if SCENARIO == "shutdown_settlement" and active is not None:
+                emit(
+                    {
+                        "method": "test/secondTurnReceived",
+                        "params": {"threadId": active[0], "turnId": active[1]},
+                    }
+                )
+                continue
             active = (message["params"]["threadId"], "turn-1")
             if SCENARIO == "early_before_ack":
                 sys.exit(0)
@@ -309,5 +377,17 @@ for line in sys.stdin:
                     }
                 )
                 terminal()
+        elif SCENARIO == "request_boundary" and request_id in (
+            "unknown-request",
+            "malformed-request",
+        ):
+            expected = -32601 if request_id == "unknown-request" else -32602
+            assert message["error"]["code"] == expected
+            boundary_errors.add(request_id)
+            if len(boundary_errors) == 2:
+                terminal()
+        elif SCENARIO == "uncorrelated_identity" and request_id == "uncorrelated-approval":
+            assert message["error"]["code"] == -32602
+            terminal()
         else:
             emit({"id": request_id, "error": {"code": -32601, "message": "unknown method"}})
