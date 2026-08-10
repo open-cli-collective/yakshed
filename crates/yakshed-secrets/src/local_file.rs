@@ -82,6 +82,9 @@ enum LocalFileSecurityProblem {
     ParentNotDirectory,
     ParentWritable,
     ParentOwner,
+    AncestorNotDirectory,
+    AncestorWritable,
+    AncestorOwner,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -198,6 +201,7 @@ impl LocalFileState {
         let path = canonical_store_path(&self.configured_path).map_err(|error| {
             map_io_error(&self.id, "failed to initialize local secret store", error)
         })?;
+        validate_parent(&path, &self.id)?;
         let value = Arc::new(InitializedLocalFile {
             lock: shared_file_lock(&path),
             path,
@@ -537,13 +541,27 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
     let parent = path
         .parent()
         .ok_or_else(|| insecure(backend, LocalFileSecurityProblem::ParentNotDirectory))?;
-    let metadata = fs::metadata(parent).map_err(|error| {
-        map_io_error(
-            backend,
-            "failed to inspect local secret store parent",
-            error,
-        )
-    })?;
+    let metadata = match fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Err(insecure(
+                backend,
+                LocalFileSecurityProblem::ParentNotDirectory,
+            ));
+        }
+        Err(error) => {
+            return Err(map_io_error(
+                backend,
+                "failed to inspect local secret store parent",
+                error,
+            ));
+        }
+    };
     if !metadata.is_dir() {
         return Err(insecure(
             backend,
@@ -556,6 +574,58 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
     }
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(insecure(backend, LocalFileSecurityProblem::ParentWritable));
+    }
+    validate_ancestor_chain(parent, backend)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_ancestor_chain(parent: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for ancestor in parent
+        .ancestors()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let metadata = match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Err(insecure(
+                    backend,
+                    LocalFileSecurityProblem::AncestorNotDirectory,
+                ));
+            }
+            Err(error) => {
+                return Err(map_io_error(
+                    backend,
+                    "failed to inspect local secret store ancestor",
+                    error,
+                ));
+            }
+        };
+        if !metadata.is_dir() {
+            return Err(insecure(
+                backend,
+                LocalFileSecurityProblem::AncestorNotDirectory,
+            ));
+        }
+        if !ancestor_owner_is_trusted(metadata.uid(), effective_uid()) {
+            return Err(insecure(backend, LocalFileSecurityProblem::AncestorOwner));
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(insecure(
+                backend,
+                LocalFileSecurityProblem::AncestorWritable,
+            ));
+        }
     }
     Ok(())
 }
@@ -627,6 +697,11 @@ fn open_validated_store_if_present(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const fn owned_by_effective_uid(owner: u32, effective_uid: u32) -> bool {
     owner == effective_uid
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const fn ancestor_owner_is_trusted(owner: u32, effective_uid: u32) -> bool {
+    owner == 0 || owner == effective_uid
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -751,6 +826,15 @@ fn insecure(backend: &SecretBackendId, problem: LocalFileSecurityProblem) -> Sec
         }
         LocalFileSecurityProblem::ParentOwner => {
             "make the effective user the owner of the local secret store directory"
+        }
+        LocalFileSecurityProblem::AncestorNotDirectory => {
+            "use only directories in the local secret store ancestor chain"
+        }
+        LocalFileSecurityProblem::AncestorWritable => {
+            "remove group and other write permissions from the local secret store ancestor chain"
+        }
+        LocalFileSecurityProblem::AncestorOwner => {
+            "make root or the effective user the owner of every local secret store ancestor"
         }
     };
     SecretError::LockedOrDenied {
@@ -941,10 +1025,15 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use yakshed_domain::{ConnectionId, CredentialSlot, OperationId};
 
     const CANARY: &str = "local-file-canary-41c49f1a";
+
+    fn tempdir() -> io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .prefix(".yakshed-secrets-test-")
+            .tempdir_in(std::env::current_dir()?)
+    }
 
     fn config(id: &str, path: &Path) -> SecretBackend {
         SecretBackend {
@@ -1306,6 +1395,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_writable_intermediate_ancestor_is_rejected() {
+        assert_writable_intermediate_ancestor_is_rejected(0o720).await;
+    }
+
+    #[tokio::test]
+    async fn other_writable_intermediate_ancestor_is_rejected() {
+        assert_writable_intermediate_ancestor_is_rejected(0o702).await;
+    }
+
+    async fn assert_writable_intermediate_ancestor_is_rejected(mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let intermediate = temp.path().join("mutable");
+        let parent = intermediate.join("private");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&intermediate, fs::Permissions::from_mode(mode)).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let backend =
+            LocalFileBackend::from_config(&config("dev-local", &parent.join("secrets.json")))
+                .unwrap();
+
+        let Err(SecretError::LockedOrDenied {
+            remediation: Some(remediation),
+            ..
+        }) = backend.probe().await
+        else {
+            panic!("mutable intermediate ancestor must be rejected")
+        };
+        assert!(remediation.contains("ancestor"), "{remediation}");
+    }
+
+    #[tokio::test]
     async fn permission_denied_read_maps_to_locked_or_denied_without_leaking_values() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1469,11 +1591,12 @@ mod tests {
             temp.path().join("a/b"),
             temp.path().join("a/b/c"),
         ];
-        LocalFileBackend::from_config(&config("dev-local", &ancestors[2].join("store.json")))
-            .unwrap()
-            .probe()
-            .await
-            .unwrap();
+        let backend =
+            LocalFileBackend::from_config(&config("dev-local", &ancestors[2].join("store.json")))
+                .unwrap();
+        backend.probe().await.unwrap();
+        let initialized = backend.state.initialized().unwrap();
+        validate_parent(&initialized.path, &backend.state.id).unwrap();
 
         for ancestor in ancestors {
             assert_eq!(
@@ -1555,6 +1678,13 @@ mod tests {
     fn ownership_predicate_rejects_a_foreign_uid() {
         assert!(owned_by_effective_uid(501, 501));
         assert!(!owned_by_effective_uid(502, 501));
+    }
+
+    #[test]
+    fn ancestor_ownership_predicate_accepts_only_root_or_effective_uid() {
+        assert!(ancestor_owner_is_trusted(0, 501));
+        assert!(ancestor_owner_is_trusted(501, 501));
+        assert!(!ancestor_owner_is_trusted(502, 501));
     }
 
     #[tokio::test]
