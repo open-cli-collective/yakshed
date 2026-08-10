@@ -617,6 +617,7 @@ fn validate_ancestor_chain(parent: &Path, backend: &SecretBackendId) -> Result<(
                 LocalFileSecurityProblem::AncestorNotDirectory,
             ));
         }
+        validate_no_extended_acl(ancestor, backend)?;
         if !ancestor_owner_is_trusted(metadata.uid(), effective_uid()) {
             return Err(insecure(backend, LocalFileSecurityProblem::AncestorOwner));
         }
@@ -1029,10 +1030,18 @@ mod tests {
 
     const CANARY: &str = "local-file-canary-41c49f1a";
 
+    #[cfg(target_os = "macos")]
     fn tempdir() -> io::Result<tempfile::TempDir> {
+        tempfile::tempdir()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tempdir() -> io::Result<tempfile::TempDir> {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "test home is unavailable"))?;
         tempfile::Builder::new()
             .prefix(".yakshed-secrets-test-")
-            .tempdir_in(std::env::current_dir()?)
+            .tempdir_in(home)
     }
 
     fn config(id: &str, path: &Path) -> SecretBackend {
@@ -1104,6 +1113,25 @@ mod tests {
             backend.resolve(&locator, &context()).await,
             Err(SecretError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn isolated_tempdir_ancestor_chain_is_trusted() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFileBackend::from_config(&config(
+            "dev-local",
+            &temp.path().join("store/secrets.json"),
+        ))
+        .unwrap();
+
+        backend.probe().await.unwrap();
+        let initialized = backend.state.initialized().unwrap();
+        validate_parent(&initialized.path, &backend.state.id).unwrap();
+        assert!(
+            initialized
+                .path
+                .starts_with(fs::canonicalize(temp.path()).unwrap())
+        );
     }
 
     #[tokio::test]
@@ -1547,6 +1575,48 @@ mod tests {
             return false;
         }
         true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_test_acl(path: &Path) -> bool {
+        add_macos_acl(path);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_test_acl(path: &Path) -> bool {
+        add_linux_posix_acl(path)
+    }
+
+    #[tokio::test]
+    async fn intermediate_ancestor_acl_is_rejected_without_exposing_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let intermediate = temp.path().join("intermediate");
+        let parent = intermediate.join("private");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&intermediate, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("secrets.json");
+        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+        let locator = SecretLocator::new("acl-ancestor").unwrap();
+        backend
+            .put(
+                &locator,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+            )
+            .await
+            .unwrap();
+        if !add_test_acl(&intermediate) {
+            return;
+        }
+
+        let Err(error) = backend.resolve(&locator, &context()).await else {
+            panic!("ACL-bearing intermediate ancestor must be rejected")
+        };
+        assert_acl_rejected(error, &intermediate);
     }
 
     #[cfg(target_os = "linux")]
