@@ -216,6 +216,7 @@ impl LocalFileState {
             store,
             &self.id,
             || Ok(()),
+            AtomicWriteFile::commit,
             || {
                 #[cfg(test)]
                 if self
@@ -780,9 +781,14 @@ fn claim_or_validate_with_hook(
                 backend_id: backend.clone(),
                 secrets: HashMap::new(),
             };
-            write_store(path, &store, backend, before_commit, || {
-                validate_store_if_present(path, backend)
-            })
+            write_store(
+                path,
+                &store,
+                backend,
+                before_commit,
+                AtomicWriteFile::commit,
+                || validate_store_if_present(path, backend),
+            )
         }
         Err(error) => Err(map_io_error(
             backend,
@@ -798,9 +804,10 @@ fn write_store(
     store: &LocalFileStore,
     backend: &SecretBackendId,
     before_commit: impl FnOnce() -> io::Result<()>,
+    commit: impl FnOnce(AtomicWriteFile) -> io::Result<()>,
     post_commit_validation: impl FnOnce() -> Result<(), SecretError>,
 ) -> Result<(), SecretError> {
-    write_store_with_hooks(path, store, before_commit, sync_directory)
+    write_store_with_hooks(path, store, before_commit, commit, sync_directory)
         .map_err(|error| map_write_error(backend, error))?;
     post_commit_validation().map_err(|_| SecretError::UncertainWrite {
         backend: backend.clone(),
@@ -834,7 +841,7 @@ fn read_store(path: &Path, backend: &SecretBackendId) -> Result<LocalFileStore, 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 enum WriteStoreError {
     BeforeCommit,
-    AfterCommit,
+    Uncertain,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -842,6 +849,7 @@ fn write_store_with_hooks(
     path: &Path,
     store: &LocalFileStore,
     before_commit: impl FnOnce() -> io::Result<()>,
+    commit: impl FnOnce(AtomicWriteFile) -> io::Result<()>,
     after_commit: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), WriteStoreError> {
     let mut file = private_atomic_file(path).map_err(|_| WriteStoreError::BeforeCommit)?;
@@ -849,9 +857,9 @@ fn write_store_with_hooks(
     file.write_all(b"\n")
         .map_err(|_| WriteStoreError::BeforeCommit)?;
     before_commit().map_err(|_| WriteStoreError::BeforeCommit)?;
-    file.commit().map_err(|_| WriteStoreError::BeforeCommit)?;
+    commit(file).map_err(|_| WriteStoreError::Uncertain)?;
     after_commit(path.parent().expect("store path has a parent"))
-        .map_err(|_| WriteStoreError::AfterCommit)
+        .map_err(|_| WriteStoreError::Uncertain)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -860,7 +868,7 @@ fn map_write_error(backend: &SecretBackendId, error: WriteStoreError) -> SecretE
         WriteStoreError::BeforeCommit => {
             backend_failure(backend, "failed to write local secret store")
         }
-        WriteStoreError::AfterCommit => SecretError::UncertainWrite {
+        WriteStoreError::Uncertain => SecretError::UncertainWrite {
             backend: backend.clone(),
         },
     }
@@ -1789,11 +1797,38 @@ mod tests {
                 &path,
                 &replacement,
                 || Err(io::Error::other("fault")),
+                AtomicWriteFile::commit,
                 |_| Ok(())
             ),
             Err(WriteStoreError::BeforeCommit)
         ));
         assert_eq!(fs::read(path).unwrap(), previous);
+    }
+
+    #[test]
+    fn commit_stage_failure_is_classified_as_uncertain_write() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("store/secrets.json");
+        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+        let initialized = backend.state.initialized().unwrap();
+        let store = LocalFileStore {
+            format_version: FORMAT_VERSION,
+            backend_id: backend.state.id.clone(),
+            secrets: HashMap::from([("key".to_owned(), CANARY.to_owned())]),
+        };
+
+        assert!(matches!(
+            write_store(
+                &initialized.path,
+                &store,
+                &backend.state.id,
+                || Ok(()),
+                |_| Err(io::Error::other("commit-stage fault")),
+                || Ok(())
+            ),
+            Err(SecretError::UncertainWrite { .. })
+        ));
+        assert!(!initialized.path.exists());
     }
 
     #[test]
@@ -1812,6 +1847,7 @@ mod tests {
             &initialized.path,
             &store,
             || Ok(()),
+            AtomicWriteFile::commit,
             |_| Err(io::Error::other("post-commit fault")),
         )
         .unwrap_err();

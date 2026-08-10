@@ -583,7 +583,8 @@ path = "/Users/example/.local/share/yakshed/dev-secrets.json"
 Backend instances targeting the same canonical file share a process-global lock and an exclusive `flock` on macOS and Linux,
 held for each complete read or read-modify-write operation. Dropping a queued mutation prevents it from starting; dropping one after
 its write begins leaves an uncertain outcome that callers must reconcile before retrying. Reads wait for a contended flock;
-mutations poll the flock non-blockingly so abandonment cancels the wait promptly.
+mutations poll the flock non-blockingly so abandonment cancels the wait promptly. The atomic writer's `commit()` call is the
+uncertainty boundary: any error it returns is an uncertain write because replacement may already have occurred.
 
 Private mode bits are necessary but not sufficient: the store file and its direct parent must also have no extended ACL
 entries. YakShed inspects native extended ACLs on macOS and the POSIX ACL xattrs on Linux before operations and re-checks the
@@ -818,7 +819,10 @@ The UI implications differ:
 | Uncertain write | Re-probe/reconcile before retrying; the value may already be stored |
 | Protocol violation | Mark helper/backend incompatible |
 
-A mutating operation that times out after dispatch may have an uncertain outcome. Re-probe before retrying blindly.
+A mutating operation that times out after dispatch may have an uncertain outcome. For `local-file`, the atomic writer's
+`commit()` call is the uncertainty boundary because it may report an error after replacing the store file; any `commit()`
+error is therefore an uncertain write. Temp-file creation, writing, and syncing failures before `commit()` remain definite
+backend failures. Re-probe before retrying blindly.
 
 ---
 
