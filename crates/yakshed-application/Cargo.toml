@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+time.workspace = true
 yakshed-domain.workspace = true
 
 [dev-dependencies]

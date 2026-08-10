@@ -7,14 +7,28 @@ use uuid::Uuid;
 
 /// Stable identity of a configured connection.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct ConnectionId(Uuid);
 
 impl FromStr for ConnectionId {
-    type Err = uuid::Error;
+    type Err = ValidationError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Uuid::parse_str(value).map(Self)
+        parse_uuid_v7("connection id", value).map(Self)
+    }
+}
+
+impl TryFrom<String> for ConnectionId {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ConnectionId> for String {
+    fn from(value: ConnectionId) -> Self {
+        value.to_string()
     }
 }
 
@@ -62,6 +76,24 @@ impl fmt::Display for ArtifactId {
 #[serde(try_from = "String", into = "String")]
 pub struct WorkItemId(Uuid);
 
+impl WorkItemId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn is_v7(self) -> bool {
+        self.0.get_version_num() == 7
+    }
+}
+
+impl TryFrom<Uuid> for WorkItemId {
+    type Error = ValidationError;
+
+    fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+        validate_uuid_v7("work item id", value).map(Self)
+    }
+}
+
 impl FromStr for WorkItemId {
     type Err = ValidationError;
 
@@ -94,6 +126,24 @@ impl fmt::Display for WorkItemId {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct RunId(Uuid);
+
+impl RunId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn is_v7(self) -> bool {
+        self.0.get_version_num() == 7
+    }
+}
+
+impl TryFrom<Uuid> for RunId {
+    type Error = ValidationError;
+
+    fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+        validate_uuid_v7("run id", value).map(Self)
+    }
+}
 
 impl FromStr for RunId {
     type Err = ValidationError;
@@ -237,6 +287,263 @@ pub struct ArtifactRecord {
     pub byte_len: u64,
     pub media_type: String,
     pub provenance: ArtifactProvenance,
+}
+
+macro_rules! uuid_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(
+            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+        )]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(Uuid);
+
+        impl $name {
+            pub fn new_v7() -> Self {
+                Self(Uuid::now_v7())
+            }
+
+            pub fn is_v7(self) -> bool {
+                self.0.get_version_num() == 7
+            }
+        }
+
+        impl TryFrom<Uuid> for $name {
+            type Error = ValidationError;
+
+            fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+                validate_uuid_v7(stringify!($name), value).map(Self)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = ValidationError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                parse_uuid_v7(stringify!($name), value).map(Self)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = ValidationError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                value.parse()
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.to_string()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+    };
+}
+
+uuid_id!(ProjectId, "Stable identity of a YakShed project.");
+uuid_id!(
+    TimelineBatchId,
+    "Stable identity of a timeline ingestion batch."
+);
+uuid_id!(TimelineItemId, "Stable identity of a timeline item.");
+uuid_id!(ApprovalRequestId, "Stable identity of an approval request.");
+uuid_id!(AuditEventId, "Stable identity of an audit event.");
+
+/// UTC instant represented durably as Unix epoch milliseconds.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct UtcTimestamp(i64);
+
+impl UtcTimestamp {
+    pub const fn from_unix_millis(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn unix_millis(self) -> i64 {
+        self.0
+    }
+}
+
+/// Monotonic cursor for one provider-owned source stream.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct StreamCursor(u64);
+
+impl StreamCursor {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Monotonic display ordinal within one run timeline.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TimelineRevision(u64);
+
+impl TimelineRevision {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Monotonic revision of one durable application aggregate.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DataRevision(u64);
+
+impl DataRevision {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Opaque provider-owned identifier paired with its namespace.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NamespacedProviderId {
+    namespace: String,
+    value: String,
+}
+
+impl NamespacedProviderId {
+    pub fn new(
+        namespace: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, ValidationError> {
+        let namespace = namespace.into();
+        let value = value.into();
+        require_nonempty("provider namespace", &namespace)?;
+        require_nonempty("provider id", &value)?;
+        if namespace.len() > 128 || namespace.chars().any(char::is_control) {
+            return Err(ValidationError("invalid provider namespace".to_owned()));
+        }
+        if value.len() > 4096 || value.chars().any(char::is_control) {
+            return Err(ValidationError("invalid provider id".to_owned()));
+        }
+        Ok(Self { namespace, value })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectSnapshot {
+    pub id: ProjectId,
+    pub name: String,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkItemStatus {
+    Ready,
+    Archived,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemSnapshot {
+    pub id: WorkItemId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub status: WorkItemStatus,
+    pub parent_id: Option<WorkItemId>,
+    pub revision: DataRevision,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunStatus {
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl RunStatus {
+    pub const fn can_transition_to(self, target: Self) -> bool {
+        matches!(
+            (self, target),
+            (
+                Self::Running,
+                Self::Completed | Self::Failed | Self::Interrupted
+            )
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunSnapshot {
+    pub id: RunId,
+    pub connection_id: ConnectionId,
+    pub work_item_id: WorkItemId,
+    pub status: RunStatus,
+    pub provider_id: Option<NamespacedProviderId>,
+    pub created_at: UtcTimestamp,
+    pub ended_at: Option<UtcTimestamp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelineItemSnapshot {
+    pub id: TimelineItemId,
+    pub connection_id: ConnectionId,
+    pub run_id: RunId,
+    pub revision: TimelineRevision,
+    pub kind: String,
+    pub body: String,
+    pub provider_id: Option<NamespacedProviderId>,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecision {
+    Approved,
+    Denied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalStatus {
+    Pending,
+    Responding { decision: ApprovalDecision },
+    Resolved { decision: ApprovalDecision },
+    Voided { decision: Option<ApprovalDecision> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalSnapshot {
+    pub id: ApprovalRequestId,
+    pub connection_id: ConnectionId,
+    pub run_id: RunId,
+    pub provider_id: NamespacedProviderId,
+    pub kind: String,
+    pub summary: String,
+    pub status: ApprovalStatus,
+    pub requested_at: UtcTimestamp,
+    pub response_started_at: Option<UtcTimestamp>,
+    pub resolved_at: Option<UtcTimestamp>,
+    pub voided_at: Option<UtcTimestamp>,
 }
 
 /// A configured harness/model-provider trust boundary.
@@ -589,6 +896,10 @@ fn require_nonempty(field: &'static str, value: &str) -> Result<(), ValidationEr
 fn parse_uuid_v7(field: &'static str, value: &str) -> Result<Uuid, ValidationError> {
     let uuid = Uuid::parse_str(value)
         .map_err(|error| ValidationError(format!("invalid {field}: {error}")))?;
+    validate_uuid_v7(field, uuid)
+}
+
+fn validate_uuid_v7(field: &'static str, uuid: Uuid) -> Result<Uuid, ValidationError> {
     if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
         return Err(ValidationError(format!("{field} must be a UUIDv7")));
     }
@@ -632,6 +943,38 @@ impl Error for ValidationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_owned_ids_are_uuid_v7() {
+        let parsed = Uuid::parse_str(&WorkItemId::new_v7().to_string()).unwrap();
+        assert_eq!(parsed.get_version_num(), 7);
+    }
+
+    #[test]
+    fn app_owned_id_deserialization_rejects_non_v7_uuid() {
+        use serde::Deserialize as _;
+        use serde::de::value::{Error, StrDeserializer};
+
+        let value = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(ConnectionId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
+        assert!(ProjectId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
+        assert!(TimelineBatchId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
+        assert!(ApprovalRequestId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
+    }
+
+    #[test]
+    fn run_state_transition_matrix_is_closed() {
+        for terminal in [
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Interrupted,
+        ] {
+            assert!(RunStatus::Running.can_transition_to(terminal));
+            assert!(!terminal.can_transition_to(RunStatus::Running));
+            assert!(!terminal.can_transition_to(terminal));
+        }
+        assert!(!RunStatus::Running.can_transition_to(RunStatus::Running));
+    }
 
     #[test]
     fn credential_binding_variants_enforce_their_reference_fields() {

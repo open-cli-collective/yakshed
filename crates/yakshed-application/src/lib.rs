@@ -3,9 +3,14 @@
 use std::path::Path;
 use std::{collections::HashSet, error::Error, fmt};
 
+use async_trait::async_trait;
+use thiserror::Error as ThisError;
 use yakshed_domain::{
-    Connection, ConnectionId, CredentialBinding, SecretBackend, SecretBackendId,
-    SecretBackendSettings,
+    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, AuditEventId, Connection, ConnectionId,
+    CredentialBinding, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
+    RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings, StreamCursor,
+    TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
+    WorkItemId, WorkItemSnapshot,
 };
 
 /// Canonical non-secret application configuration.
@@ -284,6 +289,292 @@ pub fn validate_backend_configuration(
             })
         }
     }
+}
+
+pub trait Clock: Send + Sync {
+    fn now(&self) -> UtcTimestamp;
+}
+
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> UtcTimestamp {
+        let now = time::OffsetDateTime::now_utc();
+        UtcTimestamp::from_unix_millis(now.unix_timestamp() * 1_000 + i64::from(now.millisecond()))
+    }
+}
+
+pub trait IdGenerator: Send + Sync {
+    fn next_project_id(&self) -> ProjectId;
+    fn next_work_item_id(&self) -> WorkItemId;
+    fn next_run_id(&self) -> RunId;
+    fn next_timeline_batch_id(&self) -> TimelineBatchId;
+    fn next_timeline_item_id(&self) -> TimelineItemId;
+    fn next_approval_request_id(&self) -> ApprovalRequestId;
+    fn next_audit_event_id(&self) -> AuditEventId;
+}
+
+pub struct SystemIdGenerator;
+
+impl IdGenerator for SystemIdGenerator {
+    fn next_project_id(&self) -> ProjectId {
+        ProjectId::new_v7()
+    }
+
+    fn next_work_item_id(&self) -> WorkItemId {
+        WorkItemId::new_v7()
+    }
+
+    fn next_run_id(&self) -> RunId {
+        RunId::new_v7()
+    }
+
+    fn next_timeline_batch_id(&self) -> TimelineBatchId {
+        TimelineBatchId::new_v7()
+    }
+
+    fn next_timeline_item_id(&self) -> TimelineItemId {
+        TimelineItemId::new_v7()
+    }
+
+    fn next_approval_request_id(&self) -> ApprovalRequestId {
+        ApprovalRequestId::new_v7()
+    }
+
+    fn next_audit_event_id(&self) -> AuditEventId {
+        AuditEventId::new_v7()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateProject {
+    pub id: ProjectId,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectPage {
+    pub items: Vec<ProjectSnapshot>,
+    pub next_after: Option<ProjectId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateWorkItem {
+    pub id: WorkItemId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub parent_id: Option<WorkItemId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListWorkItems {
+    pub project_id: ProjectId,
+    pub after: Option<WorkItemId>,
+    pub limit: u32,
+    pub include_archived: bool,
+}
+
+impl ListWorkItems {
+    pub fn for_project(project_id: ProjectId, limit: u32) -> Self {
+        Self {
+            project_id,
+            after: None,
+            limit,
+            include_archived: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemPage {
+    pub items: Vec<WorkItemSnapshot>,
+    pub next_after: Option<WorkItemId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateRun {
+    pub id: RunId,
+    pub connection_id: ConnectionId,
+    pub work_item_id: WorkItemId,
+    pub provider_run: Option<NamespacedProviderId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransitionRun {
+    pub run_id: RunId,
+    pub expected_current: RunStatus,
+    pub target: RunStatus,
+    pub occurred_at: UtcTimestamp,
+    pub audit_event_id: AuditEventId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunPage {
+    pub items: Vec<RunSnapshot>,
+    pub next_after: Option<RunId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewTimelineItem {
+    pub id: TimelineItemId,
+    pub kind: String,
+    pub body: String,
+    pub provider_id: Option<NamespacedProviderId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelineBatch {
+    pub batch_id: TimelineBatchId,
+    pub connection_id: ConnectionId,
+    pub run_id: RunId,
+    pub source_namespace: String,
+    pub stream_id: String,
+    pub expected_stream_revision: StreamCursor,
+    pub items: Vec<NewTimelineItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListTimeline {
+    pub run_id: RunId,
+    pub after: Option<TimelineRevision>,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelinePage {
+    pub items: Vec<TimelineItemSnapshot>,
+    pub next_after: Option<TimelineRevision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetStreamCursor {
+    pub connection_id: ConnectionId,
+    pub run_id: RunId,
+    pub source_namespace: String,
+    pub stream_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamCursorState {
+    pub cursor: StreamCursor,
+    pub last_batch_id: TimelineBatchId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingApproval {
+    pub id: ApprovalRequestId,
+    pub run_id: RunId,
+    pub provider_id: NamespacedProviderId,
+    pub kind: String,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeginApprovalResponse {
+    pub approval_id: ApprovalRequestId,
+    pub decision: ApprovalDecision,
+    pub audit_event_id: AuditEventId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfirmApprovalResponse {
+    pub approval_id: ApprovalRequestId,
+    pub audit_event_id: AuditEventId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalPage {
+    pub items: Vec<ApprovalSnapshot>,
+    pub next_after: Option<ApprovalRequestId>,
+}
+
+#[derive(Debug, ThisError)]
+pub enum StoreError {
+    #[error("{entity} not found: {id}")]
+    NotFound { entity: &'static str, id: String },
+    #[error("store invariant conflict: {0}")]
+    Conflict(String),
+    #[error("database integrity failure: {0}")]
+    Integrity(String),
+    #[error("database migration failure: {0}")]
+    Migration(String),
+    #[error("database schema {found} is newer than supported schema {supported}")]
+    UnsupportedNewerSchema { found: u32, supported: u32 },
+    #[error("database open failure: {0}")]
+    Open(String),
+    #[error("database backend failure: {0}")]
+    Backend(String),
+    #[error("database store is shut down")]
+    Closed,
+}
+
+/// Application-shaped durable state operations; implementations expose no storage handles.
+/// Create operations are idempotent by supplied ID when immutable command content matches.
+#[async_trait]
+pub trait AppStore: Send + Sync {
+    async fn create_project(&self, command: CreateProject) -> Result<ProjectSnapshot, StoreError>;
+    async fn list_projects(
+        &self,
+        after: Option<ProjectId>,
+        limit: u32,
+    ) -> Result<ProjectPage, StoreError>;
+    async fn create_work_item(
+        &self,
+        command: CreateWorkItem,
+    ) -> Result<WorkItemSnapshot, StoreError>;
+    async fn get_work_item(&self, id: WorkItemId) -> Result<WorkItemSnapshot, StoreError>;
+    async fn list_work_items(&self, query: ListWorkItems) -> Result<WorkItemPage, StoreError>;
+    async fn archive_work_subtree(&self, root: WorkItemId) -> Result<u64, StoreError>;
+    async fn create_run(&self, command: CreateRun) -> Result<RunSnapshot, StoreError>;
+    async fn get_run(&self, id: RunId) -> Result<RunSnapshot, StoreError>;
+    async fn transition_run(&self, command: TransitionRun) -> Result<RunSnapshot, StoreError>;
+    async fn list_runs_for_work_item(
+        &self,
+        work_item_id: WorkItemId,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError>;
+    async fn list_active_runs(
+        &self,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError>;
+    async fn append_timeline_batch(&self, batch: TimelineBatch)
+    -> Result<StreamCursor, StoreError>;
+    async fn get_stream_cursor(
+        &self,
+        query: GetStreamCursor,
+    ) -> Result<Option<StreamCursorState>, StoreError>;
+    async fn list_timeline_page(&self, query: ListTimeline) -> Result<TimelinePage, StoreError>;
+    async fn record_pending_approval(
+        &self,
+        approval: PendingApproval,
+    ) -> Result<ApprovalSnapshot, StoreError>;
+    async fn list_pending_approvals(
+        &self,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError>;
+    async fn list_approvals_for_run(
+        &self,
+        run_id: RunId,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError>;
+    async fn begin_approval_response(
+        &self,
+        response: BeginApprovalResponse,
+    ) -> Result<ApprovalSnapshot, StoreError>;
+    async fn confirm_approval_response(
+        &self,
+        response: ConfirmApprovalResponse,
+    ) -> Result<ApprovalSnapshot, StoreError>;
+    async fn list_unconfirmed_approval_responses(
+        &self,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+    ) -> Result<ApprovalPage, StoreError>;
+    async fn shutdown(&self) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]

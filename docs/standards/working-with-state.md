@@ -380,7 +380,7 @@ Repository methods should be application-shaped, not one generic CRUD interface 
 #[async_trait::async_trait]
 pub trait AppStore: Send + Sync {
     async fn create_work_item(&self, command: CreateWorkItem) -> Result<WorkItemSnapshot, StoreError>;
-    async fn append_timeline_batch(&self, batch: TimelineBatch) -> Result<ProjectionRevision, StoreError>;
+    async fn append_timeline_batch(&self, batch: TimelineBatch) -> Result<StreamCursor, StoreError>;
     async fn record_pending_approval(&self, approval: PendingApprovalRecord) -> Result<(), StoreError>;
     async fn resolve_approval(&self, resolution: ApprovalResolutionRecord) -> Result<(), StoreError>;
 }
