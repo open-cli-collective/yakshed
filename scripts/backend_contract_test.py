@@ -444,6 +444,14 @@ def run_contract(args: argparse.Namespace, root: Path, canaries: CanarySet) -> N
         listed = host.request("connection.list")
         connections = listed.get("connections")
         require(isinstance(connections, list) and len(connections) == 3, "expected 3 connections")
+        delegated = host.request("connection.get", {"connection_id": HOME_ID})
+        delegated_credentials = delegated.get("connection", {}).get("credentials", [])
+        require(
+            delegated_credentials
+            and delegated_credentials[0].get("status") == "delegated"
+            and delegated_credentials[0].get("delivery") == {"kind": "harness_managed"},
+            "delegated harness-managed delivery was not preserved",
+        )
 
         host.request(
             "secret.put",
@@ -543,6 +551,44 @@ def run_contract(args: argparse.Namespace, root: Path, canaries: CanarySet) -> N
             require(probe.get("matched") is True, f"credential probe failed for {slot}")
             require(probe.get("forbidden_present") == [], f"forbidden variables reached {slot} probe")
 
+        sleeping_probe = root / "sleeping_probe.py"
+        sleeping_pid = root / "sleeping_probe.pid"
+        sleeping_probe.write_text(
+            "import pathlib,subprocess,sys\n"
+            "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n",
+            encoding="utf-8",
+        )
+        host.request_error(
+            "runtime.credential_probe",
+            "timeout",
+            {
+                "connection_id": WORK_ID,
+                "slot": "anthropic.api_key",
+                "probe_program": sys.executable,
+                "probe_args": [str(sleeping_probe), str(sleeping_pid)],
+                "expected_sha256": canaries.digest("work credential"),
+                "forbidden_variables": [],
+            },
+        )
+        probe_pid = int(sleeping_pid.read_text(encoding="utf-8"))
+        reap_deadline = time.monotonic() + 2
+        while True:
+            try:
+                os.kill(probe_pid, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() >= reap_deadline:
+                raise ContractFailure("timed-out credential probe group remained alive")
+            time.sleep(0.01)
+        expect_status(host, WORK_LOCATOR, "present")
+
+        config_text = (root / "config" / "config.toml").read_text(encoding="utf-8")
+        require(
+            "delivery" not in config_text,
+            "adapter-owned credential delivery leaked into canonical config",
+        )
+
         scan_tree_for_canaries(root, canaries)
         host.shutdown()
 
@@ -565,6 +611,26 @@ def run_contract(args: argparse.Namespace, root: Path, canaries: CanarySet) -> N
                 "overwrite": False,
             },
         )
+        persisted = host.request("connection.get", {"connection_id": WORK_ID})
+        credentials = persisted.get("connection", {}).get("credentials", [])
+        require(
+            credentials
+            and credentials[0].get("delivery")
+            == {"kind": "process_environment", "variable": "ANTHROPIC_API_KEY"},
+            "credential delivery metadata did not survive restart",
+        )
+        restarted_probe = host.request(
+            "runtime.credential_probe",
+            {
+                "connection_id": WORK_ID,
+                "slot": "anthropic.api_key",
+                "probe_program": sys.executable,
+                "probe_args": [str(fake_harness)],
+                "expected_sha256": canaries.digest("work credential"),
+                "forbidden_variables": ["OPENAI_API_KEY", "FIREWORKS_API_KEY"],
+            },
+        )
+        require(restarted_probe.get("matched") is True, "credential probe failed after restart")
         reset = host.request("config.reset")
         reset_revision = reset.get("config_revision")
         require(isinstance(reset_revision, int), "config.reset omitted revision")

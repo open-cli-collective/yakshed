@@ -127,6 +127,11 @@ pub struct ConfigSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigChange {
     PutConnection(Connection),
+    /// Atomically registers the backends required by a connection and stores the connection.
+    PutConnectionWithSecretBackends {
+        connection: Connection,
+        secret_backends: Vec<SecretBackend>,
+    },
     RemoveConnection(ConnectionId),
     PutSecretBackend(SecretBackend),
     RemoveSecretBackend(SecretBackendId),

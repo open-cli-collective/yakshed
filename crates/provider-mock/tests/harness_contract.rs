@@ -4,7 +4,8 @@ mod contract_suite;
 use contract_suite::{ContractScenario, HarnessContractFixture};
 use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
 use yakshed_harness::{
-    HarnessCapabilities, ProviderRequestId, RuntimeHandle, RuntimePath, StartSessionSpec,
+    HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery, ProviderRequestId,
+    RuntimeHandle, RuntimePath, StartSessionSpec,
 };
 
 struct MockFixture {
@@ -32,6 +33,24 @@ fn capabilities() -> HarnessCapabilities {
         account_ui: false,
         model_discovery: true,
     }
+}
+
+#[test]
+fn mock_declares_credential_delivery_per_slot() {
+    let mock = MockHarness::new(capabilities(), Vec::new(), None);
+    let requirements = mock.credential_requirements();
+
+    assert!(requirements.iter().any(|requirement| {
+        requirement.slot.as_str() == "codex.account"
+            && requirement.delivery == HarnessCredentialDelivery::HarnessManaged
+    }));
+    assert!(requirements.iter().any(|requirement| {
+        requirement.slot.as_str() == "anthropic.api_key"
+            && requirement.delivery
+                == HarnessCredentialDelivery::ProcessEnvironment {
+                    variable: "ANTHROPIC_API_KEY".to_owned(),
+                }
+    }));
 }
 
 impl HarnessContractFixture for MockFixture {

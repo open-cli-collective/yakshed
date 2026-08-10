@@ -6,14 +6,14 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(test)]
 use tokio::sync::oneshot;
-use yakshed_domain::ConnectionId;
+use yakshed_domain::{ConnectionId, CredentialSlot};
 use yakshed_harness::{
-    HarnessAdapter, HarnessCapabilities, HarnessDescriptor, HarnessError, HarnessEvent,
-    HarnessEventPermit, HarnessEventSender, HarnessInput, HarnessRunTerminal, NativePayload, Page,
-    ProviderEventStream, ProviderRequestHandle, ProviderRequestId, ProviderResponse,
-    ProviderRunHandle, ProviderRunId, ProviderSession, ProviderSessionId, ProviderSessionSummary,
-    RunOptions, RuntimeHandle, SanitizedDiagnostic, SessionPageCursor, SessionQuery,
-    StartSessionSpec, event_channel,
+    HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery, HarnessCredentialRequirement,
+    HarnessDescriptor, HarnessError, HarnessEvent, HarnessEventPermit, HarnessEventSender,
+    HarnessInput, HarnessRunTerminal, NativePayload, Page, ProviderEventStream,
+    ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle, ProviderRunId,
+    ProviderSession, ProviderSessionId, ProviderSessionSummary, RunOptions, RuntimeHandle,
+    SanitizedDiagnostic, SessionPageCursor, SessionQuery, StartSessionSpec, event_channel,
 };
 
 /// Deterministic run/runtime faults. `DelayApproval` is released manually rather than by sleep.
@@ -843,6 +843,30 @@ impl HarnessAdapter for MockHarness {
             name: "Deterministic Mock Harness".to_owned(),
             version: "1".to_owned(),
         }
+    }
+
+    fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement> {
+        [
+            ("codex.account", HarnessCredentialDelivery::HarnessManaged),
+            (
+                "anthropic.api_key",
+                HarnessCredentialDelivery::ProcessEnvironment {
+                    variable: "ANTHROPIC_API_KEY".to_owned(),
+                },
+            ),
+            (
+                "fireworks.api_key",
+                HarnessCredentialDelivery::ProcessEnvironment {
+                    variable: "FIREWORKS_API_KEY".to_owned(),
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(slot, delivery)| HarnessCredentialRequirement {
+            slot: CredentialSlot::new(slot).expect("mock requirement slot is valid"),
+            delivery,
+        })
+        .collect()
     }
 
     async fn capabilities(
