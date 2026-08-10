@@ -797,8 +797,10 @@ name = "yakshed-secrets"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "atomic-write-file",
  "secrecy",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "yakshed-domain",

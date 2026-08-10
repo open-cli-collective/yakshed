@@ -19,10 +19,15 @@ use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, CredentialResolution, CredentialStatus,
     DeleteSecretOutcome, InvalidBindingReason, MemorySecretBackend, MemorySecretFault,
     PutSecretOptions, PutSecretOutcome, ResolvedSecret, SecretAccessContext, SecretAccessPurpose,
-    SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackendDescriptor,
+    SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackend, SecretBackendDescriptor,
     SecretBackendHandle, SecretBackendId, SecretBackendStatus, SecretError, SecretLocator,
     SecretOperation, SecretReference, SecretResolver, shape_process_environment,
 };
+
+#[cfg(feature = "dev-secrets")]
+use yakshed_secrets::LocalFileBackend;
+#[cfg(not(feature = "dev-secrets"))]
+use yakshed_secrets::{SecretBackendConfigurationError, validate_backend_configuration};
 
 const CONNECTION_A: &str = "0193f26e-7a72-7d42-bf77-0de14c4cc111";
 const CONNECTION_B: &str = "0193f26e-7a72-7d42-bf77-0de14c4cc222";
@@ -106,6 +111,87 @@ fn domain_reference_values_reject_unsafe_input() {
     assert!(SecretLocator::new("x".repeat(4097)).is_err());
     assert!(SecretBackendId::new("bad backend").is_err());
     assert_eq!(locator("opaque/path").as_str(), "opaque/path");
+}
+
+#[cfg(not(feature = "dev-secrets"))]
+#[test]
+fn local_file_config_requires_dev_secrets_feature() {
+    let config = SecretBackend {
+        id: backend_id("dev-local"),
+        kind: "local-file".to_owned(),
+        account: None,
+        path: Some("/tmp/yakshed-dev-secrets.json".to_owned()),
+    };
+
+    let error = validate_backend_configuration(&config).unwrap_err();
+    assert!(matches!(
+        error,
+        SecretBackendConfigurationError::MissingFeature {
+            feature: "dev-secrets",
+            ..
+        }
+    ));
+    assert!(error.to_string().contains("dev-secrets"));
+}
+
+#[cfg(feature = "dev-secrets")]
+#[tokio::test]
+async fn local_file_read_only_rejection_is_audited() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = SecretBackend {
+        id: backend_id("dev-local"),
+        kind: "local-file".to_owned(),
+        account: None,
+        path: Some(
+            temp.path()
+                .join("store/secrets.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    };
+    let backend = Arc::new(LocalFileBackend::from_config(&config).unwrap());
+    let connections = [connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "dev-local", "a/key")],
+    )];
+    let audit = Arc::new(AuditLog::default());
+    let broker = CredentialBroker::new(
+        [(
+            backend_id("dev-local"),
+            SecretBackendHandle {
+                resolver: backend,
+                administrator: None,
+            },
+        )],
+        &connections,
+        audit.clone(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let context = context(CONNECTION_A, "provider.api_key", "request-local-read-only");
+
+    assert!(matches!(
+        broker
+            .put(
+                &connections,
+                &connections[0].credentials[0],
+                &context,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+                &BrokerCancellation::default(),
+            )
+            .await,
+        Err(SecretError::UnsupportedOperation {
+            operation: SecretOperation::Put,
+            ..
+        })
+    ));
+    assert!(audit.0.lock().unwrap().iter().any(|event| {
+        event.operation == SecretOperation::Put
+            && event.outcome == yakshed_secrets::SecretAuditOutcome::Failed
+            && event.backend.as_ref() == Some(&backend_id("dev-local"))
+    }));
 }
 
 #[tokio::test]

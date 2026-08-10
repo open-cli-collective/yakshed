@@ -560,6 +560,24 @@ Before adoption, a spike must establish:
 
 SecretSpec is an implementation option, not the YakShed product model.
 
+### 9.7 `local-file`
+
+An explicit plaintext developer-convenience store for long-running local development without repeated OS-keychain prompts.
+
+```toml
+[[secret_backends]]
+id = "dev-local"
+kind = "local-file"
+path = "/Users/example/.local/share/yakshed/dev-secrets.json"
+```
+
+- compiled only with the non-default `dev-secrets` Cargo feature;
+- allowed only for deliberate development builds and never auto-selected or used as a fallback;
+- refused with a typed configuration error naming the missing feature when ordinary builds reference it;
+- stores plaintext secrets in a private local file and is not suitable for release configuration.
+
+The future development launch script must pass `--features dev-secrets`, mirroring Retune's `build-install.sh` pattern.
+
 ---
 
 ## 10. Backend registration and selection

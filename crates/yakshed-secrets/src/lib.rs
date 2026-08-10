@@ -1,6 +1,8 @@
 //! Secret contracts, an isolated memory backend, and credential brokering.
 
 mod broker;
+#[cfg(feature = "dev-secrets")]
+mod local_file;
 mod memory;
 
 use std::{error::Error, fmt, sync::Arc};
@@ -9,14 +11,81 @@ use async_trait::async_trait;
 use secrecy::SecretString;
 use time::OffsetDateTime;
 pub use yakshed_domain::{
-    ConnectionId, CredentialSlot, OperationId, SecretBackendId, SecretLocator, SecretReference,
+    ConnectionId, CredentialSlot, OperationId, SecretBackend, SecretBackendId, SecretLocator,
+    SecretReference,
 };
 
 pub use broker::{
     BrokerCancellation, ChildProcessEnvironment, CredentialBroker, CredentialResolution,
     CredentialStatus, shape_process_environment,
 };
+#[cfg(feature = "dev-secrets")]
+pub use local_file::LocalFileBackend;
 pub use memory::{MemorySecretBackend, MemorySecretFault};
+
+pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
+pub const DEV_SECRETS_FEATURE: &str = "dev-secrets";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecretBackendConfigurationError {
+    MissingFeature {
+        backend: SecretBackendId,
+        feature: &'static str,
+    },
+    MissingPath {
+        backend: SecretBackendId,
+    },
+    WrongKind {
+        backend: SecretBackendId,
+    },
+}
+
+impl fmt::Display for SecretBackendConfigurationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingFeature { backend, feature } => write!(
+                formatter,
+                "secret backend {backend} requires cargo feature {feature}"
+            ),
+            Self::MissingPath { backend } => {
+                write!(formatter, "secret backend {backend} requires a path")
+            }
+            Self::WrongKind { backend } => {
+                write!(formatter, "secret backend {backend} is not local-file")
+            }
+        }
+    }
+}
+
+impl Error for SecretBackendConfigurationError {}
+
+/// Rejects configured backend kinds that are unavailable in this build.
+///
+/// Application composition must call this for every configured backend before registration.
+pub fn validate_backend_configuration(
+    backend: &SecretBackend,
+) -> Result<(), SecretBackendConfigurationError> {
+    if backend.kind != LOCAL_FILE_BACKEND_KIND {
+        return Ok(());
+    }
+    #[cfg(not(feature = "dev-secrets"))]
+    return Err(SecretBackendConfigurationError::MissingFeature {
+        backend: backend.id.clone(),
+        feature: DEV_SECRETS_FEATURE,
+    });
+    #[cfg(feature = "dev-secrets")]
+    if backend
+        .path
+        .as_deref()
+        .is_none_or(|path| path.trim().is_empty())
+    {
+        return Err(SecretBackendConfigurationError::MissingPath {
+            backend: backend.id.clone(),
+        });
+    }
+    #[cfg(feature = "dev-secrets")]
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretReferenceSummary {

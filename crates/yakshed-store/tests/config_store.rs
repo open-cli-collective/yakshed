@@ -42,6 +42,7 @@ async fn config_round_trips_through_disk() {
                 id: SecretBackendId::new("memory").unwrap(),
                 kind: "memory".into(),
                 account: None,
+                path: None,
             }),
         )
         .await
@@ -53,6 +54,36 @@ async fn config_round_trips_through_disk() {
 
     let reopened = ConfigStore::open(paths).unwrap();
     assert_eq!(reopened.snapshot().config, updated.config);
+}
+
+#[tokio::test]
+async fn local_file_backend_path_round_trips_through_disk() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let store = ConfigStore::open(paths.clone()).unwrap();
+    let backend = SecretBackend {
+        id: SecretBackendId::new("dev-local").unwrap(),
+        kind: "local-file".into(),
+        account: None,
+        path: Some("/tmp/yakshed-dev-secrets.json".into()),
+    };
+
+    store
+        .update(
+            ConfigRevision::INITIAL,
+            ConfigChange::PutSecretBackend(backend.clone()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ConfigStore::open(paths)
+            .unwrap()
+            .snapshot()
+            .config
+            .secret_backends,
+        vec![backend]
+    );
 }
 
 #[cfg(unix)]
@@ -232,6 +263,7 @@ async fn remove_operations_are_persisted() {
         id: SecretBackendId::new("memory").unwrap(),
         kind: "memory".into(),
         account: None,
+        path: None,
     };
     let snapshot = store
         .update(

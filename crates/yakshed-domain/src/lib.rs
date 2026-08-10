@@ -509,11 +509,16 @@ pub struct SecretBackend {
     pub id: SecretBackendId,
     pub kind: String,
     pub account: Option<String>,
+    pub path: Option<String>,
 }
 
 impl SecretBackend {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        require_nonempty("secret backend kind", &self.kind)
+        require_nonempty("secret backend kind", &self.kind)?;
+        if let Some(path) = &self.path {
+            require_nonempty("secret backend path", path)?;
+        }
+        Ok(())
     }
 }
 

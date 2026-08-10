@@ -69,6 +69,8 @@ struct SecretBackendDto {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -209,6 +211,7 @@ impl TryFrom<SecretBackendDto> for SecretBackend {
             id: SecretBackendId::new(backend.id)?,
             kind: backend.kind,
             account: backend.account,
+            path: backend.path,
         })
     }
 }
@@ -219,6 +222,7 @@ impl From<&SecretBackend> for SecretBackendDto {
             id: backend.id.as_str().to_owned(),
             kind: backend.kind.clone(),
             account: backend.account.clone(),
+            path: backend.path.clone(),
         }
     }
 }
