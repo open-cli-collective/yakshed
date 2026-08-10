@@ -4,12 +4,27 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+dev-secrets = [
+    "dep:atomic-write-file",
+    "dep:libc",
+    "dep:serde",
+    "dep:serde_json",
+]
+
 [dependencies]
 async-trait.workspace = true
+atomic-write-file = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 secrecy.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+yakshed-application.workspace = true
 yakshed-domain.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true

@@ -1,12 +1,43 @@
 use std::fs;
 
 use tempfile::tempdir;
-use yakshed_application::{AppConfig, ConfigChange, ConfigRevision};
+use yakshed_application::{
+    AppConfig, ConfigChange, ConfigRevision, SecretBackendAvailability, SecretBackendCapability,
+    SecretBackendConfigurationError,
+};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
-    ProviderStateRootId, SecretBackend, SecretBackendId, SecretLocator, SecretReference,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator,
+    SecretReference,
 };
 use yakshed_store::{AppPaths, ConfigError, ConfigStore};
+
+const BACKEND_CAPABILITIES: &[SecretBackendCapability] = &[
+    SecretBackendCapability::available("memory"),
+    SecretBackendCapability::available("local-os"),
+    SecretBackendCapability::available("onepassword-cli"),
+    SecretBackendCapability::available("environment"),
+    SecretBackendCapability {
+        kind: "local-file",
+        availability: SecretBackendAvailability::MissingFeature {
+            feature: "dev-secrets",
+        },
+    },
+];
+const LOCAL_FILE_CAPABILITIES: &[SecretBackendCapability] =
+    &[SecretBackendCapability::available("local-file")];
+
+const LOCAL_FILE_CONFIG: &[u8] = br#"schema_version = 1
+
+[[secret_backends]]
+id = "dev-local"
+kind = "local-file"
+path = "/tmp/yakshed-dev-secrets.json"
+"#;
+
+fn open(paths: AppPaths) -> Result<ConfigStore, ConfigError> {
+    ConfigStore::open(paths, BACKEND_CAPABILITIES)
+}
 
 fn connection() -> Connection {
     Connection {
@@ -33,15 +64,14 @@ fn connection() -> Connection {
 async fn config_round_trips_through_disk() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    let store = ConfigStore::open(paths.clone()).unwrap();
+    let store = open(paths.clone()).unwrap();
 
     let updated = store
         .update(
             ConfigRevision::INITIAL,
             ConfigChange::PutSecretBackend(SecretBackend {
                 id: SecretBackendId::new("memory").unwrap(),
-                kind: "memory".into(),
-                account: None,
+                settings: SecretBackendSettings::Memory,
             }),
         )
         .await
@@ -51,8 +81,97 @@ async fn config_round_trips_through_disk() {
         .await
         .unwrap();
 
-    let reopened = ConfigStore::open(paths).unwrap();
+    let reopened = open(paths).unwrap();
     assert_eq!(reopened.snapshot().config, updated.config);
+}
+
+#[test]
+fn injected_capabilities_report_missing_feature_for_persisted_local_file_config() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(paths.config_root.join("config.toml"), LOCAL_FILE_CONFIG).unwrap();
+
+    assert!(matches!(
+        open(paths),
+        Err(ConfigError::SecretBackendConfiguration(
+            SecretBackendConfigurationError::MissingFeature {
+                kind: "local-file",
+                feature: "dev-secrets",
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
+fn injected_capabilities_accept_persisted_local_file_config() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(paths.config_root.join("config.toml"), LOCAL_FILE_CONFIG).unwrap();
+
+    assert_eq!(
+        ConfigStore::open(paths, LOCAL_FILE_CAPABILITIES)
+            .unwrap()
+            .snapshot()
+            .config
+            .secret_backends,
+        vec![SecretBackend {
+            id: SecretBackendId::new("dev-local").unwrap(),
+            settings: SecretBackendSettings::LocalFile {
+                path: "/tmp/yakshed-dev-secrets.json".into(),
+            },
+        }]
+    );
+}
+
+#[test]
+fn duplicate_local_file_paths_are_rejected() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(
+        paths.config_root.join("config.toml"),
+        r#"schema_version = 1
+
+[[secret_backends]]
+id = "dev-a"
+kind = "local-file"
+path = "/tmp/shared-dev-secrets.json"
+
+[[secret_backends]]
+id = "dev-b"
+kind = "local-file"
+path = "/tmp/shared-dev-secrets.json"
+"#,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        ConfigStore::open(paths, LOCAL_FILE_CAPABILITIES),
+        Err(ConfigError::SecretBackendConfiguration(
+            yakshed_application::SecretBackendConfigurationError::DuplicateLocalFilePath { .. }
+        ))
+    ));
+}
+
+#[test]
+fn invalid_backend_setting_combinations_fail_closed() {
+    for backend in [
+        "id = \"memory\"\nkind = \"memory\"\npath = \"unexpected\"\n",
+        "id = \"dev-local\"\nkind = \"local-file\"\n",
+    ] {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_config_root().unwrap();
+        let config_path = paths.config_root.join("config.toml");
+        let source = format!("schema_version = 1\n\n[[secret_backends]]\n{backend}");
+        fs::write(&config_path, &source).unwrap();
+
+        assert!(matches!(open(paths), Err(ConfigError::Validation(_))));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), source);
+    }
 }
 
 #[cfg(unix)]
@@ -62,7 +181,7 @@ fn config_file_is_private() {
 
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    ConfigStore::open(paths.clone()).unwrap();
+    open(paths.clone()).unwrap();
 
     assert_eq!(
         fs::metadata(paths.config_root.join("config.toml"))
@@ -84,7 +203,7 @@ fn newer_schema_is_rejected_without_rewrite() {
     fs::write(&config_path, bytes).unwrap();
 
     assert!(matches!(
-        ConfigStore::open(paths),
+        open(paths),
         Err(ConfigError::UnsupportedSchema {
             found: 999,
             supported: 1
@@ -100,10 +219,7 @@ fn malformed_config_has_a_parse_error() {
     paths.create_config_root().unwrap();
     fs::write(paths.config_root.join("config.toml"), "not = [toml").unwrap();
 
-    assert!(matches!(
-        ConfigStore::open(paths),
-        Err(ConfigError::Parse(_))
-    ));
+    assert!(matches!(open(paths), Err(ConfigError::Parse(_))));
 }
 
 #[test]
@@ -116,10 +232,7 @@ fn invalid_persisted_backend_id_fails_closed_without_rewrite() {
         b"schema_version = 1\n\n[[secret_backends]]\nid = \"bad backend\"\nkind = \"memory\"\n";
     fs::write(&config_path, bytes).unwrap();
 
-    assert!(matches!(
-        ConfigStore::open(paths),
-        Err(ConfigError::Validation(_))
-    ));
+    assert!(matches!(open(paths), Err(ConfigError::Validation(_))));
     assert_eq!(fs::read(config_path).unwrap(), bytes);
 }
 
@@ -150,17 +263,14 @@ locator = "bad\nlocator"
 "#;
     fs::write(&config_path, bytes).unwrap();
 
-    assert!(matches!(
-        ConfigStore::open(paths),
-        Err(ConfigError::Validation(_))
-    ));
+    assert!(matches!(open(paths), Err(ConfigError::Validation(_))));
     assert_eq!(fs::read(config_path).unwrap(), bytes);
 }
 
 #[tokio::test]
 async fn stale_revision_conflicts_without_mutation() {
     let temp = tempdir().unwrap();
-    let store = ConfigStore::open(AppPaths::for_test(temp.path())).unwrap();
+    let store = open(AppPaths::for_test(temp.path())).unwrap();
     let first = store
         .update(
             ConfigRevision::INITIAL,
@@ -184,7 +294,7 @@ async fn stale_revision_conflicts_without_mutation() {
 #[tokio::test]
 async fn concurrent_updates_allow_exactly_one_revision() {
     let temp = tempdir().unwrap();
-    let store = ConfigStore::open(AppPaths::for_test(temp.path())).unwrap();
+    let store = open(AppPaths::for_test(temp.path())).unwrap();
 
     let (dark, light) = tokio::join!(
         store.update(
@@ -209,7 +319,7 @@ async fn concurrent_updates_allow_exactly_one_revision() {
 #[tokio::test]
 async fn invalid_change_is_rejected_without_mutation() {
     let temp = tempdir().unwrap();
-    let store = ConfigStore::open(AppPaths::for_test(temp.path())).unwrap();
+    let store = open(AppPaths::for_test(temp.path())).unwrap();
 
     assert!(matches!(
         store
@@ -227,11 +337,10 @@ async fn invalid_change_is_rejected_without_mutation() {
 async fn remove_operations_are_persisted() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    let store = ConfigStore::open(paths.clone()).unwrap();
+    let store = open(paths.clone()).unwrap();
     let backend = SecretBackend {
         id: SecretBackendId::new("memory").unwrap(),
-        kind: "memory".into(),
-        account: None,
+        settings: SecretBackendSettings::Memory,
     };
     let snapshot = store
         .update(
@@ -259,7 +368,7 @@ async fn remove_operations_are_persisted() {
         .await
         .unwrap();
 
-    let reopened = ConfigStore::open(paths).unwrap().snapshot();
+    let reopened = open(paths).unwrap().snapshot();
     assert!(reopened.config.connections.is_empty());
     assert!(reopened.config.secret_backends.is_empty());
 }
@@ -268,7 +377,7 @@ async fn remove_operations_are_persisted() {
 async fn reset_only_recreates_config_toml() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    let store = ConfigStore::open(paths.clone()).unwrap();
+    let store = open(paths.clone()).unwrap();
     paths.create_cache_root().unwrap();
     paths.create_data_root().unwrap();
     paths.create_runtime_root().unwrap();
@@ -294,7 +403,7 @@ async fn reset_only_recreates_config_toml() {
 fn opening_config_creates_only_the_config_root() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    ConfigStore::open(paths.clone()).unwrap();
+    open(paths.clone()).unwrap();
 
     assert!(paths.config_root.is_dir());
     assert!(!paths.cache_root.exists());
@@ -358,7 +467,7 @@ locator = "connection/0193f26e-7a72-7d42-bf77-0de14c4cc333/fireworks_api_key"
     let paths = AppPaths::for_test(temp.path());
     paths.create_config_root().unwrap();
     fs::write(paths.config_root.join("config.toml"), EXAMPLE).unwrap();
-    let store = ConfigStore::open(paths.clone()).unwrap();
+    let store = open(paths.clone()).unwrap();
     let snapshot = store
         .update(
             ConfigRevision::INITIAL,
@@ -374,8 +483,5 @@ locator = "connection/0193f26e-7a72-7d42-bf77-0de14c4cc333/fireworks_api_key"
     let written = fs::read_to_string(paths.config_root.join("config.toml")).unwrap();
     assert!(written.contains("authority = \"codex-app-server\""));
     assert!(!written.contains("delivery"));
-    assert_eq!(
-        ConfigStore::open(paths).unwrap().snapshot().config,
-        snapshot.config
-    );
+    assert_eq!(open(paths).unwrap().snapshot().config, snapshot.config);
 }

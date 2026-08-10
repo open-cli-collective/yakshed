@@ -1,6 +1,9 @@
-//! Secret contracts, an isolated memory backend, and credential brokering.
+//! Secret contracts, feature-gated development backends, and credential brokering.
 
 mod broker;
+#[cfg(feature = "dev-secrets")]
+mod local_file;
+#[cfg(feature = "dev-secrets")]
 mod memory;
 
 use std::{error::Error, fmt, sync::Arc};
@@ -8,15 +11,61 @@ use std::{error::Error, fmt, sync::Arc};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use time::OffsetDateTime;
+pub use yakshed_application::{
+    SecretBackendAvailability, SecretBackendCapability, SecretBackendConfigurationError,
+    validate_backend_configuration,
+};
 pub use yakshed_domain::{
-    ConnectionId, CredentialSlot, OperationId, SecretBackendId, SecretLocator, SecretReference,
+    ConnectionId, CredentialSlot, OperationId, SecretBackend, SecretBackendId,
+    SecretBackendSettings, SecretLocator, SecretReference,
 };
 
 pub use broker::{
     BrokerCancellation, ChildProcessEnvironment, CredentialBroker, CredentialResolution,
     CredentialStatus, shape_process_environment,
 };
+#[cfg(feature = "dev-secrets")]
+pub use local_file::LocalFileBackend;
+#[cfg(feature = "dev-secrets")]
 pub use memory::{MemorySecretBackend, MemorySecretFault};
+
+pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
+
+#[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+    SecretBackendCapability::available("memory"),
+    SecretBackendCapability::available(LOCAL_FILE_BACKEND_KIND),
+];
+#[cfg(not(feature = "dev-secrets"))]
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+    SecretBackendCapability {
+        kind: "memory",
+        availability: SecretBackendAvailability::MissingFeature {
+            feature: "dev-secrets",
+        },
+    },
+    SecretBackendCapability {
+        kind: LOCAL_FILE_BACKEND_KIND,
+        availability: SecretBackendAvailability::MissingFeature {
+            feature: "dev-secrets",
+        },
+    },
+];
+#[cfg(all(
+    feature = "dev-secrets",
+    not(any(target_os = "macos", target_os = "linux"))
+))]
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+    SecretBackendCapability::available("memory"),
+    SecretBackendCapability {
+        kind: LOCAL_FILE_BACKEND_KIND,
+        availability: SecretBackendAvailability::UnsupportedPlatform,
+    },
+];
+
+pub const fn backend_capabilities() -> &'static [SecretBackendCapability] {
+    &BACKEND_CAPABILITIES
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretReferenceSummary {
@@ -242,6 +291,9 @@ pub enum SecretError {
         backend: SecretBackendId,
         redacted_message: String,
     },
+    UncertainWrite {
+        backend: SecretBackendId,
+    },
     InvalidBinding {
         connection_id: ConnectionId,
         slot: CredentialSlot,
@@ -265,7 +317,19 @@ impl fmt::Display for SecretError {
             Self::BackendUnavailable { backend, .. } => {
                 write!(formatter, "secret backend unavailable: {backend}")
             }
-            Self::LockedOrDenied { backend, .. } => {
+            Self::LockedOrDenied {
+                backend,
+                remediation: Some(remediation),
+            } => {
+                write!(
+                    formatter,
+                    "secret backend locked or denied: {backend}: {remediation}"
+                )
+            }
+            Self::LockedOrDenied {
+                backend,
+                remediation: None,
+            } => {
                 write!(formatter, "secret backend locked or denied: {backend}")
             }
             Self::AuthenticationRequired { backend, .. } => {
@@ -294,6 +358,12 @@ impl fmt::Display for SecretError {
             }
             Self::BackendFailure { backend, .. } => {
                 write!(formatter, "secret backend failure: {backend}")
+            }
+            Self::UncertainWrite { backend } => {
+                write!(
+                    formatter,
+                    "secret backend write outcome uncertain: {backend}"
+                )
             }
             Self::InvalidBinding {
                 connection_id,
@@ -327,6 +397,7 @@ pub enum SecretAuditOutcome {
     NotFound,
     Rejected,
     Failed,
+    Uncertain,
     TimedOut,
     Cancelled,
 }

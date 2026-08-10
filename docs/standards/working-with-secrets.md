@@ -535,11 +535,17 @@ The UI must report that the credential is process-scoped and non-persistent.
 
 A deterministic in-memory backend for unit, integration, and contract tests.
 
+- compiled only with the non-default `dev-secrets` Cargo feature;
 - no persistence;
 - safe parallel test isolation;
 - programmable error responses;
 - never auto-selected;
-- refused in ordinary release configuration unless a dedicated development feature is enabled.
+- refused in ordinary release configuration with the typed `MissingFeature` error.
+
+| Development backend | Default build | `dev-secrets` build |
+|---|---|---|
+| `memory` | `MissingFeature` | available on every platform |
+| `local-file` | `MissingFeature` | available on macOS/Linux; `UnsupportedPlatform` elsewhere |
 
 The `keyring-core` mock store can help test the native-keyring adapter, but YakShed should also provide its own memory backend
 so the broker contract and application composition do not depend on keyring implementation details.
@@ -559,6 +565,55 @@ Before adoption, a spike must establish:
 - no secret-bearing type crosses into application serialization.
 
 SecretSpec is an implementation option, not the YakShed product model.
+
+### 9.7 `local-file`
+
+An explicit plaintext developer-convenience store for long-running local development without repeated OS-keychain prompts.
+
+```toml
+[[secret_backends]]
+id = "dev-local"
+kind = "local-file"
+path = "/Users/example/.local/share/yakshed/dev-secrets.json"
+```
+
+- compiled only with the non-default `dev-secrets` Cargo feature;
+- supported only on macOS and Linux, where YakShed enforces private directory and file permission bits and validates native
+  ACLs;
+- configured with an absolute path so behavior never depends on the process working directory;
+- allowed only for deliberate development builds and never auto-selected or used as a fallback;
+- refused with a typed configuration error naming the missing feature when ordinary builds reference it;
+- refused with a distinct typed unsupported-platform error when the feature is compiled outside macOS and Linux;
+- stores plaintext secrets in a private local file and is not suitable for release configuration.
+
+Backend instances targeting the same canonical file share a process-global lock and an exclusive `flock` on macOS and Linux,
+held for each complete read or read-modify-write operation. Dropping a queued mutation prevents it from starting; dropping one after
+its write begins leaves an uncertain outcome that callers must reconcile before retrying. Reads wait for a contended flock;
+mutations poll the flock non-blockingly so abandonment cancels the wait promptly. The atomic writer's `commit()` call is the
+uncertainty boundary: any error it returns is an uncertain write because replacement may already have occurred.
+
+Private mode bits are necessary but not sufficient: the store file and its direct parent must also have no extended ACL
+entries. YakShed inspects native extended ACLs on macOS and the POSIX ACL xattrs on Linux before operations and re-checks the
+store after atomic replacement. It refuses ACL-bearing paths with remediation rather than silently removing user-managed
+filesystem security state. The direct parent and store file must be owned by the effective user; opened store descriptors
+are revalidated for type, mode, owner, and path identity before reads.
+
+Every directory in the canonical store path's ancestor chain must be owned by root or the effective user and must not be
+group- or other-writable. On macOS, every component must also be free of ACL entries. On Linux, extended access ACLs are
+rejected throughout the chain, while a default-only ACL on a non-parent ancestor is allowed: it grants no access to that
+component, and YakShed never creates children there. The direct parent remains strict because its default ACL would propagate
+to newly created store files. This distinction supports real layouts such as GitHub runners, where `/home` carries a default
+ACL but `/home/runner` does not. Sticky world-writable ancestors such as `/tmp` are rejected; configure the store beneath the
+application's private data directory instead. Pathname re-resolution is acceptable here because no other principal can
+mutate the trusted chain; a dirfd-relative I/O layer is unnecessary under this assumption.
+
+Removing or resetting a backend's config intentionally retains its plaintext file. While YakShed is running, purge through
+the backend's locked purge operation, which removes only the store and syncs the parent directory. The zero-length `.lock`
+sidecar is persistent coordination state and survives purge, preventing lock-generation splits for queued contenders. Manual
+file deletion is safe only after every backend instance has stopped. Re-adding the same backend ID and path restores retained
+values unless the store was explicitly purged.
+
+The future development launch script must pass `--features dev-secrets`, mirroring Retune's `build-install.sh` pattern.
 
 ---
 
@@ -759,6 +814,7 @@ pub enum SecretError {
     UnsupportedOperation { backend: SecretBackendId, operation: SecretOperation },
     TimedOut { backend: SecretBackendId },
     Cancelled { backend: SecretBackendId },
+    UncertainWrite { backend: SecretBackendId },
     ProtocolViolation { backend: SecretBackendId, reason: String },
     BackendFailure { backend: SecretBackendId, redacted_message: String },
 }
@@ -775,9 +831,13 @@ The UI implications differ:
 | Invalid locator | Edit reference |
 | Unsupported operation | Explain read-only/write-only limitation |
 | Timeout/cancelled | Retry without assuming mutation outcome |
+| Uncertain write | Re-probe/reconcile before retrying; the value may already be stored |
 | Protocol violation | Mark helper/backend incompatible |
 
-A mutating operation that times out after dispatch may have an uncertain outcome. Re-probe before retrying blindly.
+A mutating operation that times out after dispatch may have an uncertain outcome. For `local-file`, the atomic writer's
+`commit()` call is the uncertainty boundary because it may report an error after replacing the store file; any `commit()`
+error is therefore an uncertain write. Temp-file creation, writing, and syncing failures before `commit()` remain definite
+backend failures. Re-probe before retrying blindly.
 
 ---
 

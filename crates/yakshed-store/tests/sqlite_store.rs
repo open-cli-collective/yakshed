@@ -976,7 +976,7 @@ async fn second_open_conflicts_without_reconciling_live_run() {
 #[tokio::test]
 async fn config_reset_does_not_remove_sqlite_work_data() {
     let context = Context::open().await;
-    let config = ConfigStore::open(context.paths.clone()).unwrap();
+    let config = ConfigStore::open(context.paths.clone(), &[]).unwrap();
     let project_id = context.project().await;
     let work = context
         .store

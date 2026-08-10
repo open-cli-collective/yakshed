@@ -8,11 +8,14 @@ use std::{
 use atomic_write_file::{AtomicWriteFile, OpenOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use yakshed_application::{AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, UiConfig};
+use yakshed_application::{
+    AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, ConfigValidationError,
+    SecretBackendCapability, SecretBackendConfigurationError, UiConfig,
+};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
-    ProviderStateRootId, SecretBackend, SecretBackendId, SecretLocator, SecretReference,
-    ValidationError,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator,
+    SecretReference, ValidationError,
 };
 
 use crate::{AppPaths, PathError};
@@ -69,6 +72,8 @@ struct SecretBackendDto {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,18 +212,27 @@ impl TryFrom<SecretBackendDto> for SecretBackend {
     fn try_from(backend: SecretBackendDto) -> Result<Self, Self::Error> {
         Ok(Self {
             id: SecretBackendId::new(backend.id)?,
-            kind: backend.kind,
-            account: backend.account,
+            settings: SecretBackendSettings::from_config_parts(
+                &backend.kind,
+                backend.account,
+                backend.path,
+            )?,
         })
     }
 }
 
 impl From<&SecretBackend> for SecretBackendDto {
     fn from(backend: &SecretBackend) -> Self {
+        let (account, path) = match &backend.settings {
+            SecretBackendSettings::OnePasswordCli { account } => (account.clone(), None),
+            SecretBackendSettings::LocalFile { path } => (None, Some(path.clone())),
+            _ => (None, None),
+        };
         Self {
             id: backend.id.as_str().to_owned(),
-            kind: backend.kind.clone(),
-            account: backend.account.clone(),
+            kind: backend.kind().to_owned(),
+            account,
+            path,
         }
     }
 }
@@ -230,6 +244,7 @@ pub struct ConfigStore {
 
 struct StoreInner {
     config_path: PathBuf,
+    backend_capabilities: &'static [SecretBackendCapability],
     state: RwLock<ConfigSnapshot>,
     updates: Mutex<()>,
     #[cfg(test)]
@@ -238,11 +253,14 @@ struct StoreInner {
 
 impl ConfigStore {
     /// Opens or creates the schema-v1 config beneath the injected config root.
-    pub fn open(paths: AppPaths) -> Result<Self, ConfigError> {
+    pub fn open(
+        paths: AppPaths,
+        backend_capabilities: &'static [SecretBackendCapability],
+    ) -> Result<Self, ConfigError> {
         paths.create_config_root()?;
         let config_path = paths.config_root.join(CONFIG_FILE);
         let config = if config_path.exists() {
-            read_config(&config_path)?
+            read_config(&config_path, backend_capabilities)?
         } else {
             let config = AppConfig::default();
             write_config(&config_path, &config)?;
@@ -252,6 +270,7 @@ impl ConfigStore {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 config_path,
+                backend_capabilities,
                 state: RwLock::new(ConfigSnapshot {
                     revision: ConfigRevision::INITIAL,
                     config,
@@ -309,9 +328,7 @@ impl StoreInner {
 
         let mut config = current.config;
         apply_change(&mut config, change);
-        config
-            .validate()
-            .map_err(|error| ConfigError::Validation(error.to_string()))?;
+        validate_config(&config, self.backend_capabilities)?;
         let revision = current
             .revision
             .get()
@@ -365,7 +382,10 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
     }
 }
 
-fn read_config(path: &Path) -> Result<AppConfig, ConfigError> {
+fn read_config(
+    path: &Path,
+    backend_capabilities: &[SecretBackendCapability],
+) -> Result<AppConfig, ConfigError> {
     let source = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_owned(),
         source,
@@ -374,10 +394,21 @@ fn read_config(path: &Path) -> Result<AppConfig, ConfigError> {
     let value = migrate(value)?;
     let config = AppConfig::try_from(value.try_into::<ConfigDto>().map_err(ConfigError::Parse)?)
         .map_err(|error| ConfigError::Validation(error.to_string()))?;
-    config
-        .validate()
-        .map_err(|error| ConfigError::Validation(error.to_string()))?;
+    validate_config(&config, backend_capabilities)?;
     Ok(config)
+}
+
+fn validate_config(
+    config: &AppConfig,
+    backend_capabilities: &[SecretBackendCapability],
+) -> Result<(), ConfigError> {
+    match config.validate(backend_capabilities) {
+        Ok(()) => Ok(()),
+        Err(ConfigValidationError::SecretBackend(error)) => {
+            Err(ConfigError::SecretBackendConfiguration(error))
+        }
+        Err(error) => Err(ConfigError::Validation(error.to_string())),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -509,6 +540,8 @@ pub enum ConfigError {
     },
     #[error("invalid config: {0}")]
     Validation(String),
+    #[error("invalid secret backend configuration: {0}")]
+    SecretBackendConfiguration(#[from] SecretBackendConfigurationError),
     #[error("failed to serialize config: {0}")]
     Serialize(#[source] toml::ser::Error),
     #[error("config worker failed: {0}")]
@@ -667,7 +700,7 @@ mod tests {
     async fn temp_permission_failure_preserves_previous_file_and_revision() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
-        let store = ConfigStore::open(paths.clone()).unwrap();
+        let store = ConfigStore::open(paths.clone(), &[]).unwrap();
         let before = fs::read(paths.config_root.join(CONFIG_FILE)).unwrap();
         *store
             .inner
@@ -694,7 +727,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn delayed_write_does_not_block_unrelated_runtime_work() {
         let temp = tempdir().unwrap();
-        let store = ConfigStore::open(AppPaths::for_test(temp.path())).unwrap();
+        let store = ConfigStore::open(AppPaths::for_test(temp.path()), &[]).unwrap();
         let started = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         *store
