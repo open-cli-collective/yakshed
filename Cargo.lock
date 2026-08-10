@@ -420,6 +420,8 @@ dependencies = [
 name = "provider-mock"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "tokio",
  "yakshed-domain",
  "yakshed-harness",
 ]
@@ -935,7 +937,9 @@ dependencies = [
 name = "yakshed-harness"
 version = "0.1.0"
 dependencies = [
- "yakshed-application",
+ "async-trait",
+ "thiserror",
+ "tokio",
  "yakshed-domain",
 ]
 
