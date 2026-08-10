@@ -5,6 +5,8 @@
 //! Dropped mutations are suppressed before writing starts. A drop after writing starts has an
 //! uncertain outcome and must be reconciled before retrying. Reads wait for a contended file lock;
 //! abandoned mutations stop waiting promptly.
+//! Extended ACLs are rejected via native macOS ACL inspection or Linux POSIX ACL xattrs; YakShed
+//! never removes filesystem ACLs on the user's behalf.
 
 #[cfg(unix)]
 use std::{
@@ -18,6 +20,9 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 
 #[cfg(unix)]
 use async_trait::async_trait;
@@ -208,8 +213,7 @@ impl LocalFileState {
     }
 
     fn save(&self, path: &Path, store: &LocalFileStore) -> Result<(), SecretError> {
-        write_store_with_hooks(path, store, || Ok(()), sync_directory)
-            .map_err(|error| map_write_error(&self.id, error))
+        write_store(path, store, &self.id, || Ok(()))
     }
 
     fn with_store_lock<T>(
@@ -460,6 +464,7 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
             LocalFileSecurityProblem::ParentNotDirectory,
         ));
     }
+    validate_no_extended_acl(parent, backend)?;
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(insecure(backend, LocalFileSecurityProblem::ParentWritable));
     }
@@ -484,6 +489,7 @@ fn validate_store_if_present(path: &Path, backend: &SecretBackendId) -> Result<(
     if !metadata.file_type().is_file() {
         return Err(insecure(backend, LocalFileSecurityProblem::StoreNotRegular));
     }
+    validate_no_extended_acl(path, backend)?;
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(insecure(
             backend,
@@ -491,6 +497,107 @@ fn validate_store_if_present(path: &Path, backend: &SecretBackendId) -> Result<(
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_no_extended_acl(path: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
+    if has_extended_acl(path).map_err(|error| {
+        map_io_error(
+            backend,
+            "failed to inspect local secret store access controls",
+            error,
+        )
+    })? {
+        return Err(SecretError::LockedOrDenied {
+            backend: backend.clone(),
+            remediation: Some(format!("remove ACL entries from {}", path.display())),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn has_extended_acl(path: &Path) -> io::Result<bool> {
+    use std::{os::raw::c_void, os::unix::ffi::OsStrExt, ptr};
+
+    unsafe extern "C" {
+        fn acl_get_file(path: *const libc::c_char, acl_type: libc::c_int) -> *mut c_void;
+        fn acl_get_entry(
+            acl: *mut c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut c_void,
+        ) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: the path is NUL-terminated, and the returned ACL is released before returning.
+    let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let mut entry = ptr::null_mut();
+    // SAFETY: `acl` is valid and `entry` points to writable storage for the borrowed entry.
+    let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    // SAFETY: `acl` was returned by `acl_get_file` and has not yet been freed.
+    unsafe { acl_free(acl) };
+    match result {
+        0 => Ok(true),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn has_extended_acl(_path: &Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "ACL inspection is unsupported on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn has_extended_acl(path: &Path) -> io::Result<bool> {
+    use std::{os::unix::ffi::OsStrExt, ptr};
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: the path is NUL-terminated; a null output buffer requests the required size.
+    let size = unsafe { libc::listxattr(path.as_ptr(), ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(false);
+    }
+    let mut names = vec![0_u8; size as usize];
+    // SAFETY: `names` exposes `size` writable bytes for the NUL-separated attribute names.
+    let written = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            names.as_mut_ptr().cast::<libc::c_char>(),
+            names.len(),
+        )
+    };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(names[..written as usize]
+        .split(|byte| *byte == 0)
+        .any(|name| {
+            matches!(
+                name,
+                b"system.posix_acl_access" | b"system.posix_acl_default"
+            )
+        }))
 }
 
 #[cfg(unix)]
@@ -537,8 +644,7 @@ fn claim_or_validate_with_hook(
                 backend_id: backend.clone(),
                 secrets: HashMap::new(),
             };
-            write_store_with_hooks(path, &store, before_commit, sync_directory)
-                .map_err(|error| map_write_error(backend, error))
+            write_store(path, &store, backend, before_commit)
         }
         Err(error) => Err(map_io_error(
             backend,
@@ -546,6 +652,18 @@ fn claim_or_validate_with_hook(
             error,
         )),
     }
+}
+
+#[cfg(unix)]
+fn write_store(
+    path: &Path,
+    store: &LocalFileStore,
+    backend: &SecretBackendId,
+    before_commit: impl FnOnce() -> io::Result<()>,
+) -> Result<(), SecretError> {
+    write_store_with_hooks(path, store, before_commit, sync_directory)
+        .map_err(|error| map_write_error(backend, error))?;
+    validate_store_if_present(path, backend)
 }
 
 #[cfg(unix)]
@@ -974,6 +1092,134 @@ mod tests {
         assert!(matches!(error, SecretError::LockedOrDenied { .. }));
         assert!(!format!("{error}").contains(CANARY));
         assert!(!format!("{error:?}").contains(CANARY));
+    }
+
+    fn assert_acl_rejected(error: SecretError, path: &Path) {
+        assert!(!format!("{error}").contains(CANARY));
+        assert!(!format!("{error:?}").contains(CANARY));
+        let SecretError::LockedOrDenied {
+            remediation: Some(remediation),
+            ..
+        } = error
+        else {
+            panic!("extended ACL must map to LockedOrDenied")
+        };
+        let path = fs::canonicalize(path).unwrap();
+        assert_eq!(
+            remediation,
+            format!("remove ACL entries from {}", path.display())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_macos_acl(path: &Path) {
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_store_and_parent_acls_are_rejected_without_exposing_secrets() {
+        for target_parent in [false, true] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("store/secrets.json");
+            let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+            let locator = SecretLocator::new("acl-protected").unwrap();
+            backend
+                .put(
+                    &locator,
+                    &SecretString::from(CANARY.to_owned()),
+                    PutSecretOptions::NO_OVERWRITE,
+                )
+                .await
+                .unwrap();
+            let acl_path = if target_parent {
+                path.parent().unwrap()
+            } else {
+                &path
+            };
+            add_macos_acl(acl_path);
+
+            let Err(error) = backend.resolve(&locator, &context()).await else {
+                panic!("ACL-protected store must be rejected")
+            };
+            assert_acl_rejected(error, acl_path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_linux_posix_acl(path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+
+        fn push_entry(bytes: &mut Vec<u8>, tag: u16, permissions: u16, id: u32) {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&permissions.to_le_bytes());
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        push_entry(&mut acl, 0x01, 0o6, u32::MAX);
+        // SAFETY: `geteuid` takes no arguments and has no preconditions.
+        let other_id = unsafe { libc::geteuid() }.wrapping_add(1);
+        push_entry(&mut acl, 0x02, 0o4, other_id);
+        push_entry(&mut acl, 0x04, 0, u32::MAX);
+        push_entry(&mut acl, 0x10, 0o4, u32::MAX);
+        push_entry(&mut acl, 0x20, 0, u32::MAX);
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: all pointers reference live, correctly sized byte buffers for this call.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                c"system.posix_acl_access".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        if result != 0 {
+            eprintln!(
+                "skipping POSIX ACL assertion: {}",
+                io::Error::last_os_error()
+            );
+            return false;
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_store_and_parent_acls_are_rejected_without_exposing_secrets() {
+        for target_parent in [false, true] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("store/secrets.json");
+            let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+            let locator = SecretLocator::new("acl-protected").unwrap();
+            backend
+                .put(
+                    &locator,
+                    &SecretString::from(CANARY.to_owned()),
+                    PutSecretOptions::NO_OVERWRITE,
+                )
+                .await
+                .unwrap();
+            let acl_path = if target_parent {
+                path.parent().unwrap()
+            } else {
+                &path
+            };
+            if !add_linux_posix_acl(acl_path) {
+                continue;
+            }
+
+            let Err(error) = backend.resolve(&locator, &context()).await else {
+                panic!("ACL-protected store must be rejected")
+            };
+            assert_acl_rejected(error, acl_path);
+        }
     }
 
     #[tokio::test]

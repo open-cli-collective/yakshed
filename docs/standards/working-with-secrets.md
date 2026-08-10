@@ -584,6 +584,11 @@ each complete read or read-modify-write operation. Dropping a queued mutation pr
 its write begins leaves an uncertain outcome that callers must reconcile before retrying. Reads wait for a contended flock;
 mutations poll the flock non-blockingly so abandonment cancels the wait promptly.
 
+Private mode bits are necessary but not sufficient: the store file and its direct parent must also have no extended ACL
+entries. YakShed inspects native extended ACLs on macOS and the POSIX ACL xattrs on Linux before operations and re-checks the
+store after atomic replacement. It refuses ACL-bearing paths with remediation rather than silently removing user-managed
+filesystem security state.
+
 Removing or resetting a backend's config intentionally retains its plaintext file. Re-adding the same backend ID and path
 restores access to those values; manually delete the file to purge them.
 
