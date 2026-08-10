@@ -13,7 +13,7 @@ use std::{fmt, str::FromStr};
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use yakshed_domain::{ApprovalDecision, ConnectionId};
+use yakshed_domain::{ApprovalDecision, ConnectionId, CredentialSlot};
 
 pub const EVENT_BUFFER_CAPACITY: usize = 64;
 
@@ -22,6 +22,20 @@ pub struct HarnessDescriptor {
     pub id: String,
     pub name: String,
     pub version: String,
+}
+
+/// Adapter-owned delivery mechanism for one canonical credential slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessCredentialDelivery {
+    HarnessManaged,
+    ProcessEnvironment { variable: String },
+}
+
+/// One credential slot and the delivery mechanism fixed by its harness adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessCredentialRequirement {
+    pub slot: CredentialSlot,
+    pub delivery: HarnessCredentialDelivery,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -490,6 +504,8 @@ pub fn event_channel() -> (HarnessEventSender, ProviderEventStream) {
 #[async_trait]
 pub trait HarnessAdapter: Send + Sync {
     fn descriptor(&self) -> HarnessDescriptor;
+
+    fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement>;
 
     async fn capabilities(
         &self,

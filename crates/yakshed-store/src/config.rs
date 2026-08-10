@@ -13,9 +13,9 @@ use yakshed_application::{
     SecretBackendCapability, SecretBackendConfigurationError, UiConfig,
 };
 use yakshed_domain::{
-    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialDelivery,
-    CredentialSlot, ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings,
-    SecretLocator, SecretReference, ValidationError,
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator,
+    SecretReference, ValidationError,
 };
 
 use crate::{AppPaths, PathError};
@@ -54,26 +54,15 @@ enum CredentialBindingDto {
     Delegated {
         slot: CredentialSlot,
         authority: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        delivery: Option<CredentialDeliveryDto>,
     },
     Secret {
         slot: CredentialSlot,
         backend: String,
         locator: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        delivery: Option<CredentialDeliveryDto>,
     },
     Disabled {
         slot: CredentialSlot,
     },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum CredentialDeliveryDto {
-    HarnessManaged,
-    ProcessEnvironment { variable: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -172,21 +161,15 @@ impl TryFrom<CredentialBindingDto> for CredentialBindingRecord {
     type Error = ValidationError;
 
     fn try_from(binding: CredentialBindingDto) -> Result<Self, Self::Error> {
-        let record = match binding {
-            CredentialBindingDto::Delegated {
-                slot,
-                authority,
-                delivery,
-            } => Self {
+        Ok(match binding {
+            CredentialBindingDto::Delegated { slot, authority } => Self {
                 slot,
                 binding: CredentialBinding::Delegated { authority },
-                delivery: delivery.map(TryInto::try_into).transpose()?,
             },
             CredentialBindingDto::Secret {
                 slot,
                 backend,
                 locator,
-                delivery,
             } => Self {
                 slot,
                 binding: CredentialBinding::Secret {
@@ -195,16 +178,12 @@ impl TryFrom<CredentialBindingDto> for CredentialBindingRecord {
                         locator: SecretLocator::new(locator)?,
                     },
                 },
-                delivery: delivery.map(TryInto::try_into).transpose()?,
             },
             CredentialBindingDto::Disabled { slot } => Self {
                 slot,
                 binding: CredentialBinding::Disabled,
-                delivery: None,
             },
-        };
-        record.validate()?;
-        Ok(record)
+        })
     }
 }
 
@@ -214,40 +193,14 @@ impl From<&CredentialBindingRecord> for CredentialBindingDto {
             CredentialBinding::Delegated { authority } => Self::Delegated {
                 slot: record.slot.clone(),
                 authority: authority.clone(),
-                delivery: record.delivery.as_ref().map(Into::into),
             },
             CredentialBinding::Secret { reference } => Self::Secret {
                 slot: record.slot.clone(),
                 backend: reference.backend_id.as_str().to_owned(),
                 locator: reference.locator.as_str().to_owned(),
-                delivery: record.delivery.as_ref().map(Into::into),
             },
             CredentialBinding::Disabled => Self::Disabled {
                 slot: record.slot.clone(),
-            },
-        }
-    }
-}
-
-impl TryFrom<CredentialDeliveryDto> for CredentialDelivery {
-    type Error = ValidationError;
-
-    fn try_from(delivery: CredentialDeliveryDto) -> Result<Self, Self::Error> {
-        match delivery {
-            CredentialDeliveryDto::HarnessManaged => Ok(Self::HarnessManaged),
-            CredentialDeliveryDto::ProcessEnvironment { variable } => {
-                Self::process_environment(variable)
-            }
-        }
-    }
-}
-
-impl From<&CredentialDelivery> for CredentialDeliveryDto {
-    fn from(delivery: &CredentialDelivery) -> Self {
-        match delivery {
-            CredentialDelivery::HarnessManaged => Self::HarnessManaged,
-            CredentialDelivery::ProcessEnvironment { variable } => Self::ProcessEnvironment {
-                variable: variable.clone(),
             },
         }
     }
@@ -727,12 +680,10 @@ mod tests {
         let delegated = CredentialBindingDto::Delegated {
             slot: CredentialSlot::new("codex.account").unwrap(),
             authority: "codex-app-server".to_owned(),
-            delivery: Some(CredentialDeliveryDto::HarnessManaged),
         };
         let CredentialBindingDto::Delegated {
             slot: _,
             authority: _,
-            delivery: _,
         } = delegated
         else {
             panic!("delegated binding expected")
@@ -742,15 +693,11 @@ mod tests {
             slot: CredentialSlot::new("anthropic.api_key").unwrap(),
             backend: "memory".to_owned(),
             locator: "connection/work/anthropic_api_key".to_owned(),
-            delivery: Some(CredentialDeliveryDto::ProcessEnvironment {
-                variable: "ANTHROPIC_API_KEY".to_owned(),
-            }),
         };
         let CredentialBindingDto::Secret {
             slot: _,
             backend: _,
             locator: _,
-            delivery: _,
         } = secret
         else {
             panic!("secret binding expected")

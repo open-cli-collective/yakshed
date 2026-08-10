@@ -24,12 +24,14 @@ use yakshed_application::{
     SystemClock, SystemIdGenerator,
 };
 use yakshed_domain::{
-    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialDelivery,
-    CredentialSlot, OperationId, ProjectId, ProviderStateRootId, SecretBackend, SecretBackendId,
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
+    OperationId, ProjectId, ProviderStateRootId, SecretBackend, SecretBackendId,
     SecretBackendSettings, SecretLocator, SecretReference, WorkItemId, WorkItemSnapshot,
     WorkItemStatus,
 };
-use yakshed_harness::HarnessCapabilities;
+use yakshed_harness::{
+    HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery, HarnessCredentialRequirement,
+};
 use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, CredentialResolution, CredentialStatus,
     DeleteSecretOutcome, MemorySecretBackend, NoopSecretAuditSink, PutSecretOptions,
@@ -152,7 +154,7 @@ struct Host {
     artifacts: Option<ArtifactStore>,
     memory: Arc<MemorySecretBackend>,
     broker: CredentialBroker,
-    _harness: MockHarness,
+    harness: MockHarness,
     negotiated: bool,
     shutting_down: bool,
     _temporary_root: Option<tempfile::TempDir>,
@@ -201,7 +203,7 @@ impl Host {
             artifacts: Some(artifacts),
             memory,
             broker,
-            _harness: MockHarness::new(HarnessCapabilities::default(), Vec::new(), None),
+            harness: MockHarness::new(HarnessCapabilities::default(), Vec::new(), None),
             negotiated: false,
             shutting_down: false,
             _temporary_root: options._temporary_root,
@@ -311,7 +313,7 @@ impl Host {
         let ConvertedConnection {
             connection,
             needs_memory,
-        } = params.connection.into_domain()?;
+        } = params.connection.into_domain(&self.harness)?;
         let id = connection.id;
         let secret_backends = needs_memory
             .then(|| SecretBackend {
@@ -372,7 +374,14 @@ impl Host {
     }
 
     async fn connection_json(&self, connection: &Connection) -> Result<Value, HostError> {
+        if connection.harness != self.harness.descriptor().id {
+            return Err(HostError::new(
+                "unsupported",
+                "connection selects an unavailable harness",
+            ));
+        }
         let snapshot = self.config.snapshot();
+        let requirements = self.harness.credential_requirements();
         let mut credentials = Vec::with_capacity(connection.credentials.len());
         for binding in &connection.credentials {
             let status = self
@@ -398,8 +407,10 @@ impl Host {
                     "status": status,
                 }),
             };
-            if let Some(delivery) = &binding.delivery {
-                value["delivery"] = delivery_json(delivery);
+            if !matches!(binding.binding, CredentialBinding::Disabled) {
+                let requirement = credential_requirement(&requirements, &binding.slot)?;
+                validate_binding_requirement(&binding.binding, &requirement.delivery)?;
+                value["delivery"] = delivery_json(&requirement.delivery);
             }
             credentials.push(value);
         }
@@ -525,6 +536,23 @@ impl Host {
 
     async fn credential_probe(&self, params: Value) -> Result<Value, HostError> {
         let params: ProbeParams = parse_params(params)?;
+        #[cfg(not(unix))]
+        {
+            let _ = params;
+            Err(HostError::new(
+                "unsupported",
+                "credential probe requires Unix process-tree cleanup",
+            ))
+        }
+        #[cfg(unix)]
+        {
+            self.credential_probe_unix(params).await
+        }
+    }
+
+    /// Credential probes are Unix-only until a Windows contract-gate lane justifies Job Objects.
+    #[cfg(unix)]
+    async fn credential_probe_unix(&self, params: ProbeParams) -> Result<Value, HostError> {
         validate_probe(&params)?;
         let connection_id = ConnectionId::from_str(&params.connection_id)?;
         let slot = CredentialSlot::new(params.slot.clone())?;
@@ -535,16 +563,27 @@ impl Host {
             .iter()
             .find(|connection| connection.id == connection_id)
             .ok_or_else(|| HostError::not_found("connection not found"))?;
+        if connection.harness != self.harness.descriptor().id {
+            return Err(HostError::new(
+                "unsupported",
+                "connection selects an unavailable harness",
+            ));
+        }
         let binding = connection
             .credentials
             .iter()
             .find(|binding| binding.slot == slot)
             .ok_or_else(|| HostError::not_found("credential binding not found"))?;
-        let variable = binding
-            .delivery
-            .as_ref()
-            .and_then(CredentialDelivery::variable)
-            .ok_or_else(|| HostError::new("unsupported", "binding has no process delivery"))?;
+        let requirements = self.harness.credential_requirements();
+        let requirement = credential_requirement(&requirements, &slot)?;
+        validate_binding_requirement(&binding.binding, &requirement.delivery)?;
+        let HarnessCredentialDelivery::ProcessEnvironment { variable } = &requirement.delivery
+        else {
+            return Err(HostError::new(
+                "unsupported",
+                "binding has no process delivery",
+            ));
+        };
         let context = secret_context(connection_id, slot, "credential-probe")?;
         let resolution = self
             .broker
@@ -697,6 +736,7 @@ impl Host {
     }
 }
 
+#[cfg(unix)]
 async fn run_probe(
     params: &ProbeParams,
     variable: &str,
@@ -705,6 +745,7 @@ async fn run_probe(
     run_probe_with_timeout(params, variable, environment, PROBE_TIMEOUT).await
 }
 
+#[cfg(unix)]
 async fn run_probe_with_timeout(
     params: &ProbeParams,
     variable: &str,
@@ -740,47 +781,48 @@ async fn run_probe_with_timeout(
         .stderr
         .take()
         .ok_or_else(|| HostError::internal("credential probe stderr unavailable"))?;
-    let stdout_reader = tokio::spawn(read_bounded(stdout));
-    let stderr_reader = tokio::spawn(read_bounded(stderr));
     let mut child = ProbeChild::new(child, process_group);
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
+    let (status, stdout) = match tokio::time::timeout(timeout, async {
+        let (status, stdout, _stderr) = tokio::try_join!(
+            async {
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| HostError::new("backend_unavailable", "credential probe failed"))
+            },
+            read_bounded(stdout),
+            read_bounded(stderr),
+        )?;
+        Ok::<_, HostError>((status, stdout))
+    })
+    .await
+    {
+        Ok(Ok(completed)) => {
             child.disarm();
-            status
+            completed
         }
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
             child.kill_and_reap().await;
-            let _ = stdout_reader.await;
-            let _ = stderr_reader.await;
-            return Err(HostError::new(
-                "backend_unavailable",
-                "credential probe failed",
-            ));
+            return Err(error);
         }
         Err(_) => {
             child.kill_and_reap().await;
-            let _ = stdout_reader.await;
-            let _ = stderr_reader.await;
             return Err(HostError::new("timeout", "credential probe timed out"));
         }
     };
-    let stdout = stdout_reader
-        .await
-        .map_err(|_| HostError::internal("credential probe reader failed"))??;
-    let _stderr = stderr_reader
-        .await
-        .map_err(|_| HostError::internal("credential probe reader failed"))??;
     let mut output: ProbeOutput = serde_json::from_slice(&stdout)
         .map_err(|_| HostError::new("protocol_error", "credential probe returned invalid JSON"))?;
     output.exit_code = status.code().unwrap_or(-1);
     Ok(output)
 }
 
+#[cfg(unix)]
 struct ProbeChild {
     child: Option<Child>,
     process_group: u32,
 }
 
+#[cfg(unix)]
 impl ProbeChild {
     fn new(child: Child, process_group: u32) -> Self {
         Self {
@@ -810,6 +852,7 @@ impl ProbeChild {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ProbeChild {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
@@ -833,9 +876,7 @@ fn kill_process_group(process_group: u32) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_process_group(_process_group: u32) {}
-
+#[cfg(unix)]
 async fn read_bounded(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>, HostError> {
     let mut bytes = Vec::new();
     reader
@@ -915,12 +956,74 @@ fn work_json(item: &WorkItemSnapshot) -> Value {
     })
 }
 
-fn delivery_json(delivery: &CredentialDelivery) -> Value {
+fn delivery_json(delivery: &HarnessCredentialDelivery) -> Value {
     match delivery {
-        CredentialDelivery::HarnessManaged => json!({"kind": "harness_managed"}),
-        CredentialDelivery::ProcessEnvironment { variable } => {
+        HarnessCredentialDelivery::HarnessManaged => json!({"kind": "harness_managed"}),
+        HarnessCredentialDelivery::ProcessEnvironment { variable } => {
             json!({"kind": "process_environment", "variable": variable})
         }
+    }
+}
+
+fn credential_requirement<'a>(
+    requirements: &'a [HarnessCredentialRequirement],
+    slot: &CredentialSlot,
+) -> Result<&'a HarnessCredentialRequirement, HostError> {
+    requirements
+        .iter()
+        .find(|requirement| requirement.slot == *slot)
+        .ok_or_else(|| HostError::invalid("harness declares no requirement for credential slot"))
+}
+
+fn validate_binding_requirement(
+    binding: &CredentialBinding,
+    delivery: &HarnessCredentialDelivery,
+) -> Result<(), HostError> {
+    if matches!(
+        (binding, delivery),
+        (
+            CredentialBinding::Delegated { .. },
+            HarnessCredentialDelivery::HarnessManaged
+        ) | (
+            CredentialBinding::Secret { .. },
+            HarnessCredentialDelivery::ProcessEnvironment { .. }
+        )
+    ) {
+        Ok(())
+    } else {
+        Err(HostError::invalid(
+            "credential source does not match harness delivery requirement",
+        ))
+    }
+}
+
+fn validate_requested_delivery(
+    requested: &DeliveryInput,
+    declared: &HarnessCredentialDelivery,
+) -> Result<(), HostError> {
+    match (requested, declared) {
+        (DeliveryInput::HarnessManaged, HarnessCredentialDelivery::HarnessManaged) => Ok(()),
+        (
+            DeliveryInput::ProcessEnvironment {
+                variable: requested,
+            },
+            HarnessCredentialDelivery::ProcessEnvironment { variable: declared },
+        ) => {
+            validate_environment_variable(requested)?;
+            validate_environment_variable(declared).map_err(|_| {
+                HostError::internal("harness declared an invalid environment variable")
+            })?;
+            if requested == declared {
+                Ok(())
+            } else {
+                Err(HostError::invalid(
+                    "credential delivery does not match harness requirement",
+                ))
+            }
+        }
+        _ => Err(HostError::invalid(
+            "credential delivery does not match harness requirement",
+        )),
     }
 }
 
@@ -1022,7 +1125,14 @@ struct ConnectionInput {
 }
 
 impl ConnectionInput {
-    fn into_domain(self) -> Result<ConvertedConnection, HostError> {
+    fn into_domain(self, harness: &impl HarnessAdapter) -> Result<ConvertedConnection, HostError> {
+        if self.harness != harness.descriptor().id {
+            return Err(HostError::new(
+                "unsupported",
+                "connection selects an unavailable harness",
+            ));
+        }
+        let requirements = harness.credential_requirements();
         let mut needs_memory = false;
         let mut credentials = Vec::with_capacity(self.credentials.len());
         for credential in self.credentials {
@@ -1032,16 +1142,12 @@ impl ConnectionInput {
                     authority,
                     delivery,
                 } => {
-                    if !matches!(delivery, DeliveryInput::HarnessManaged) {
-                        return Err(HostError::invalid(
-                            "delegated credentials require harness_managed delivery",
-                        ));
-                    }
-                    credentials.push(CredentialBindingRecord {
-                        slot: CredentialSlot::new(slot)?,
-                        binding: CredentialBinding::Delegated { authority },
-                        delivery: Some(CredentialDelivery::HarnessManaged),
-                    });
+                    let slot = CredentialSlot::new(slot)?;
+                    let binding = CredentialBinding::Delegated { authority };
+                    let requirement = credential_requirement(&requirements, &slot)?;
+                    validate_requested_delivery(&delivery, &requirement.delivery)?;
+                    validate_binding_requirement(&binding, &requirement.delivery)?;
+                    credentials.push(CredentialBindingRecord { slot, binding });
                 }
                 CredentialInput::Secret {
                     slot,
@@ -1051,28 +1157,24 @@ impl ConnectionInput {
                 } => {
                     require_memory(&backend)?;
                     let slot = CredentialSlot::new(slot)?;
-                    let DeliveryInput::ProcessEnvironment { variable } = delivery else {
-                        return Err(HostError::invalid(
-                            "secret credentials require process_environment delivery",
-                        ));
-                    };
-                    needs_memory = true;
-                    credentials.push(CredentialBindingRecord {
-                        slot,
-                        binding: CredentialBinding::Secret {
-                            reference: SecretReference {
-                                backend_id: SecretBackendId::new(backend)?,
-                                locator: SecretLocator::new(locator)?,
-                            },
+                    let binding = CredentialBinding::Secret {
+                        reference: SecretReference {
+                            backend_id: SecretBackendId::new(backend)?,
+                            locator: SecretLocator::new(locator)?,
                         },
-                        delivery: Some(CredentialDelivery::process_environment(variable)?),
-                    });
+                    };
+                    let requirement = credential_requirement(&requirements, &slot)?;
+                    validate_requested_delivery(&delivery, &requirement.delivery)?;
+                    validate_binding_requirement(&binding, &requirement.delivery)?;
+                    needs_memory = true;
+                    credentials.push(CredentialBindingRecord { slot, binding });
                 }
                 CredentialInput::Disabled { slot } => {
+                    let slot = CredentialSlot::new(slot)?;
+                    credential_requirement(&requirements, &slot)?;
                     credentials.push(CredentialBindingRecord {
-                        slot: CredentialSlot::new(slot)?,
+                        slot,
                         binding: CredentialBinding::Disabled,
-                        delivery: None,
                     });
                 }
             }
@@ -1362,6 +1464,55 @@ mod tests {
     }
 
     #[test]
+    fn connection_input_rejects_missing_or_adapter_mismatched_delivery() {
+        let mut value = json!({
+            "id": "0193f26e-7a72-7d42-bf77-0de14c4cc222",
+            "name": "Work",
+            "harness": "mock",
+            "model_provider": "anthropic",
+            "provider_state": "work-test",
+            "credentials": [{
+                "slot": "anthropic.api_key",
+                "source": "secret",
+                "backend": "memory",
+                "locator": "connection/work/key"
+            }]
+        });
+        assert!(serde_json::from_value::<ConnectionInput>(value.clone()).is_err());
+
+        value["credentials"][0]["delivery"] =
+            json!({"kind": "process_environment", "variable": "WRONG_API_KEY"});
+        let input = serde_json::from_value::<ConnectionInput>(value).unwrap();
+        let mock = MockHarness::new(HarnessCapabilities::default(), Vec::new(), None);
+        let error = match input.into_domain(&mock) {
+            Ok(_) => panic!("mismatched adapter delivery unexpectedly validated"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid_request");
+
+        let wrong_source = serde_json::from_value::<ConnectionInput>(json!({
+            "id": "0193f26e-7a72-7d42-bf77-0de14c4cc222",
+            "name": "Work",
+            "harness": "mock",
+            "model_provider": "codex",
+            "provider_state": "work-test",
+            "credentials": [{
+                "slot": "codex.account",
+                "source": "secret",
+                "backend": "memory",
+                "locator": "connection/work/key",
+                "delivery": {"kind": "harness_managed"}
+            }]
+        }))
+        .unwrap();
+        let error = match wrong_source.into_domain(&mock) {
+            Ok(_) => panic!("mismatched credential source unexpectedly validated"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
     fn credential_probe_rejects_relative_executables() {
         let params = ProbeParams {
             connection_id: "ignored".to_owned(),
@@ -1424,5 +1575,80 @@ mod tests {
             .unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_holding_descendant_is_killed_by_the_full_probe_timeout() {
+        use yakshed_secrets::{ResolvedSecret, ResolvedSecretSource};
+
+        let temp = tempfile::tempdir().unwrap();
+        let group_file = temp.path().join("probe.group");
+        let child_file = temp.path().join("probe.child");
+        let params = ProbeParams {
+            connection_id: "ignored".to_owned(),
+            slot: "ignored".to_owned(),
+            probe_program: "/bin/sh".to_owned(),
+            probe_args: vec![
+                "-c".to_owned(),
+                "echo $$ > \"$1\"; sleep 60 & echo $! > \"$2\"; exit 0".to_owned(),
+                "probe".to_owned(),
+                group_file.display().to_string(),
+                child_file.display().to_string(),
+            ],
+            expected_sha256: "0".repeat(64),
+            forbidden_variables: Vec::new(),
+        };
+        let secret = ResolvedSecret::new(
+            SecretString::from("synthetic".to_owned()),
+            ResolvedSecretSource {
+                backend: SecretBackendId::new("memory").unwrap(),
+            },
+            None,
+        );
+        let environment =
+            shape_process_environment(&HashMap::new(), "TEST_SECRET", &secret).unwrap();
+
+        let error = match run_probe_with_timeout(
+            &params,
+            "TEST_SECRET",
+            environment,
+            Duration::from_millis(500),
+        )
+        .await
+        {
+            Ok(_) => panic!("pipe-holding descendant unexpectedly completed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "timeout");
+        let process_group = std::fs::read_to_string(group_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let descendant = std::fs::read_to_string(child_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert_process_gone(-process_group).await;
+        assert_process_gone(descendant).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_gone(pid: libc::pid_t) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("probe process remained after group cleanup");
     }
 }

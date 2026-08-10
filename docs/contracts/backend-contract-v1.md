@@ -376,6 +376,10 @@ Result:
 
 The digest returned by the probe is not exposed by the host response. This operation exists only for synthetic contract secrets.
 
+> The v1 contract host enables this operation only on Unix, where it can isolate and reap the
+> complete probe process group. Non-Unix hosts return `unsupported`; add Windows Job Object
+> support only when a Windows contract-gate lane is introduced.
+
 ### Probe executable contract
 
 The host invokes the probe without a shell as:

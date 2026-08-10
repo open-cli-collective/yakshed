@@ -6,9 +6,9 @@ use yakshed_application::{
     SecretBackendConfigurationError,
 };
 use yakshed_domain::{
-    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialDelivery,
-    CredentialSlot, ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings,
-    SecretLocator, SecretReference,
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator,
+    SecretReference,
 };
 use yakshed_store::{AppPaths, ConfigError, ConfigStore};
 
@@ -56,41 +56,8 @@ fn connection() -> Connection {
                     locator: SecretLocator::new("connection/work/anthropic_api_key").unwrap(),
                 },
             },
-            delivery: None,
         }],
     }
-}
-
-#[tokio::test]
-async fn credential_delivery_round_trips_across_restart() {
-    let temp = tempdir().unwrap();
-    let paths = AppPaths::for_test(temp.path());
-    let store = open(paths.clone()).unwrap();
-    let mut connection = connection();
-    connection.credentials[0].delivery =
-        Some(CredentialDelivery::process_environment("ANTHROPIC_API_KEY").unwrap());
-
-    store
-        .update(
-            ConfigRevision::INITIAL,
-            ConfigChange::PutConnectionWithSecretBackends {
-                connection: connection.clone(),
-                secret_backends: vec![SecretBackend {
-                    id: SecretBackendId::new("memory").unwrap(),
-                    settings: SecretBackendSettings::Memory,
-                }],
-            },
-        )
-        .await
-        .unwrap();
-
-    let written = fs::read_to_string(paths.config_root.join("config.toml")).unwrap();
-    assert!(written.contains("kind = \"process_environment\""));
-    assert!(written.contains("variable = \"ANTHROPIC_API_KEY\""));
-    assert_eq!(
-        open(paths).unwrap().snapshot().config.connections,
-        vec![connection]
-    );
 }
 
 #[tokio::test]

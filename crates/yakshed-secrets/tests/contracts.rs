@@ -63,7 +63,6 @@ fn secret_binding(slot: &str, backend: &str, locator: &str) -> CredentialBinding
                 locator: SecretLocator::new(locator).unwrap(),
             },
         },
-        delivery: None,
     }
 }
 
@@ -844,7 +843,6 @@ async fn current_binding_changes_and_detaches_take_effect_immediately() {
         binding: CredentialBinding::Delegated {
             authority: "provider-login".into(),
         },
-        delivery: None,
     };
     let changed = connection(
         CONNECTION_A,
@@ -901,7 +899,6 @@ async fn disabled_and_invalid_scopes_fail_before_backend_access() {
     let disabled = CredentialBindingRecord {
         slot: CredentialSlot::new("provider.api_key").unwrap(),
         binding: CredentialBinding::Disabled,
-        delivery: None,
     };
     let connections = [connection(
         CONNECTION_A,
