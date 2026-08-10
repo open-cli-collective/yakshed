@@ -4,7 +4,7 @@ use std::{
     fs,
     path::Path,
     str::FromStr,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, Transaction, params};
 use rusqlite_migration::{M, Migrations};
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use yakshed_application::{
     AppStore, ApprovalPage, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateProject,
     CreateRun, CreateWorkItem, GetStreamCursor, IdGenerator, ListTimeline, ListWorkItems,
@@ -31,6 +31,7 @@ use crate::AppPaths;
 const DATABASE_FILE: &str = "yakshed.sqlite3";
 const SCHEMA_VERSION: u32 = 1;
 const MAX_PAGE_SIZE: u32 = 200;
+const ACTOR_QUEUE_CAPACITY: usize = 64;
 
 const INITIAL_SCHEMA: &str = r#"
 CREATE TABLE projects (
@@ -148,7 +149,7 @@ enum Message {
 }
 
 struct Actor {
-    sender: Mutex<Option<mpsc::Sender<Message>>>,
+    sender: AsyncMutex<Option<mpsc::Sender<Message>>>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -170,7 +171,7 @@ impl SqliteStore {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> Result<Self, StoreError> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = oneshot::channel();
         let worker_clock = Arc::clone(&clock);
         let thread = thread::Builder::new()
@@ -198,12 +199,16 @@ impl SqliteStore {
             })
             .map_err(|error| StoreError::Open(error.to_string()))?;
 
-        ready_receiver.await.map_err(|_| {
+        let ready = ready_receiver.await.map_err(|_| {
             StoreError::Open("database worker stopped during initialization".to_owned())
-        })??;
+        })?;
+        if let Err(error) = ready {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+            return Err(error);
+        }
         Ok(Self {
             actor: Actor {
-                sender: Mutex::new(Some(sender)),
+                sender: AsyncMutex::new(Some(sender)),
                 thread: Mutex::new(Some(thread)),
             },
             clock,
@@ -218,17 +223,51 @@ impl SqliteStore {
         T: Send + 'static,
     {
         let (result_sender, result_receiver) = oneshot::channel();
-        self.actor
-            .sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let sender = self.actor.sender.lock().await;
+        sender
             .as_ref()
             .ok_or(StoreError::Closed)?
             .send(Message::Job(Box::new(move |worker| {
                 let _ = result_sender.send(operation(worker));
             })))
+            .await
             .map_err(|_| StoreError::Closed)?;
+        drop(sender);
         result_receiver.await.map_err(|_| StoreError::Closed)?
+    }
+
+    #[cfg(test)]
+    async fn stall_worker(&self) -> Result<std::sync::mpsc::Sender<()>, StoreError> {
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (started_sender, started_receiver) = oneshot::channel();
+        let sender = self.actor.sender.lock().await;
+        sender
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .send(Message::Job(Box::new(move |_| {
+                let _ = started_sender.send(());
+                let _ = release_receiver.recv();
+            })))
+            .await
+            .map_err(|_| StoreError::Closed)?;
+        drop(sender);
+        started_receiver.await.map_err(|_| StoreError::Closed)?;
+        Ok(release_sender)
+    }
+
+    #[cfg(test)]
+    async fn enqueue_test_probe(&self) -> Result<oneshot::Receiver<()>, StoreError> {
+        let (done_sender, done_receiver) = oneshot::channel();
+        let sender = self.actor.sender.lock().await;
+        sender
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .send(Message::Job(Box::new(move |_| {
+                let _ = done_sender.send(());
+            })))
+            .await
+            .map_err(|_| StoreError::Closed)?;
+        Ok(done_receiver)
     }
 
     #[cfg(test)]
@@ -296,8 +335,8 @@ impl SqliteStore {
     }
 }
 
-fn run_worker(mut worker: Worker, receiver: mpsc::Receiver<Message>) {
-    while let Ok(message) = receiver.recv() {
+fn run_worker(mut worker: Worker, mut receiver: mpsc::Receiver<Message>) {
+    while let Some(message) = receiver.blocking_recv() {
         match message {
             Message::Job(job) => job(&mut worker),
             Message::Shutdown(done) => {
@@ -326,9 +365,12 @@ fn open_connection(paths: &AppPaths) -> Result<Connection, StoreError> {
     if !existed {
         set_private_file_permissions(&database)?;
     }
+    connection
+        .busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(classify_integrity_or_open)?;
     let version = connection
         .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-        .map_err(classify_integrity_or_open)?;
+        .map_err(classify_lease_error)?;
     if version > SCHEMA_VERSION {
         return Err(StoreError::UnsupportedNewerSchema {
             found: version,
@@ -337,16 +379,22 @@ fn open_connection(paths: &AppPaths) -> Result<Connection, StoreError> {
     }
 
     connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(classify_lease_error)?;
+    connection
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .map_err(classify_lease_error)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE; COMMIT;")
+        .map_err(classify_lease_error)?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(5_000))
+        .map_err(classify_integrity_or_open)?;
+    connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(classify_integrity_or_open)?;
     connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .map_err(classify_integrity_or_open)?;
-    connection
         .pragma_update(None, "synchronous", "FULL")
-        .map_err(classify_integrity_or_open)?;
-    connection
-        .busy_timeout(std::time::Duration::from_millis(5_000))
         .map_err(classify_integrity_or_open)?;
     let integrity: String = connection
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
@@ -386,6 +434,17 @@ fn classify_integrity_or_open(error: rusqlite::Error) -> StoreError {
         StoreError::Integrity(error.to_string())
     } else {
         StoreError::Open(error.to_string())
+    }
+}
+
+fn classify_lease_error(error: rusqlite::Error) -> StoreError {
+    if matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    ) {
+        StoreError::Conflict("store is already open in another instance".to_owned())
+    } else {
+        classify_integrity_or_open(error)
     }
 }
 
@@ -1169,8 +1228,11 @@ impl AppStore for SqliteStore {
         validate_app_id("run id", command.id.is_v7())?;
         let now = self.clock.now();
         self.call(move |worker| {
-            let existing = worker
+            let transaction = worker
                 .connection
+                .transaction()
+                .map_err(map_database_error)?;
+            let existing = transaction
                 .query_row(
                     &format!("{RUN_SELECT} WHERE id = ?1"),
                     [command.id.to_string()],
@@ -1191,21 +1253,33 @@ impl AppStore for SqliteStore {
                     )))
                 };
             }
-            let work_exists = worker
-                .connection
+            let work_status = transaction
                 .query_row(
-                    "SELECT 1 FROM work_items WHERE id = ?1",
+                    "SELECT status FROM work_items WHERE id = ?1",
                     [command.work_item_id.to_string()],
-                    |_| Ok(()),
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()
-                .map_err(map_database_error)?
-                .is_some();
-            if !work_exists {
-                return Err(StoreError::NotFound {
-                    entity: "work item",
-                    id: command.work_item_id.to_string(),
-                });
+                .map_err(map_database_error)?;
+            match work_status.as_deref() {
+                None => {
+                    return Err(StoreError::NotFound {
+                        entity: "work item",
+                        id: command.work_item_id.to_string(),
+                    });
+                }
+                Some("archived") => {
+                    return Err(StoreError::Conflict(format!(
+                        "archived work item cannot accept a run: {}",
+                        command.work_item_id
+                    )));
+                }
+                Some("ready") => {}
+                Some(status) => {
+                    return Err(StoreError::Integrity(format!(
+                        "unknown work item status: {status}"
+                    )));
+                }
             }
             let (namespace, provider_run_id) =
                 command
@@ -1217,8 +1291,7 @@ impl AppStore for SqliteStore {
                             Some(provider.value().to_owned()),
                         )
                     });
-            worker
-                .connection
+            transaction
                 .execute(
                     "INSERT INTO runs
                      (id, connection_id, work_item_id, status, provider_namespace,
@@ -1234,7 +1307,7 @@ impl AppStore for SqliteStore {
                     ],
                 )
                 .map_err(map_database_error)?;
-            Ok(RunSnapshot {
+            let snapshot = RunSnapshot {
                 id: command.id,
                 connection_id: command.connection_id,
                 work_item_id: command.work_item_id,
@@ -1242,7 +1315,9 @@ impl AppStore for SqliteStore {
                 provider_id: command.provider_run,
                 created_at: now,
                 ended_at: None,
-            })
+            };
+            transaction.commit().map_err(map_database_error)?;
+            Ok(snapshot)
         })
         .await
     }
@@ -1899,10 +1974,11 @@ impl AppStore for SqliteStore {
         self.actor
             .sender
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .await
             .take()
             .ok_or(StoreError::Closed)?
             .send(Message::Shutdown(done_sender))
+            .await
             .map_err(|_| StoreError::Closed)?;
         done_receiver.await.map_err(|_| StoreError::Closed)?;
         let thread = self
@@ -1923,11 +1999,9 @@ impl AppStore for SqliteStore {
 
 impl Drop for SqliteStore {
     fn drop(&mut self) {
-        if let Ok(sender) = self.actor.sender.get_mut()
-            && let Some(sender) = sender.take()
-        {
+        if let Some(sender) = self.actor.sender.get_mut().take() {
             let (done, _) = oneshot::channel();
-            let _ = sender.send(Message::Shutdown(done));
+            let _ = sender.try_send(Message::Shutdown(done));
         }
     }
 }
@@ -1943,6 +2017,37 @@ mod tests {
         fn now(&self) -> UtcTimestamp {
             UtcTimestamp::from_unix_millis(42)
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_actor_queue_applies_backpressure_until_worker_drains() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(
+            AppPaths::for_test(temp.path()),
+            Arc::new(FixedClock),
+            Arc::new(SystemIdGenerator),
+        )
+        .await
+        .unwrap();
+        let release = store.stall_worker().await.unwrap();
+        let mut queued = Vec::with_capacity(ACTOR_QUEUE_CAPACITY);
+        for _ in 0..ACTOR_QUEUE_CAPACITY {
+            queued.push(store.enqueue_test_probe().await.unwrap());
+        }
+        let mut excess = Box::pin(store.enqueue_test_probe());
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut excess)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let excess = excess.await.unwrap();
+        for result in queued {
+            result.await.unwrap();
+        }
+        excess.await.unwrap();
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]

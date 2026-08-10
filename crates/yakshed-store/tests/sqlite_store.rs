@@ -629,6 +629,44 @@ async fn archive_subtree_preserves_archived_records() {
 }
 
 #[tokio::test]
+async fn archived_work_item_rejects_new_run_but_allows_idempotent_retry() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "archived run target".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let original = CreateRun {
+        id: context.ids.next_run_id(),
+        connection_id: connection_a(),
+        work_item_id: work.id,
+        provider_run: None,
+    };
+    let run = context.store.create_run(original.clone()).await.unwrap();
+    context.store.archive_work_subtree(work.id).await.unwrap();
+
+    assert_eq!(context.store.create_run(original).await.unwrap(), run);
+    assert!(matches!(
+        context
+            .store
+            .create_run(CreateRun {
+                id: context.ids.next_run_id(),
+                connection_id: connection_a(),
+                work_item_id: work.id,
+                provider_run: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
 async fn pagination_is_stable_and_timeline_ordinals_are_independent_from_stream_cursors() {
     let context = Context::open().await;
     let project_id = context.project().await;
@@ -875,6 +913,64 @@ async fn concurrent_callers_serialize_and_shutdown_is_typed() {
         context.store.get_work_item(one.unwrap().id).await,
         Err(StoreError::Closed)
     ));
+}
+
+#[tokio::test]
+async fn second_open_conflicts_without_reconciling_live_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let ids = Arc::new(TestIds::new());
+    let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone())
+        .await
+        .unwrap();
+    let project = store
+        .create_project(CreateProject {
+            id: ids.next_project_id(),
+            name: "lease owner".into(),
+        })
+        .await
+        .unwrap();
+    let work = store
+        .create_work_item(CreateWorkItem {
+            id: ids.next_work_item_id(),
+            project_id: project.id,
+            title: "live work".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = store
+        .create_run(CreateRun {
+            id: ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+
+    match SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone()).await {
+        Err(StoreError::Conflict(_)) => {}
+        Err(error) => panic!("unexpected second-open error: {error:?}"),
+        Ok(_) => panic!("second store unexpectedly acquired the database lease"),
+    }
+    assert_eq!(
+        store.get_run(run.id).await.unwrap().status,
+        RunStatus::Running
+    );
+    assert_eq!(
+        store.list_active_runs(None, 10).await.unwrap().items.len(),
+        1
+    );
+
+    store.shutdown().await.unwrap();
+    let reopened = SqliteStore::open(paths, Arc::new(FixedClock), ids)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get_run(run.id).await.unwrap().status,
+        RunStatus::Interrupted
+    );
 }
 
 #[tokio::test]
