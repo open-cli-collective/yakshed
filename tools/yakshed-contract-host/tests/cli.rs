@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[test]
-fn version_is_the_only_implemented_invocation() {
+fn version_is_state_free_and_invalid_launches_fail_without_stdout() {
     let binary = env!("CARGO_BIN_EXE_yakshed-contract-host");
     let version = Command::new(binary)
         .arg("--version")
@@ -14,14 +14,19 @@ fn version_is_the_only_implemented_invocation() {
     );
 
     for args in [&[][..], &["--version", "extra"][..], &["--frobnicate"][..]] {
-        let stub = Command::new(binary)
+        let rejected = Command::new(binary)
             .args(args)
             .output()
             .expect("contract host should run");
-        assert!(!stub.status.success(), "{args:?} unexpectedly succeeded");
-        assert_eq!(
-            String::from_utf8(stub.stderr).unwrap(),
-            "contract host not yet implemented\n"
+        assert!(
+            !rejected.status.success(),
+            "{args:?} unexpectedly succeeded"
+        );
+        assert!(rejected.stdout.is_empty());
+        assert!(
+            String::from_utf8(rejected.stderr)
+                .unwrap()
+                .starts_with("contract host argument error:")
         );
     }
 }

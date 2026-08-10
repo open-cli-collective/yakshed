@@ -910,8 +910,13 @@ name = "yakshed-contract-host"
 version = "0.1.0"
 dependencies = [
  "provider-mock",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "yakshed-application",
- "yakshed-desktop-api",
+ "yakshed-domain",
  "yakshed-harness",
  "yakshed-secrets",
  "yakshed-store",
@@ -970,6 +975,7 @@ dependencies = [
  "rusqlite",
  "rusqlite_migration",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

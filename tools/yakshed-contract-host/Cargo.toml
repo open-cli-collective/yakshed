@@ -6,8 +6,13 @@ rust-version.workspace = true
 
 [dependencies]
 provider-mock.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
 yakshed-application.workspace = true
-yakshed-desktop-api.workspace = true
+yakshed-domain.workspace = true
 yakshed-harness.workspace = true
-yakshed-secrets.workspace = true
+yakshed-secrets = { workspace = true, features = ["dev-secrets"] }
 yakshed-store.workspace = true

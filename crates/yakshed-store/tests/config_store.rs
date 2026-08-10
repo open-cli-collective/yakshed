@@ -85,6 +85,31 @@ async fn config_round_trips_through_disk() {
     assert_eq!(reopened.snapshot().config, updated.config);
 }
 
+#[tokio::test]
+async fn connection_and_required_backend_commit_in_one_revision() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let store = open(paths.clone()).unwrap();
+
+    let snapshot = store
+        .update(
+            ConfigRevision::INITIAL,
+            ConfigChange::PutConnectionWithSecretBackends {
+                connection: connection(),
+                secret_backends: vec![SecretBackend {
+                    id: SecretBackendId::new("memory").unwrap(),
+                    settings: SecretBackendSettings::Memory,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.revision, ConfigRevision::new(1));
+    assert_eq!(snapshot.config.connections, vec![connection()]);
+    assert_eq!(open(paths).unwrap().snapshot().config, snapshot.config);
+}
+
 #[test]
 fn injected_capabilities_report_missing_feature_for_persisted_local_file_config() {
     let temp = tempdir().unwrap();

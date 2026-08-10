@@ -366,6 +366,21 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
             config.connections.push(connection);
             config.connections.sort_by_key(|item| item.id);
         }
+        ConfigChange::PutConnectionWithSecretBackends {
+            connection,
+            secret_backends,
+        } => {
+            for backend in secret_backends {
+                config.secret_backends.retain(|item| item.id != backend.id);
+                config.secret_backends.push(backend);
+            }
+            config
+                .secret_backends
+                .sort_by(|left, right| left.id.cmp(&right.id));
+            config.connections.retain(|item| item.id != connection.id);
+            config.connections.push(connection);
+            config.connections.sort_by_key(|item| item.id);
+        }
         ConfigChange::RemoveConnection(id) => config.connections.retain(|item| item.id != id),
         ConfigChange::PutSecretBackend(backend) => {
             config.secret_backends.retain(|item| item.id != backend.id);
