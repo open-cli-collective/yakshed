@@ -581,11 +581,84 @@ impl Connection {
 pub struct CredentialBindingRecord {
     pub slot: CredentialSlot,
     pub binding: CredentialBinding,
+    /// Adapter delivery metadata. `None` remains valid for schema-v1 entries written before
+    /// delivery became canonical; new connection inputs should always supply it.
+    pub delivery: Option<CredentialDelivery>,
 }
 
 impl CredentialBindingRecord {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        self.binding.validate()
+        self.binding.validate()?;
+        match (&self.binding, &self.delivery) {
+            (_, None)
+            | (CredentialBinding::Delegated { .. }, Some(CredentialDelivery::HarnessManaged))
+            | (
+                CredentialBinding::Secret { .. },
+                Some(CredentialDelivery::ProcessEnvironment { .. }),
+            ) => {}
+            (CredentialBinding::Disabled, Some(_)) => {
+                return Err(ValidationError(
+                    "disabled credential cannot have delivery metadata".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(ValidationError(
+                    "credential source and delivery kind are incompatible".to_owned(),
+                ));
+            }
+        }
+        if let Some(delivery) = &self.delivery {
+            delivery.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Closed non-secret mechanisms for delivering one resolved credential to a harness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CredentialDelivery {
+    HarnessManaged,
+    ProcessEnvironment { variable: String },
+}
+
+impl CredentialDelivery {
+    pub fn process_environment(variable: impl Into<String>) -> Result<Self, ValidationError> {
+        let delivery = Self::ProcessEnvironment {
+            variable: variable.into(),
+        };
+        delivery.validate()?;
+        Ok(delivery)
+    }
+
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::HarnessManaged => "harness_managed",
+            Self::ProcessEnvironment { .. } => "process_environment",
+        }
+    }
+
+    pub fn variable(&self) -> Option<&str> {
+        match self {
+            Self::HarnessManaged => None,
+            Self::ProcessEnvironment { variable } => Some(variable),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let Self::ProcessEnvironment { variable } = self else {
+            return Ok(());
+        };
+        let mut bytes = variable.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        {
+            return Err(ValidationError(
+                "invalid process environment variable".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -990,6 +1063,13 @@ mod tests {
     }
 
     #[test]
+    fn credential_delivery_is_closed_and_validates_environment_variables() {
+        assert!(CredentialDelivery::process_environment("ANTHROPIC_API_KEY").is_ok());
+        assert!(CredentialDelivery::process_environment("NOT-AN-ENV-VAR").is_err());
+        assert_eq!(CredentialDelivery::HarnessManaged.kind(), "harness_managed");
+    }
+
+    #[test]
     fn connection_rejects_conflicting_bindings_for_the_same_slot() {
         let connection = Connection {
             id: "0193f26e-7a72-7d42-bf77-0de14c4cc222".parse().unwrap(),
@@ -1003,6 +1083,7 @@ mod tests {
                     binding: CredentialBinding::Delegated {
                         authority: "codex-app-server".to_owned(),
                     },
+                    delivery: Some(CredentialDelivery::HarnessManaged),
                 },
                 CredentialBindingRecord {
                     slot: CredentialSlot::new("codex.account").unwrap(),
@@ -1012,6 +1093,9 @@ mod tests {
                             locator: SecretLocator::new("connection/work/codex_account").unwrap(),
                         },
                     },
+                    delivery: Some(
+                        CredentialDelivery::process_environment("CODEX_API_KEY").unwrap(),
+                    ),
                 },
             ],
         };

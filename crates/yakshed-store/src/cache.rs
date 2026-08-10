@@ -1,10 +1,21 @@
-use std::{fs, io, path::PathBuf};
+use std::{fs, io, io::Write, path::Path, path::PathBuf};
 
+use atomic_write_file::OpenOptions;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{AppPaths, PathError};
+
+const CACHE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CacheEnvelope {
+    schema_version: u32,
+    value: Value,
+}
 
 /// Small disposable JSON cache used by application composition roots.
 pub struct CacheStore {
@@ -26,13 +37,20 @@ impl CacheStore {
     pub fn put(&self, namespace: &str, key: &str, value: &Value) -> Result<(), CacheError> {
         validate_key(namespace)?;
         validate_key(key)?;
-        fs::write(self.path(namespace, key), serde_json::to_vec(value)?).map_err(CacheError::Io)
+        let bytes = serde_json::to_vec(&CacheEnvelope {
+            schema_version: CACHE_SCHEMA_VERSION,
+            value: value.clone(),
+        })?;
+        let mut file = OpenOptions::new().open(self.path(namespace, key))?;
+        file.write_all(&bytes)?;
+        file.commit()?;
+        Ok(())
     }
 
     pub fn exists(&self, namespace: &str, key: &str) -> Result<bool, CacheError> {
         validate_key(namespace)?;
         validate_key(key)?;
-        Ok(self.path(namespace, key).try_exists()?)
+        valid_entry(&self.path(namespace, key))
     }
 
     pub fn clear(&self) -> Result<(), CacheError> {
@@ -45,10 +63,10 @@ impl CacheStore {
     }
 
     pub fn count(&self) -> Result<u64, CacheError> {
-        Ok(
-            fs::read_dir(&self.entries)?
-                .try_fold(0_u64, |count, entry| entry.map(|_| count + 1))?,
-        )
+        fs::read_dir(&self.entries)?.try_fold(0_u64, |count, entry| {
+            let entry = entry?;
+            Ok(count + u64::from(valid_entry(&entry.path())?))
+        })
     }
 
     fn path(&self, namespace: &str, key: &str) -> PathBuf {
@@ -64,6 +82,30 @@ impl CacheStore {
         name.push_str(".json");
         self.entries.join(name)
     }
+}
+
+fn valid_entry(path: &Path) -> Result<bool, CacheError> {
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let valid = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CacheEnvelope>(&bytes).ok())
+        .is_some_and(|entry| entry.schema_version == CACHE_SCHEMA_VERSION);
+    if !valid {
+        let metadata = fs::symlink_metadata(path)?;
+        let removed = if metadata.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        match removed {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(valid)
 }
 
 fn validate_key(value: &str) -> Result<(), CacheError> {
@@ -113,5 +155,29 @@ mod tests {
         assert!(!cache.exists("provider", "key").unwrap());
         assert!(!paths.cache_root.join("stale").exists());
         assert_eq!(fs::read(paths.config_root.join("keep")).unwrap(), b"config");
+    }
+
+    #[test]
+    fn truncated_entry_is_a_miss_and_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(root.path());
+        let cache = CacheStore::open(&paths).unwrap();
+        let entry = cache.path("provider", "truncated");
+        fs::write(&entry, br#"{"schema_version":1,"value":"#).unwrap();
+
+        assert!(!cache.exists("provider", "truncated").unwrap());
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn wrong_version_entry_is_a_miss_and_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(root.path());
+        let cache = CacheStore::open(&paths).unwrap();
+        let entry = cache.path("provider", "future");
+        fs::write(&entry, br#"{"schema_version":2,"value":{}}"#).unwrap();
+
+        assert!(!cache.exists("provider", "future").unwrap());
+        assert!(!entry.exists());
     }
 }

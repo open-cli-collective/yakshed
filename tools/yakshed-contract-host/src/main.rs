@@ -3,9 +3,9 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{ExitCode, Stdio},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -15,13 +15,17 @@ use provider_mock::MockHarness;
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, Command},
+};
 use yakshed_application::{
     AppStore, ConfigChange, ConfigRevision, CreateProject, CreateWorkItem, ListWorkItems,
     SystemClock, SystemIdGenerator,
 };
 use yakshed_domain::{
-    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
-    OperationId, ProjectId, ProviderStateRootId, SecretBackend, SecretBackendId,
+    Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialDelivery,
+    CredentialSlot, OperationId, ProjectId, ProviderStateRootId, SecretBackend, SecretBackendId,
     SecretBackendSettings, SecretLocator, SecretReference, WorkItemId, WorkItemSnapshot,
     WorkItemStatus,
 };
@@ -38,6 +42,8 @@ use yakshed_store::{
 
 const PROTOCOL_VERSION: u64 = 1;
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+/// Contract probes are local test helpers; five seconds covers interpreter startup with margin.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const ARTIFACT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[tokio::main(flavor = "current_thread")]
@@ -146,7 +152,6 @@ struct Host {
     artifacts: Option<ArtifactStore>,
     memory: Arc<MemorySecretBackend>,
     broker: CredentialBroker,
-    deliveries: HashMap<(ConnectionId, CredentialSlot), String>,
     _harness: MockHarness,
     negotiated: bool,
     shutting_down: bool,
@@ -196,7 +201,6 @@ impl Host {
             artifacts: Some(artifacts),
             memory,
             broker,
-            deliveries: HashMap::new(),
             _harness: MockHarness::new(HarnessCapabilities::default(), Vec::new(), None),
             negotiated: false,
             shutting_down: false,
@@ -306,7 +310,6 @@ impl Host {
         let params: PutConnectionParams = parse_params(params)?;
         let ConvertedConnection {
             connection,
-            deliveries,
             needs_memory,
         } = params.connection.into_domain()?;
         let id = connection.id;
@@ -327,11 +330,6 @@ impl Host {
                 },
             )
             .await?;
-        self.deliveries
-            .retain(|(connection, _), _| *connection != id);
-        for (slot, variable) in deliveries {
-            self.deliveries.insert((id, slot), variable);
-        }
         Ok(json!({"config_revision": snapshot.revision.get(), "connection_id": id}))
     }
 
@@ -400,8 +398,8 @@ impl Host {
                     "status": status,
                 }),
             };
-            if let Some(variable) = self.deliveries.get(&(connection.id, binding.slot.clone())) {
-                value["delivery"] = json!({"kind": "process_environment", "variable": variable});
+            if let Some(delivery) = &binding.delivery {
+                value["delivery"] = delivery_json(delivery);
             }
             credentials.push(value);
         }
@@ -542,9 +540,10 @@ impl Host {
             .iter()
             .find(|binding| binding.slot == slot)
             .ok_or_else(|| HostError::not_found("credential binding not found"))?;
-        let variable = self
-            .deliveries
-            .get(&(connection_id, slot.clone()))
+        let variable = binding
+            .delivery
+            .as_ref()
+            .and_then(CredentialDelivery::variable)
             .ok_or_else(|| HostError::new("unsupported", "binding has no process delivery"))?;
         let context = secret_context(connection_id, slot, "credential-probe")?;
         let resolution = self
@@ -565,7 +564,7 @@ impl Host {
         let ambient = std::env::vars_os().collect::<HashMap<OsString, OsString>>();
         let environment =
             shape_process_environment(&ambient, variable, &secret).map_err(HostError::invalid)?;
-        let output = run_probe(&params, variable, environment)?;
+        let output = run_probe(&params, variable, environment).await?;
         drop(secret);
         let matched = output.protocol_version == PROTOCOL_VERSION
             && output.present
@@ -583,7 +582,6 @@ impl Host {
     async fn config_reset(&mut self) -> Result<Value, HostError> {
         let revision = self.config.snapshot().revision;
         let snapshot = self.config.update(revision, ConfigChange::Reset).await?;
-        self.deliveries.clear();
         Ok(json!({"config_revision": snapshot.revision.get()}))
     }
 
@@ -699,10 +697,19 @@ impl Host {
     }
 }
 
-fn run_probe(
+async fn run_probe(
     params: &ProbeParams,
     variable: &str,
     environment: yakshed_secrets::ChildProcessEnvironment,
+) -> Result<ProbeOutput, HostError> {
+    run_probe_with_timeout(params, variable, environment, PROBE_TIMEOUT).await
+}
+
+async fn run_probe_with_timeout(
+    params: &ProbeParams,
+    variable: &str,
+    environment: yakshed_secrets::ChildProcessEnvironment,
+    timeout: Duration,
 ) -> Result<ProbeOutput, HostError> {
     let mut command = Command::new(&params.probe_program);
     command
@@ -712,13 +719,19 @@ fn run_probe(
     for forbidden in &params.forbidden_variables {
         command.arg("--forbid").arg(forbidden);
     }
-    environment.apply_to(&mut command);
+    environment.apply_to(command.as_std_mut());
+    #[cfg(unix)]
+    command.process_group(0);
+    command.kill_on_drop(true);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| HostError::new("backend_unavailable", "credential probe could not start"))?;
+    let process_group = child
+        .id()
+        .ok_or_else(|| HostError::internal("credential probe process ID unavailable"))?;
     let stdout = child
         .stdout
         .take()
@@ -727,16 +740,35 @@ fn run_probe(
         .stderr
         .take()
         .ok_or_else(|| HostError::internal("credential probe stderr unavailable"))?;
-    let stdout_reader = std::thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
-    let status = child
-        .wait()
-        .map_err(|_| HostError::new("backend_unavailable", "credential probe failed"))?;
+    let stdout_reader = tokio::spawn(read_bounded(stdout));
+    let stderr_reader = tokio::spawn(read_bounded(stderr));
+    let mut child = ProbeChild::new(child, process_group);
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            child.disarm();
+            status
+        }
+        Ok(Err(_)) => {
+            child.kill_and_reap().await;
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+            return Err(HostError::new(
+                "backend_unavailable",
+                "credential probe failed",
+            ));
+        }
+        Err(_) => {
+            child.kill_and_reap().await;
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+            return Err(HostError::new("timeout", "credential probe timed out"));
+        }
+    };
     let stdout = stdout_reader
-        .join()
+        .await
         .map_err(|_| HostError::internal("credential probe reader failed"))??;
     let _stderr = stderr_reader
-        .join()
+        .await
         .map_err(|_| HostError::internal("credential probe reader failed"))??;
     let mut output: ProbeOutput = serde_json::from_slice(&stdout)
         .map_err(|_| HostError::new("protocol_error", "credential probe returned invalid JSON"))?;
@@ -744,11 +776,72 @@ fn run_probe(
     Ok(output)
 }
 
-fn read_bounded(reader: impl Read) -> Result<Vec<u8>, HostError> {
+struct ProbeChild {
+    child: Option<Child>,
+    process_group: u32,
+}
+
+impl ProbeChild {
+    fn new(child: Child, process_group: u32) -> Self {
+        Self {
+            child: Some(child),
+            process_group,
+        }
+    }
+
+    async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child
+            .as_mut()
+            .expect("probe child is armed")
+            .wait()
+            .await
+    }
+
+    fn disarm(&mut self) {
+        self.child.take();
+    }
+
+    async fn kill_and_reap(&mut self) {
+        kill_process_group(self.process_group);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+}
+
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        kill_process_group(self.process_group);
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_group: u32) {
+    if let Ok(process_group) = i32::try_from(process_group) {
+        // SAFETY: negative PID targets the child-created process group; SIGKILL needs no handler.
+        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_process_group: u32) {}
+
+async fn read_bounded(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>, HostError> {
     let mut bytes = Vec::new();
     reader
         .take(PROBE_OUTPUT_LIMIT + 1)
         .read_to_end(&mut bytes)
+        .await
         .map_err(|_| HostError::new("protocol_error", "credential probe output read failed"))?;
     if bytes.len() as u64 > PROBE_OUTPUT_LIMIT {
         return Err(HostError::new(
@@ -820,6 +913,15 @@ fn work_json(item: &WorkItemSnapshot) -> Value {
         },
         "data_revision": item.revision.get(),
     })
+}
+
+fn delivery_json(delivery: &CredentialDelivery) -> Value {
+    match delivery {
+        CredentialDelivery::HarnessManaged => json!({"kind": "harness_managed"}),
+        CredentialDelivery::ProcessEnvironment { variable } => {
+            json!({"kind": "process_environment", "variable": variable})
+        }
+    }
 }
 
 fn secret_context(
@@ -921,7 +1023,6 @@ struct ConnectionInput {
 
 impl ConnectionInput {
     fn into_domain(self) -> Result<ConvertedConnection, HostError> {
-        let mut deliveries = Vec::new();
         let mut needs_memory = false;
         let mut credentials = Vec::with_capacity(self.credentials.len());
         for credential in self.credentials {
@@ -939,6 +1040,7 @@ impl ConnectionInput {
                     credentials.push(CredentialBindingRecord {
                         slot: CredentialSlot::new(slot)?,
                         binding: CredentialBinding::Delegated { authority },
+                        delivery: Some(CredentialDelivery::HarnessManaged),
                     });
                 }
                 CredentialInput::Secret {
@@ -954,8 +1056,6 @@ impl ConnectionInput {
                             "secret credentials require process_environment delivery",
                         ));
                     };
-                    validate_environment_variable(&variable)?;
-                    deliveries.push((slot.clone(), variable));
                     needs_memory = true;
                     credentials.push(CredentialBindingRecord {
                         slot,
@@ -965,12 +1065,14 @@ impl ConnectionInput {
                                 locator: SecretLocator::new(locator)?,
                             },
                         },
+                        delivery: Some(CredentialDelivery::process_environment(variable)?),
                     });
                 }
                 CredentialInput::Disabled { slot } => {
                     credentials.push(CredentialBindingRecord {
                         slot: CredentialSlot::new(slot)?,
                         binding: CredentialBinding::Disabled,
+                        delivery: None,
                     });
                 }
             }
@@ -986,7 +1088,6 @@ impl ConnectionInput {
         connection.validate()?;
         Ok(ConvertedConnection {
             connection,
-            deliveries,
             needs_memory,
         })
     }
@@ -994,7 +1095,6 @@ impl ConnectionInput {
 
 struct ConvertedConnection {
     connection: Connection,
-    deliveries: Vec<(CredentialSlot, String)>,
     needs_memory: bool,
 }
 
@@ -1243,6 +1343,25 @@ mod tests {
     }
 
     #[test]
+    fn connection_input_rejects_unknown_delivery_kinds() {
+        let value = json!({
+            "id": "0193f26e-7a72-7d42-bf77-0de14c4cc222",
+            "name": "Work",
+            "harness": "mock",
+            "model_provider": "anthropic",
+            "provider_state": "work-test",
+            "credentials": [{
+                "slot": "anthropic.api_key",
+                "source": "secret",
+                "backend": "memory",
+                "locator": "connection/work/key",
+                "delivery": {"kind": "shell_fragment"}
+            }]
+        });
+        assert!(serde_json::from_value::<ConnectionInput>(value).is_err());
+    }
+
+    #[test]
     fn credential_probe_rejects_relative_executables() {
         let params = ProbeParams {
             connection_id: "ignored".to_owned(),
@@ -1253,5 +1372,57 @@ mod tests {
             forbidden_variables: Vec::new(),
         };
         assert!(validate_probe(&params).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_probe_is_killed_and_reaped() {
+        use yakshed_secrets::{ResolvedSecret, ResolvedSecretSource};
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("probe.pid");
+        let params = ProbeParams {
+            connection_id: "ignored".to_owned(),
+            slot: "ignored".to_owned(),
+            probe_program: "/bin/sh".to_owned(),
+            probe_args: vec![
+                "-c".to_owned(),
+                "echo $$ > \"$1\"; sleep 60".to_owned(),
+                "probe".to_owned(),
+                pid_file.display().to_string(),
+            ],
+            expected_sha256: "0".repeat(64),
+            forbidden_variables: Vec::new(),
+        };
+        let secret = ResolvedSecret::new(
+            SecretString::from("synthetic".to_owned()),
+            ResolvedSecretSource {
+                backend: SecretBackendId::new("memory").unwrap(),
+            },
+            None,
+        );
+        let environment =
+            shape_process_environment(&HashMap::new(), "TEST_SECRET", &secret).unwrap();
+
+        let error = match run_probe_with_timeout(
+            &params,
+            "TEST_SECRET",
+            environment,
+            Duration::from_millis(500),
+        )
+        .await
+        {
+            Ok(_) => panic!("sleeping probe unexpectedly completed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "timeout");
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 }
