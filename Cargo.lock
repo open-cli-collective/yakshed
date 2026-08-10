@@ -799,10 +799,12 @@ dependencies = [
  "async-trait",
  "atomic-write-file",
  "secrecy",
+ "serde",
  "serde_json",
  "tempfile",
  "time",
  "tokio",
+ "yakshed-application",
  "yakshed-domain",
 ]
 

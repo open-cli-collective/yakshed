@@ -10,9 +10,13 @@ use std::{error::Error, fmt, sync::Arc};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use time::OffsetDateTime;
+pub use yakshed_application::{
+    DEV_SECRETS_FEATURE, LOCAL_FILE_BACKEND_KIND, SecretBackendConfigurationError,
+    validate_backend_configuration,
+};
 pub use yakshed_domain::{
-    ConnectionId, CredentialSlot, OperationId, SecretBackend, SecretBackendId, SecretLocator,
-    SecretReference,
+    ConnectionId, CredentialSlot, OperationId, SecretBackend, SecretBackendId,
+    SecretBackendSettings, SecretLocator, SecretReference,
 };
 
 pub use broker::{
@@ -22,70 +26,6 @@ pub use broker::{
 #[cfg(feature = "dev-secrets")]
 pub use local_file::LocalFileBackend;
 pub use memory::{MemorySecretBackend, MemorySecretFault};
-
-pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
-pub const DEV_SECRETS_FEATURE: &str = "dev-secrets";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SecretBackendConfigurationError {
-    MissingFeature {
-        backend: SecretBackendId,
-        feature: &'static str,
-    },
-    MissingPath {
-        backend: SecretBackendId,
-    },
-    WrongKind {
-        backend: SecretBackendId,
-    },
-}
-
-impl fmt::Display for SecretBackendConfigurationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingFeature { backend, feature } => write!(
-                formatter,
-                "secret backend {backend} requires cargo feature {feature}"
-            ),
-            Self::MissingPath { backend } => {
-                write!(formatter, "secret backend {backend} requires a path")
-            }
-            Self::WrongKind { backend } => {
-                write!(formatter, "secret backend {backend} is not local-file")
-            }
-        }
-    }
-}
-
-impl Error for SecretBackendConfigurationError {}
-
-/// Rejects configured backend kinds that are unavailable in this build.
-///
-/// Application composition must call this for every configured backend before registration.
-pub fn validate_backend_configuration(
-    backend: &SecretBackend,
-) -> Result<(), SecretBackendConfigurationError> {
-    if backend.kind != LOCAL_FILE_BACKEND_KIND {
-        return Ok(());
-    }
-    #[cfg(not(feature = "dev-secrets"))]
-    return Err(SecretBackendConfigurationError::MissingFeature {
-        backend: backend.id.clone(),
-        feature: DEV_SECRETS_FEATURE,
-    });
-    #[cfg(feature = "dev-secrets")]
-    if backend
-        .path
-        .as_deref()
-        .is_none_or(|path| path.trim().is_empty())
-    {
-        return Err(SecretBackendConfigurationError::MissingPath {
-            backend: backend.id.clone(),
-        });
-    }
-    #[cfg(feature = "dev-secrets")]
-    Ok(())
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretReferenceSummary {
@@ -311,6 +251,13 @@ pub enum SecretError {
         backend: SecretBackendId,
         redacted_message: String,
     },
+    UncertainWrite {
+        backend: SecretBackendId,
+    },
+    BackendIdentityMismatch {
+        backend: SecretBackendId,
+        file_backend: SecretBackendId,
+    },
     InvalidBinding {
         connection_id: ConnectionId,
         slot: CredentialSlot,
@@ -363,6 +310,18 @@ impl fmt::Display for SecretError {
             }
             Self::BackendFailure { backend, .. } => {
                 write!(formatter, "secret backend failure: {backend}")
+            }
+            Self::UncertainWrite { backend } => {
+                write!(
+                    formatter,
+                    "secret backend write outcome uncertain: {backend}"
+                )
+            }
+            Self::BackendIdentityMismatch { backend, .. } => {
+                write!(
+                    formatter,
+                    "secret backend file identity mismatch: {backend}"
+                )
             }
             Self::InvalidBinding {
                 connection_id,

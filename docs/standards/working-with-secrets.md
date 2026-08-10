@@ -572,9 +572,13 @@ path = "/Users/example/.local/share/yakshed/dev-secrets.json"
 ```
 
 - compiled only with the non-default `dev-secrets` Cargo feature;
+- supported only on Unix, where YakShed enforces private directory and file permission bits;
 - allowed only for deliberate development builds and never auto-selected or used as a fallback;
 - refused with a typed configuration error naming the missing feature when ordinary builds reference it;
 - stores plaintext secrets in a private local file and is not suitable for release configuration.
+
+Backend instances targeting the same canonical file share a process-global lock. Cross-process locking is intentionally
+out of scope because the application store's single-instance lease prevents concurrent YakShed processes.
 
 The future development launch script must pass `--features dev-secrets`, mirroring Retune's `build-install.sh` pattern.
 

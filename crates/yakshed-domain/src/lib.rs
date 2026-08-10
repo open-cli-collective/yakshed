@@ -507,18 +507,74 @@ pub struct SecretReference {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretBackend {
     pub id: SecretBackendId,
-    pub kind: String,
-    pub account: Option<String>,
-    pub path: Option<String>,
+    pub settings: SecretBackendSettings,
 }
 
 impl SecretBackend {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        require_nonempty("secret backend kind", &self.kind)?;
-        if let Some(path) = &self.path {
-            require_nonempty("secret backend path", path)?;
+        self.settings.validate()
+    }
+
+    pub const fn kind(&self) -> &'static str {
+        self.settings.kind()
+    }
+}
+
+/// Closed, kind-correlated settings for configured secret backends.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecretBackendSettings {
+    LocalOs,
+    OnePasswordCli { account: Option<String> },
+    Environment,
+    Memory,
+    LocalFile { path: String },
+}
+
+impl SecretBackendSettings {
+    pub fn from_config_parts(
+        kind: &str,
+        account: Option<String>,
+        path: Option<String>,
+    ) -> Result<Self, ValidationError> {
+        let settings = match (kind, account, path) {
+            ("local-os", None, None) => Self::LocalOs,
+            ("onepassword-cli", account, None) => Self::OnePasswordCli { account },
+            ("environment", None, None) => Self::Environment,
+            ("memory", None, None) => Self::Memory,
+            ("local-file", None, Some(path)) => Self::LocalFile { path },
+            ("local-file", None, None) => {
+                return Err(ValidationError(
+                    "local-file secret backend requires a path".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(ValidationError(format!(
+                    "unsupported or inconsistent secret backend settings for kind: {kind}"
+                )));
+            }
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::LocalOs => "local-os",
+            Self::OnePasswordCli { .. } => "onepassword-cli",
+            Self::Environment => "environment",
+            Self::Memory => "memory",
+            Self::LocalFile { .. } => "local-file",
         }
-        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::OnePasswordCli {
+                account: Some(account),
+            } => require_nonempty("secret backend account", account),
+            Self::LocalFile { path } => require_nonempty("secret backend path", path),
+            _ => Ok(()),
+        }
     }
 }
 

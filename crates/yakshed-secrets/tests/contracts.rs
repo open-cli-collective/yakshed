@@ -20,11 +20,11 @@ use yakshed_secrets::{
     DeleteSecretOutcome, InvalidBindingReason, MemorySecretBackend, MemorySecretFault,
     PutSecretOptions, PutSecretOutcome, ResolvedSecret, SecretAccessContext, SecretAccessPurpose,
     SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackend, SecretBackendDescriptor,
-    SecretBackendHandle, SecretBackendId, SecretBackendStatus, SecretError, SecretLocator,
-    SecretOperation, SecretReference, SecretResolver, shape_process_environment,
+    SecretBackendHandle, SecretBackendId, SecretBackendSettings, SecretBackendStatus, SecretError,
+    SecretLocator, SecretOperation, SecretReference, SecretResolver, shape_process_environment,
 };
 
-#[cfg(feature = "dev-secrets")]
+#[cfg(all(feature = "dev-secrets", unix))]
 use yakshed_secrets::LocalFileBackend;
 #[cfg(not(feature = "dev-secrets"))]
 use yakshed_secrets::{SecretBackendConfigurationError, validate_backend_configuration};
@@ -118,9 +118,9 @@ fn domain_reference_values_reject_unsafe_input() {
 fn local_file_config_requires_dev_secrets_feature() {
     let config = SecretBackend {
         id: backend_id("dev-local"),
-        kind: "local-file".to_owned(),
-        account: None,
-        path: Some("/tmp/yakshed-dev-secrets.json".to_owned()),
+        settings: SecretBackendSettings::LocalFile {
+            path: "/tmp/yakshed-dev-secrets.json".to_owned(),
+        },
     };
 
     let error = validate_backend_configuration(&config).unwrap_err();
@@ -134,20 +134,19 @@ fn local_file_config_requires_dev_secrets_feature() {
     assert!(error.to_string().contains("dev-secrets"));
 }
 
-#[cfg(feature = "dev-secrets")]
+#[cfg(all(feature = "dev-secrets", unix))]
 #[tokio::test]
 async fn local_file_read_only_rejection_is_audited() {
     let temp = tempfile::tempdir().unwrap();
     let config = SecretBackend {
         id: backend_id("dev-local"),
-        kind: "local-file".to_owned(),
-        account: None,
-        path: Some(
-            temp.path()
+        settings: SecretBackendSettings::LocalFile {
+            path: (temp
+                .path()
                 .join("store/secrets.json")
                 .to_string_lossy()
-                .into_owned(),
-        ),
+                .into_owned()),
+        },
     };
     let backend = Arc::new(LocalFileBackend::from_config(&config).unwrap());
     let connections = [connection(

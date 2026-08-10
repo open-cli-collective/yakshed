@@ -8,11 +8,14 @@ use std::{
 use atomic_write_file::{AtomicWriteFile, OpenOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use yakshed_application::{AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, UiConfig};
+use yakshed_application::{
+    AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, ConfigValidationError,
+    SecretBackendConfigurationError, UiConfig,
+};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
-    ProviderStateRootId, SecretBackend, SecretBackendId, SecretLocator, SecretReference,
-    ValidationError,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator,
+    SecretReference, ValidationError,
 };
 
 use crate::{AppPaths, PathError};
@@ -209,20 +212,27 @@ impl TryFrom<SecretBackendDto> for SecretBackend {
     fn try_from(backend: SecretBackendDto) -> Result<Self, Self::Error> {
         Ok(Self {
             id: SecretBackendId::new(backend.id)?,
-            kind: backend.kind,
-            account: backend.account,
-            path: backend.path,
+            settings: SecretBackendSettings::from_config_parts(
+                &backend.kind,
+                backend.account,
+                backend.path,
+            )?,
         })
     }
 }
 
 impl From<&SecretBackend> for SecretBackendDto {
     fn from(backend: &SecretBackend) -> Self {
+        let (account, path) = match &backend.settings {
+            SecretBackendSettings::OnePasswordCli { account } => (account.clone(), None),
+            SecretBackendSettings::LocalFile { path } => (None, Some(path.clone())),
+            _ => (None, None),
+        };
         Self {
             id: backend.id.as_str().to_owned(),
-            kind: backend.kind.clone(),
-            account: backend.account.clone(),
-            path: backend.path.clone(),
+            kind: backend.kind().to_owned(),
+            account,
+            path,
         }
     }
 }
@@ -313,9 +323,7 @@ impl StoreInner {
 
         let mut config = current.config;
         apply_change(&mut config, change);
-        config
-            .validate()
-            .map_err(|error| ConfigError::Validation(error.to_string()))?;
+        validate_config(&config)?;
         let revision = current
             .revision
             .get()
@@ -378,10 +386,18 @@ fn read_config(path: &Path) -> Result<AppConfig, ConfigError> {
     let value = migrate(value)?;
     let config = AppConfig::try_from(value.try_into::<ConfigDto>().map_err(ConfigError::Parse)?)
         .map_err(|error| ConfigError::Validation(error.to_string()))?;
-    config
-        .validate()
-        .map_err(|error| ConfigError::Validation(error.to_string()))?;
+    validate_config(&config)?;
     Ok(config)
+}
+
+fn validate_config(config: &AppConfig) -> Result<(), ConfigError> {
+    match config.validate() {
+        Ok(()) => Ok(()),
+        Err(ConfigValidationError::SecretBackend(error)) => {
+            Err(ConfigError::SecretBackendConfiguration(error))
+        }
+        Err(error) => Err(ConfigError::Validation(error.to_string())),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -513,6 +529,8 @@ pub enum ConfigError {
     },
     #[error("invalid config: {0}")]
     Validation(String),
+    #[error("invalid secret backend configuration: {0}")]
+    SecretBackendConfiguration(#[from] SecretBackendConfigurationError),
     #[error("failed to serialize config: {0}")]
     Serialize(#[source] toml::ser::Error),
     #[error("config worker failed: {0}")]

@@ -2,7 +2,13 @@
 
 use std::{collections::HashSet, error::Error, fmt};
 
-use yakshed_domain::{Connection, ConnectionId, CredentialBinding, SecretBackend, SecretBackendId};
+use yakshed_domain::{
+    Connection, ConnectionId, CredentialBinding, SecretBackend, SecretBackendId,
+    SecretBackendSettings,
+};
+
+pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
+pub const DEV_SECRETS_FEATURE: &str = "dev-secrets";
 
 /// Canonical non-secret application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -15,16 +21,17 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         if self.ui.theme.trim().is_empty() {
-            return Err(ConfigValidationError("ui.theme cannot be empty".to_owned()));
+            return Err(ConfigValidationError::invalid("ui.theme cannot be empty"));
         }
 
         let mut backend_ids = HashSet::new();
         for backend in &self.secret_backends {
             backend
                 .validate()
-                .map_err(|error| ConfigValidationError(error.to_string()))?;
+                .map_err(|error| ConfigValidationError::invalid(error.to_string()))?;
+            validate_backend_configuration(backend)?;
             if !backend_ids.insert(&backend.id) {
-                return Err(ConfigValidationError(format!(
+                return Err(ConfigValidationError::invalid(format!(
                     "duplicate secret backend id: {}",
                     backend.id
                 )));
@@ -36,15 +43,15 @@ impl AppConfig {
         for connection in &self.connections {
             connection
                 .validate()
-                .map_err(|error| ConfigValidationError(error.to_string()))?;
+                .map_err(|error| ConfigValidationError::invalid(error.to_string()))?;
             if !connection_ids.insert(connection.id) {
-                return Err(ConfigValidationError(format!(
+                return Err(ConfigValidationError::invalid(format!(
                     "duplicate connection id: {}",
                     connection.id
                 )));
             }
             if !provider_state_roots.insert(&connection.provider_state) {
-                return Err(ConfigValidationError(format!(
+                return Err(ConfigValidationError::invalid(format!(
                     "duplicate provider state root: {}",
                     connection.provider_state
                 )));
@@ -53,7 +60,7 @@ impl AppConfig {
                 if let CredentialBinding::Secret { reference } = &credential.binding
                     && !backend_ids.contains(&reference.backend_id)
                 {
-                    return Err(ConfigValidationError(format!(
+                    return Err(ConfigValidationError::invalid(format!(
                         "credential references unknown secret backend: {}",
                         reference.backend_id
                     )));
@@ -114,15 +121,108 @@ pub enum ConfigChange {
 
 /// A violated invariant spanning canonical configuration values.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConfigValidationError(String);
+pub enum ConfigValidationError {
+    Invalid(String),
+    SecretBackend(SecretBackendConfigurationError),
+}
+
+impl ConfigValidationError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
+}
 
 impl fmt::Display for ConfigValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        match self {
+            Self::Invalid(message) => message.fmt(formatter),
+            Self::SecretBackend(error) => error.fmt(formatter),
+        }
     }
 }
 
 impl Error for ConfigValidationError {}
+
+impl From<SecretBackendConfigurationError> for ConfigValidationError {
+    fn from(error: SecretBackendConfigurationError) -> Self {
+        Self::SecretBackend(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecretBackendConfigurationError {
+    MissingFeature {
+        backend: SecretBackendId,
+        feature: &'static str,
+    },
+    UnsupportedPlatform {
+        backend: SecretBackendId,
+        requirement: &'static str,
+    },
+    InvalidSettings {
+        backend: SecretBackendId,
+    },
+    InvalidPath {
+        backend: SecretBackendId,
+    },
+    WrongKind {
+        backend: SecretBackendId,
+    },
+}
+
+impl fmt::Display for SecretBackendConfigurationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingFeature { backend, feature } => write!(
+                formatter,
+                "secret backend {backend} requires cargo feature {feature}"
+            ),
+            Self::UnsupportedPlatform {
+                backend,
+                requirement,
+            } => write!(formatter, "secret backend {backend} requires {requirement}"),
+            Self::InvalidSettings { backend } => {
+                write!(formatter, "secret backend {backend} has invalid settings")
+            }
+            Self::InvalidPath { backend } => {
+                write!(formatter, "secret backend {backend} has an invalid path")
+            }
+            Self::WrongKind { backend } => {
+                write!(formatter, "secret backend {backend} is not local-file")
+            }
+        }
+    }
+}
+
+impl Error for SecretBackendConfigurationError {}
+
+pub fn validate_backend_configuration(
+    backend: &SecretBackend,
+) -> Result<(), SecretBackendConfigurationError> {
+    if !matches!(backend.settings, SecretBackendSettings::LocalFile { .. }) {
+        return Ok(());
+    }
+    #[cfg(not(feature = "dev-secrets"))]
+    return Err(SecretBackendConfigurationError::MissingFeature {
+        backend: backend.id.clone(),
+        feature: DEV_SECRETS_FEATURE,
+    });
+    #[cfg(all(feature = "dev-secrets", not(unix)))]
+    return Err(SecretBackendConfigurationError::UnsupportedPlatform {
+        backend: backend.id.clone(),
+        requirement: "Unix private file permissions",
+    });
+    #[cfg(all(feature = "dev-secrets", unix))]
+    {
+        backend
+            .validate()
+            .map_err(|_| SecretBackendConfigurationError::InvalidSettings {
+                backend: backend.id.clone(),
+            })?;
+    }
+    #[cfg(all(feature = "dev-secrets", unix))]
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

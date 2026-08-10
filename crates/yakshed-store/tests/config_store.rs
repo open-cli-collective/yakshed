@@ -4,9 +4,21 @@ use tempfile::tempdir;
 use yakshed_application::{AppConfig, ConfigChange, ConfigRevision};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
-    ProviderStateRootId, SecretBackend, SecretBackendId, SecretLocator, SecretReference,
+    ProviderStateRootId, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator,
+    SecretReference,
 };
 use yakshed_store::{AppPaths, ConfigError, ConfigStore};
+
+#[cfg(not(feature = "dev-secrets"))]
+use yakshed_application::SecretBackendConfigurationError;
+
+const LOCAL_FILE_CONFIG: &[u8] = br#"schema_version = 1
+
+[[secret_backends]]
+id = "dev-local"
+kind = "local-file"
+path = "/tmp/yakshed-dev-secrets.json"
+"#;
 
 fn connection() -> Connection {
     Connection {
@@ -40,9 +52,7 @@ async fn config_round_trips_through_disk() {
             ConfigRevision::INITIAL,
             ConfigChange::PutSecretBackend(SecretBackend {
                 id: SecretBackendId::new("memory").unwrap(),
-                kind: "memory".into(),
-                account: None,
-                path: None,
+                settings: SecretBackendSettings::Memory,
             }),
         )
         .await
@@ -56,25 +66,32 @@ async fn config_round_trips_through_disk() {
     assert_eq!(reopened.snapshot().config, updated.config);
 }
 
-#[tokio::test]
-async fn local_file_backend_path_round_trips_through_disk() {
+#[cfg(not(feature = "dev-secrets"))]
+#[test]
+fn default_build_rejects_persisted_local_file_config() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    let store = ConfigStore::open(paths.clone()).unwrap();
-    let backend = SecretBackend {
-        id: SecretBackendId::new("dev-local").unwrap(),
-        kind: "local-file".into(),
-        account: None,
-        path: Some("/tmp/yakshed-dev-secrets.json".into()),
-    };
+    paths.create_config_root().unwrap();
+    fs::write(paths.config_root.join("config.toml"), LOCAL_FILE_CONFIG).unwrap();
 
-    store
-        .update(
-            ConfigRevision::INITIAL,
-            ConfigChange::PutSecretBackend(backend.clone()),
-        )
-        .await
-        .unwrap();
+    assert!(matches!(
+        ConfigStore::open(paths),
+        Err(ConfigError::SecretBackendConfiguration(
+            SecretBackendConfigurationError::MissingFeature {
+                feature: "dev-secrets",
+                ..
+            }
+        ))
+    ));
+}
+
+#[cfg(all(feature = "dev-secrets", unix))]
+#[test]
+fn feature_build_accepts_persisted_local_file_config() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(paths.config_root.join("config.toml"), LOCAL_FILE_CONFIG).unwrap();
 
     assert_eq!(
         ConfigStore::open(paths)
@@ -82,8 +99,50 @@ async fn local_file_backend_path_round_trips_through_disk() {
             .snapshot()
             .config
             .secret_backends,
-        vec![backend]
+        vec![SecretBackend {
+            id: SecretBackendId::new("dev-local").unwrap(),
+            settings: SecretBackendSettings::LocalFile {
+                path: "/tmp/yakshed-dev-secrets.json".into(),
+            },
+        }]
     );
+}
+
+#[cfg(all(feature = "dev-secrets", not(unix)))]
+#[test]
+fn feature_build_rejects_local_file_without_unix_permissions() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(paths.config_root.join("config.toml"), LOCAL_FILE_CONFIG).unwrap();
+
+    assert!(matches!(
+        ConfigStore::open(paths),
+        Err(ConfigError::SecretBackendConfiguration(
+            yakshed_application::SecretBackendConfigurationError::UnsupportedPlatform { .. }
+        ))
+    ));
+}
+
+#[test]
+fn invalid_backend_setting_combinations_fail_closed() {
+    for backend in [
+        "id = \"memory\"\nkind = \"memory\"\npath = \"unexpected\"\n",
+        "id = \"dev-local\"\nkind = \"local-file\"\n",
+    ] {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_config_root().unwrap();
+        let config_path = paths.config_root.join("config.toml");
+        let source = format!("schema_version = 1\n\n[[secret_backends]]\n{backend}");
+        fs::write(&config_path, &source).unwrap();
+
+        assert!(matches!(
+            ConfigStore::open(paths),
+            Err(ConfigError::Validation(_))
+        ));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), source);
+    }
 }
 
 #[cfg(unix)]
@@ -261,9 +320,7 @@ async fn remove_operations_are_persisted() {
     let store = ConfigStore::open(paths.clone()).unwrap();
     let backend = SecretBackend {
         id: SecretBackendId::new("memory").unwrap(),
-        kind: "memory".into(),
-        account: None,
-        path: None,
+        settings: SecretBackendSettings::Memory,
     };
     let snapshot = store
         .update(
