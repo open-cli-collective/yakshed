@@ -1586,7 +1586,7 @@ mod tests {
         }
 
         let mut acl = 2_u32.to_le_bytes().to_vec();
-        push_entry(&mut acl, 0x01, 0o6, u32::MAX);
+        push_entry(&mut acl, 0x01, 0o7, u32::MAX);
         // SAFETY: `geteuid` takes no arguments and has no preconditions.
         let other_id = unsafe { libc::geteuid() }.wrapping_add(1);
         push_entry(&mut acl, 0x02, 0o4, other_id);
