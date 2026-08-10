@@ -46,6 +46,8 @@ const PROTOCOL_VERSION: u64 = 1;
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
 /// Contract probes are local test helpers; five seconds covers interpreter startup with margin.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const ARTIFACT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[tokio::main(flavor = "current_thread")]
@@ -150,7 +152,7 @@ struct Host {
     paths: AppPaths,
     config: ConfigStore,
     data: Option<SqliteStore>,
-    cache: CacheStore,
+    cache: Arc<CacheStore>,
     artifacts: Option<ArtifactStore>,
     memory: Arc<MemorySecretBackend>,
     broker: CredentialBroker,
@@ -199,7 +201,7 @@ impl Host {
             paths,
             config,
             data: Some(data),
-            cache,
+            cache: Arc::new(cache),
             artifacts: Some(artifacts),
             memory,
             broker,
@@ -265,12 +267,9 @@ impl Host {
             "secret.delete" => self.secret_delete(request.params).await,
             "work.create" => self.work_create(request.params).await,
             "work.get" => self.work_get(request.params).await,
-            "cache.put" => self.cache_put(request.params),
-            "cache.exists" => self.cache_exists(request.params),
-            "cache.clear" => {
-                self.cache.clear()?;
-                Ok(json!({"cleared": true}))
-            }
+            "cache.put" => self.cache_put(request.params).await,
+            "cache.exists" => self.cache_exists(request.params).await,
+            "cache.clear" => self.cache_clear().await,
             "runtime.credential_probe" => self.credential_probe(request.params).await,
             "config.reset" => self.config_reset().await,
             "data.purge" => self.data_purge().await,
@@ -522,16 +521,33 @@ impl Host {
         Ok(work_json(&item))
     }
 
-    fn cache_put(&self, params: Value) -> Result<Value, HostError> {
+    async fn cache_put(&self, params: Value) -> Result<Value, HostError> {
         let params: CachePutParams = parse_params(params)?;
-        self.cache
-            .put(&params.namespace, &params.key, &params.value)?;
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            cache.put(&params.namespace, &params.key, &params.value)?;
+            Ok(())
+        })
+        .await?;
         Ok(json!({"stored": true}))
     }
 
-    fn cache_exists(&self, params: Value) -> Result<Value, HostError> {
+    async fn cache_exists(&self, params: Value) -> Result<Value, HostError> {
         let params: CacheKeyParams = parse_params(params)?;
-        Ok(json!({"exists": self.cache.exists(&params.namespace, &params.key)?}))
+        let cache = Arc::clone(&self.cache);
+        let exists =
+            run_blocking(move || Ok(cache.exists(&params.namespace, &params.key)?)).await?;
+        Ok(json!({"exists": exists}))
+    }
+
+    async fn cache_clear(&self) -> Result<Value, HostError> {
+        let cache = Arc::clone(&self.cache);
+        run_blocking(move || {
+            cache.clear()?;
+            Ok(())
+        })
+        .await?;
+        Ok(json!({"cleared": true}))
     }
 
     async fn credential_probe(&self, params: Value) -> Result<Value, HostError> {
@@ -629,17 +645,19 @@ impl Host {
         if let Some(data) = self.data.take() {
             data.shutdown().await?;
         }
-        if self
-            .paths
-            .data_root
-            .try_exists()
-            .map_err(HostError::persistence)?
-        {
-            std::fs::remove_dir_all(&self.paths.data_root).map_err(HostError::persistence)?;
-        }
-        self.paths
-            .create_data_root()
-            .map_err(HostError::persistence)?;
+        let paths = self.paths.clone();
+        let artifacts = run_blocking(move || {
+            if paths
+                .data_root
+                .try_exists()
+                .map_err(HostError::persistence)?
+            {
+                std::fs::remove_dir_all(&paths.data_root).map_err(HostError::persistence)?;
+            }
+            paths.create_data_root().map_err(HostError::persistence)?;
+            ArtifactStore::new(&paths, ARTIFACT_MAX_BYTES).map_err(Into::into)
+        })
+        .await?;
         self.data = Some(
             SqliteStore::open(
                 self.paths.clone(),
@@ -648,7 +666,7 @@ impl Host {
             )
             .await?,
         );
-        self.artifacts = Some(ArtifactStore::new(&self.paths, ARTIFACT_MAX_BYTES)?);
+        self.artifacts = Some(artifacts);
         Ok(json!({"purged": true}))
     }
 
@@ -711,11 +729,13 @@ impl Host {
             }
         }
         secret_statuses.sort_by_key(Value::to_string);
+        let cache = Arc::clone(&self.cache);
+        let cache_entries = run_blocking(move || Ok(cache.count()?)).await?;
         Ok(json!({
             "config_revision": snapshot.revision.get(),
             "connections": snapshot.config.connections.len(),
             "work_items": work_items,
-            "cache_entries": self.cache.count()?,
+            "cache_entries": cache_entries,
             "artifacts": 0,
             "secret_statuses": secret_statuses,
         }))
@@ -734,6 +754,16 @@ impl Host {
         }
         clear_directory(&self.paths.runtime_root).map_err(HostError::persistence)
     }
+}
+
+async fn run_blocking<T, F>(work: F) -> Result<T, HostError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, HostError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| HostError::internal("blocking host operation failed"))?
 }
 
 #[cfg(unix)]
@@ -798,15 +828,15 @@ async fn run_probe_with_timeout(
     .await
     {
         Ok(Ok(completed)) => {
-            child.disarm();
+            child.kill_and_reap().await?;
             completed
         }
         Ok(Err(error)) => {
-            child.kill_and_reap().await;
+            child.kill_and_reap().await?;
             return Err(error);
         }
         Err(_) => {
-            child.kill_and_reap().await;
+            child.kill_and_reap().await?;
             return Err(HostError::new("timeout", "credential probe timed out"));
         }
     };
@@ -839,16 +869,13 @@ impl ProbeChild {
             .await
     }
 
-    fn disarm(&mut self) {
-        self.child.take();
-    }
-
-    async fn kill_and_reap(&mut self) {
+    async fn kill_and_reap(&mut self) -> Result<(), HostError> {
         kill_process_group(self.process_group);
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+        wait_for_process_group_exit(self.process_group).await
     }
 }
 
@@ -874,6 +901,24 @@ fn kill_process_group(process_group: u32) {
         // SAFETY: negative PID targets the child-created process group; SIGKILL needs no handler.
         let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_process_group_exit(process_group: u32) -> Result<(), HostError> {
+    let process_group = i32::try_from(process_group)
+        .map_err(|_| HostError::internal("credential probe process group is invalid"))?;
+    tokio::time::timeout(PROBE_CLEANUP_TIMEOUT, async move {
+        loop {
+            if unsafe { libc::kill(-process_group, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| HostError::new("backend_unavailable", "credential probe cleanup failed"))
 }
 
 #[cfg(unix)]
@@ -1424,6 +1469,29 @@ impl From<yakshed_store::PathError> for HostError {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_store_work_does_not_stall_the_host_executor() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let work = tokio::spawn(run_blocking(move || {
+            started_tx.send(()).expect("test receiver remains open");
+            release_rx.recv().expect("test sender remains open");
+            Ok(7)
+        }));
+
+        started_rx.await.unwrap();
+        let unrelated = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            11
+        });
+        assert_eq!(unrelated.await.unwrap(), 11);
+        release_tx.send(()).unwrap();
+        match work.await.unwrap() {
+            Ok(value) => assert_eq!(value, 7),
+            Err(_) => panic!("blocking work failed"),
+        }
+    }
+
     #[test]
     fn connection_input_rejects_secret_valued_fields() {
         let value = json!({
@@ -1634,6 +1702,78 @@ mod tests {
             .unwrap();
         assert_process_gone(-process_group).await;
         assert_process_gone(descendant).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_probe_reaps_stdio_detached_descendant_before_returning() {
+        use yakshed_secrets::{ResolvedSecret, ResolvedSecretSource};
+
+        let temp = tempfile::tempdir().unwrap();
+        let group_file = temp.path().join("probe.group");
+        let child_file = temp.path().join("probe.child");
+        let params = ProbeParams {
+            connection_id: "ignored".to_owned(),
+            slot: "ignored".to_owned(),
+            probe_program: "/bin/sh".to_owned(),
+            probe_args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "echo $$ > \"$1\"; ",
+                    "sleep 60 </dev/null >/dev/null 2>&1 & echo $! > \"$2\"; ",
+                    "printf '%s' ",
+                    "'{\"protocol_version\":1,\"credential_variable\":\"TEST_SECRET\",",
+                    "\"present\":true,\"sha256\":null,\"forbidden_present\":[]}'"
+                )
+                .to_owned(),
+                "probe".to_owned(),
+                group_file.display().to_string(),
+                child_file.display().to_string(),
+            ],
+            expected_sha256: "0".repeat(64),
+            forbidden_variables: Vec::new(),
+        };
+        let secret = ResolvedSecret::new(
+            SecretString::from("synthetic".to_owned()),
+            ResolvedSecretSource {
+                backend: SecretBackendId::new("memory").unwrap(),
+            },
+            None,
+        );
+        let environment =
+            shape_process_environment(&HashMap::new(), "TEST_SECRET", &secret).unwrap();
+
+        let output = match run_probe_with_timeout(
+            &params,
+            "TEST_SECRET",
+            environment,
+            Duration::from_secs(2),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(_) => panic!("successful probe failed"),
+        };
+
+        assert_eq!(output.exit_code, 0);
+        let process_group = std::fs::read_to_string(group_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let descendant = std::fs::read_to_string(child_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert_process_gone_now(-process_group);
+        assert_process_gone_now(descendant);
+    }
+
+    #[cfg(unix)]
+    fn assert_process_gone_now(pid: libc::pid_t) {
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     #[cfg(unix)]
