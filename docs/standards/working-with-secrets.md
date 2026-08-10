@@ -577,8 +577,12 @@ path = "/Users/example/.local/share/yakshed/dev-secrets.json"
 - refused with a typed configuration error naming the missing feature when ordinary builds reference it;
 - stores plaintext secrets in a private local file and is not suitable for release configuration.
 
-Backend instances targeting the same canonical file share a process-global lock. Cross-process locking is intentionally
-out of scope because the application store's single-instance lease prevents concurrent YakShed processes.
+Backend instances targeting the same canonical file share a process-global lock and an exclusive Unix `flock`, held for
+each complete read or read-modify-write operation. Dropping a queued mutation prevents it from starting; dropping one after
+its write begins leaves an uncertain outcome that callers must reconcile before retrying.
+
+Removing or resetting a backend's config intentionally retains its plaintext file. Re-adding the same backend ID and path
+restores access to those values; manually delete the file to purge them.
 
 The future development launch script must pass `--features dev-secrets`, mirroring Retune's `build-install.sh` pattern.
 

@@ -210,6 +210,14 @@ pub enum InvalidBindingReason {
     NotSecretBacked,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalFileSecurityProblem {
+    StoreNotRegular,
+    StorePermissions,
+    ParentNotDirectory,
+    ParentWritable,
+}
+
 pub enum SecretError {
     NotFound {
         reference: SecretReferenceSummary,
@@ -257,6 +265,10 @@ pub enum SecretError {
     BackendIdentityMismatch {
         backend: SecretBackendId,
         file_backend: SecretBackendId,
+    },
+    InsecureLocalFile {
+        backend: SecretBackendId,
+        problem: LocalFileSecurityProblem,
     },
     InvalidBinding {
         connection_id: ConnectionId,
@@ -323,6 +335,10 @@ impl fmt::Display for SecretError {
                     "secret backend file identity mismatch: {backend}"
                 )
             }
+            Self::InsecureLocalFile { backend, problem } => write!(
+                formatter,
+                "insecure local secret store ({problem:?}): {backend}"
+            ),
             Self::InvalidBinding {
                 connection_id,
                 slot,

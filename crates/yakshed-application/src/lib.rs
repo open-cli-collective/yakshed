@@ -25,11 +25,20 @@ impl AppConfig {
         }
 
         let mut backend_ids = HashSet::new();
+        let mut local_file_paths = HashSet::new();
         for backend in &self.secret_backends {
             backend
                 .validate()
                 .map_err(|error| ConfigValidationError::invalid(error.to_string()))?;
             validate_backend_configuration(backend)?;
+            if let SecretBackendSettings::LocalFile { path } = &backend.settings
+                && !local_file_paths.insert(path)
+            {
+                return Err(SecretBackendConfigurationError::DuplicateLocalFilePath {
+                    backend: backend.id.clone(),
+                }
+                .into());
+            }
             if !backend_ids.insert(&backend.id) {
                 return Err(ConfigValidationError::invalid(format!(
                     "duplicate secret backend id: {}",
@@ -168,6 +177,9 @@ pub enum SecretBackendConfigurationError {
     WrongKind {
         backend: SecretBackendId,
     },
+    DuplicateLocalFilePath {
+        backend: SecretBackendId,
+    },
 }
 
 impl fmt::Display for SecretBackendConfigurationError {
@@ -190,6 +202,10 @@ impl fmt::Display for SecretBackendConfigurationError {
             Self::WrongKind { backend } => {
                 write!(formatter, "secret backend {backend} is not local-file")
             }
+            Self::DuplicateLocalFilePath { backend } => write!(
+                formatter,
+                "secret backend {backend} duplicates another local-file path"
+            ),
         }
     }
 }

@@ -21,6 +21,7 @@ rust-version = "1.96"
 async-trait = "=0.1.89"
 atomic-write-file = "=0.3.0"
 directories = "=6.0.0"
+libc = "=0.2.189"
 provider-mock = { path = "crates/provider-mock" }
 secrecy = "=0.10.3"
 serde = { version = "=1.0.229", features = ["derive"] }

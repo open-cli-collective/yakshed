@@ -108,6 +108,37 @@ fn feature_build_accepts_persisted_local_file_config() {
     );
 }
 
+#[cfg(feature = "dev-secrets")]
+#[test]
+fn duplicate_local_file_paths_are_rejected() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(
+        paths.config_root.join("config.toml"),
+        r#"schema_version = 1
+
+[[secret_backends]]
+id = "dev-a"
+kind = "local-file"
+path = "/tmp/shared-dev-secrets.json"
+
+[[secret_backends]]
+id = "dev-b"
+kind = "local-file"
+path = "/tmp/shared-dev-secrets.json"
+"#,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        ConfigStore::open(paths),
+        Err(ConfigError::SecretBackendConfiguration(
+            yakshed_application::SecretBackendConfigurationError::DuplicateLocalFilePath { .. }
+        ))
+    ));
+}
+
 #[cfg(all(feature = "dev-secrets", not(unix)))]
 #[test]
 fn feature_build_rejects_local_file_without_unix_permissions() {
