@@ -375,6 +375,7 @@ pub enum SecretAuditOutcome {
     NotFound,
     Rejected,
     Failed,
+    Uncertain,
     TimedOut,
     Cancelled,
 }

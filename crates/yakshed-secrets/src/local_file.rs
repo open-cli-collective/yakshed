@@ -1,7 +1,8 @@
 //! Plaintext local-development secret storage.
 //!
 //! Backends targeting the same canonical path share a process-global mutex and an exclusive Unix
-//! `flock` for each operation. Config removal retains the file; delete it manually to purge.
+//! `flock` for each operation. Purge unlinks the store and sidecar under those same locks.
+//! Manual deletion is safe only after every backend instance has stopped.
 //! Dropped mutations are suppressed before writing starts. A drop after writing starts has an
 //! uncertain outcome and must be reconciled before retrying. Reads wait for a contended file lock;
 //! abandoned mutations stop waiting promptly.
@@ -117,6 +118,12 @@ impl LocalFileBackend {
         unreachable!("platform validation rejects local-file on non-Unix targets")
     }
 
+    /// Removes the local store and its lock sidecar while holding both coordination locks.
+    pub async fn purge(&self) -> Result<(), SecretError> {
+        self.run_abandonable(|state, abandoned| state.purge(abandoned))
+            .await
+    }
+
     #[cfg(unix)]
     async fn run_abandonable<T>(
         &self,
@@ -216,6 +223,67 @@ impl LocalFileState {
                     ));
                 }
                 validate_store_if_present(path, &self.id)
+            },
+        )
+    }
+
+    fn purge(&self, abandoned: &AtomicBool) -> Result<(), SecretError> {
+        let initialized = self.initialized()?;
+        let _process_guard = initialized
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        validate_parent(&initialized.path, &self.id)?;
+        let _file_guard = lock_exclusive(&lock_path(&initialized.path), &self.id, Some(abandoned))?;
+        validate_parent(&initialized.path, &self.id)?;
+        if abandoned.load(Ordering::Acquire) {
+            return Err(SecretError::Cancelled {
+                backend: self.id.clone(),
+            });
+        }
+
+        let store_removed = match fs::remove_file(&initialized.path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(map_io_error(
+                    &self.id,
+                    "failed to purge local secret store",
+                    error,
+                ));
+            }
+        };
+        if abandoned.load(Ordering::Acquire) {
+            return Err(SecretError::UncertainWrite {
+                backend: self.id.clone(),
+            });
+        }
+
+        let sidecar_removed = match fs::remove_file(lock_path(&initialized.path)) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_error) if store_removed => {
+                return Err(SecretError::UncertainWrite {
+                    backend: self.id.clone(),
+                });
+            }
+            Err(error) => {
+                return Err(map_io_error(
+                    &self.id,
+                    "failed to purge local secret store lock",
+                    error,
+                ));
+            }
+        };
+        sync_directory(initialized.path.parent().expect("store path has a parent")).map_err(
+            |error| {
+                if store_removed || sidecar_removed {
+                    SecretError::UncertainWrite {
+                        backend: self.id.clone(),
+                    }
+                } else {
+                    map_io_error(&self.id, "failed to sync purged local secret store", error)
+                }
             },
         )
     }
@@ -988,6 +1056,42 @@ mod tests {
                 .unwrap()
                 .expose(|value| value == CANARY)
         );
+    }
+
+    #[tokio::test]
+    async fn purge_serializes_with_mutation_and_reinitializes_empty_store() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("store/secrets.json");
+        let config = config("dev-local", &path);
+        let backend = Arc::new(LocalFileBackend::from_config(&config).unwrap());
+        let existing = SecretLocator::new("existing").unwrap();
+        backend
+            .put(
+                &existing,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+            )
+            .await
+            .unwrap();
+
+        let concurrent_locator = SecretLocator::new("concurrent").unwrap();
+        let concurrent_value = SecretString::from("concurrent-canary");
+        let mutation = backend.put(
+            &concurrent_locator,
+            &concurrent_value,
+            PutSecretOptions::NO_OVERWRITE,
+        );
+        let purge = backend.purge();
+        let _ = tokio::join!(mutation, purge);
+
+        backend.purge().await.unwrap();
+        assert!(!path.exists());
+        assert!(!lock_path(&backend.state.initialized().unwrap().path).exists());
+        assert!(matches!(
+            backend.resolve(&existing, &context()).await,
+            Err(SecretError::NotFound { .. })
+        ));
+        assert!(path.exists());
     }
 
     #[tokio::test]

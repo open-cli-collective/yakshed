@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use secrecy::SecretString;
-use tokio::sync::{Barrier, Semaphore};
+use tokio::sync::{Barrier, Notify, Semaphore};
 use yakshed_application::{AppConfig, ConfigValidationError};
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
@@ -670,8 +670,12 @@ async fn broker_maps_required_failures_and_uncertain_write_reconciliation() {
                 &BrokerCancellation::default(),
             )
             .await,
-        Err(SecretError::TimedOut { .. })
+        Err(SecretError::UncertainWrite { .. })
     ));
+    assert!(audit.0.lock().unwrap().iter().any(|event| {
+        event.operation == SecretOperation::Put
+            && event.outcome == yakshed_secrets::SecretAuditOutcome::Uncertain
+    }));
     assert_eq!(
         broker
             .status(&connections, binding, &ctx, &BrokerCancellation::default())
@@ -929,6 +933,126 @@ struct ImmediateWriteBackend {
     writes: AtomicUsize,
 }
 
+struct SlowWriteBackend {
+    writes: Arc<AtomicUsize>,
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl SecretResolver for SlowWriteBackend {
+    fn descriptor(&self) -> SecretBackendDescriptor {
+        SecretBackendDescriptor {
+            id: backend_id("slow"),
+            kind: "test".into(),
+        }
+    }
+
+    async fn probe(&self) -> Result<SecretBackendStatus, SecretError> {
+        Ok(SecretBackendStatus::Available)
+    }
+
+    async fn resolve(
+        &self,
+        locator: &SecretLocator,
+        _context: &SecretAccessContext,
+    ) -> Result<ResolvedSecret, SecretError> {
+        Err(SecretError::NotFound {
+            reference: yakshed_secrets::SecretReferenceSummary::from(&SecretReference {
+                backend_id: backend_id("slow"),
+                locator: locator.clone(),
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl SecretAdministrator for SlowWriteBackend {
+    fn backend_id(&self) -> SecretBackendId {
+        backend_id("slow")
+    }
+
+    async fn put(
+        &self,
+        _locator: &SecretLocator,
+        _value: &SecretString,
+        _options: PutSecretOptions,
+    ) -> Result<PutSecretOutcome, SecretError> {
+        self.started.notify_waiters();
+        let writes = Arc::clone(&self.writes);
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            writes.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+        Ok(PutSecretOutcome::Written)
+    }
+
+    async fn delete(&self, _locator: &SecretLocator) -> Result<DeleteSecretOutcome, SecretError> {
+        Ok(DeleteSecretOutcome::NotFound)
+    }
+}
+
+#[tokio::test]
+async fn dispatched_mutation_cancellation_is_uncertain_and_audited() {
+    let backend = Arc::new(SlowWriteBackend {
+        writes: Arc::new(AtomicUsize::new(0)),
+        started: Arc::new(Notify::new()),
+    });
+    let connections = Arc::new(vec![connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "slow", "a/key")],
+    )]);
+    let audit = Arc::new(AuditLog::default());
+    let broker = Arc::new(
+        CredentialBroker::new(
+            [(
+                backend_id("slow"),
+                SecretBackendHandle {
+                    resolver: backend.clone(),
+                    administrator: Some(backend.clone()),
+                },
+            )],
+            &connections,
+            audit.clone(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    );
+    let cancellation = BrokerCancellation::default();
+    let started = backend.started.notified();
+    let task = tokio::spawn({
+        let broker = broker.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            broker
+                .put(
+                    &connections,
+                    &connections[0].credentials[0],
+                    &context(CONNECTION_A, "provider.api_key", "request-mid-save"),
+                    &SecretString::from(CANARY.to_owned()),
+                    PutSecretOptions::NO_OVERWRITE,
+                    &cancellation,
+                )
+                .await
+        }
+    });
+    started.await;
+    cancellation.cancel();
+
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(SecretError::UncertainWrite { .. })
+    ));
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    assert!(audit.0.lock().unwrap().iter().any(|event| {
+        event.operation == SecretOperation::Put
+            && event.outcome == yakshed_secrets::SecretAuditOutcome::Uncertain
+    }));
+}
+
 #[async_trait]
 impl SecretResolver for ImmediateWriteBackend {
     fn descriptor(&self) -> SecretBackendDescriptor {
@@ -1045,6 +1169,7 @@ async fn cancellation_race_never_reports_cancelled_after_a_write() {
         match result {
             Ok(_) => assert_eq!(after, before + 1),
             Err(SecretError::Cancelled { .. }) => assert_eq!(after, before),
+            Err(SecretError::UncertainWrite { .. }) => assert!(after <= before + 1),
             Err(error) => panic!("unexpected race result: {error}"),
         }
     }

@@ -267,9 +267,21 @@ impl CredentialBroker {
             _ = cancellation.cancelled() => Err(SecretError::Cancelled { backend: backend.clone() }),
             result = tokio::time::timeout(self.timeout, work) => result.unwrap_or_else(|_| Err(SecretError::TimedOut { backend: backend.clone() })),
         };
+        let result = if matches!(operation, SecretOperation::Put | SecretOperation::Delete)
+            && matches!(
+                &result,
+                Err(SecretError::TimedOut { .. } | SecretError::Cancelled { .. })
+            ) {
+            Err(SecretError::UncertainWrite {
+                backend: backend.clone(),
+            })
+        } else {
+            result
+        };
         let outcome = match &result {
             Ok(_) => SecretAuditOutcome::Succeeded,
             Err(SecretError::NotFound { .. }) => SecretAuditOutcome::NotFound,
+            Err(SecretError::UncertainWrite { .. }) => SecretAuditOutcome::Uncertain,
             Err(SecretError::TimedOut { .. }) => SecretAuditOutcome::TimedOut,
             Err(SecretError::Cancelled { .. }) => SecretAuditOutcome::Cancelled,
             Err(_) => SecretAuditOutcome::Failed,

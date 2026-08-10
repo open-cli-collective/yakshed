@@ -590,8 +590,10 @@ store after atomic replacement. It refuses ACL-bearing paths with remediation ra
 filesystem security state. The direct parent and store file must be owned by the effective user; opened store descriptors
 are revalidated for type, mode, owner, and path identity before reads.
 
-Removing or resetting a backend's config intentionally retains its plaintext file. Re-adding the same backend ID and path
-restores access to those values; manually delete the file to purge them.
+Removing or resetting a backend's config intentionally retains its plaintext file. While YakShed is running, purge through
+the backend's locked purge operation, which removes both the store and its `.lock` sidecar and syncs the parent directory.
+Manual file deletion is safe only after every backend instance has stopped. Re-adding the same backend ID and path restores
+retained values unless the store was explicitly purged.
 
 The future development launch script must pass `--features dev-secrets`, mirroring Retune's `build-install.sh` pattern.
 
@@ -794,6 +796,7 @@ pub enum SecretError {
     UnsupportedOperation { backend: SecretBackendId, operation: SecretOperation },
     TimedOut { backend: SecretBackendId },
     Cancelled { backend: SecretBackendId },
+    UncertainWrite { backend: SecretBackendId },
     ProtocolViolation { backend: SecretBackendId, reason: String },
     BackendFailure { backend: SecretBackendId, redacted_message: String },
 }
@@ -810,6 +813,7 @@ The UI implications differ:
 | Invalid locator | Edit reference |
 | Unsupported operation | Explain read-only/write-only limitation |
 | Timeout/cancelled | Retry without assuming mutation outcome |
+| Uncertain write | Re-probe/reconcile before retrying; the value may already be stored |
 | Protocol violation | Mark helper/backend incompatible |
 
 A mutating operation that times out after dispatch may have an uncertain outcome. Re-probe before retrying blindly.
