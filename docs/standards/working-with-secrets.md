@@ -598,10 +598,14 @@ store after atomic replacement. It refuses ACL-bearing paths with remediation ra
 filesystem security state. The direct parent and store file must be owned by the effective user; opened store descriptors
 are revalidated for type, mode, owner, and path identity before reads.
 
-Every directory in the canonical store path's ancestor chain must be owned by root or the effective user, must not be group-
-or other-writable, and must not carry extended ACL entries. Sticky world-writable ancestors such as `/tmp` are rejected;
-configure the store beneath the application's private data directory instead. Pathname re-resolution is acceptable here
-because no other principal can mutate the trusted chain; a dirfd-relative I/O layer is unnecessary under this assumption.
+Every directory in the canonical store path's ancestor chain must be owned by root or the effective user and must not be
+group- or other-writable. On macOS, every component must also be free of ACL entries. On Linux, extended access ACLs are
+rejected throughout the chain, while a default-only ACL on a non-parent ancestor is allowed: it grants no access to that
+component, and YakShed never creates children there. The direct parent remains strict because its default ACL would propagate
+to newly created store files. This distinction supports real layouts such as GitHub runners, where `/home` carries a default
+ACL but `/home/runner` does not. Sticky world-writable ancestors such as `/tmp` are rejected; configure the store beneath the
+application's private data directory instead. Pathname re-resolution is acceptable here because no other principal can
+mutate the trusted chain; a dirfd-relative I/O layer is unnecessary under this assumption.
 
 Removing or resetting a backend's config intentionally retains its plaintext file. While YakShed is running, purge through
 the backend's locked purge operation, which removes only the store and syncs the parent directory. The zero-length `.lock`

@@ -317,7 +317,19 @@ impl fmt::Display for SecretError {
             Self::BackendUnavailable { backend, .. } => {
                 write!(formatter, "secret backend unavailable: {backend}")
             }
-            Self::LockedOrDenied { backend, .. } => {
+            Self::LockedOrDenied {
+                backend,
+                remediation: Some(remediation),
+            } => {
+                write!(
+                    formatter,
+                    "secret backend locked or denied: {backend}: {remediation}"
+                )
+            }
+            Self::LockedOrDenied {
+                backend,
+                remediation: None,
+            } => {
                 write!(formatter, "secret backend locked or denied: {backend}")
             }
             Self::AuthenticationRequired { backend, .. } => {

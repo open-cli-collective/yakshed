@@ -75,16 +75,10 @@ struct InitializedLocalFile {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalFileSecurityProblem {
-    StoreNotRegular,
-    StorePermissions,
-    StoreOwner,
-    StoreChanged,
-    ParentNotDirectory,
-    ParentWritable,
-    ParentOwner,
-    AncestorNotDirectory,
-    AncestorWritable,
-    AncestorOwner,
+    NotRegular,
+    Permissions,
+    Owner,
+    Changed,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -540,7 +534,7 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
 
     let parent = path
         .parent()
-        .ok_or_else(|| insecure(backend, LocalFileSecurityProblem::ParentNotDirectory))?;
+        .ok_or_else(|| untrusted_component(backend, "store parent", path, "missing"))?;
     let metadata = match fs::symlink_metadata(parent) {
         Ok(metadata) => metadata,
         Err(error)
@@ -549,9 +543,11 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
                 io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
             ) =>
         {
-            return Err(insecure(
+            return Err(untrusted_component(
                 backend,
-                LocalFileSecurityProblem::ParentNotDirectory,
+                "store parent",
+                parent,
+                "not a directory",
             ));
         }
         Err(error) => {
@@ -563,17 +559,29 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
         }
     };
     if !metadata.is_dir() {
-        return Err(insecure(
+        return Err(untrusted_component(
             backend,
-            LocalFileSecurityProblem::ParentNotDirectory,
+            "store parent",
+            parent,
+            "not a directory",
         ));
     }
-    validate_no_extended_acl(parent, backend)?;
+    validate_no_extended_acl(parent, backend, true, "store parent")?;
     if !owned_by_effective_uid(metadata.uid(), effective_uid()) {
-        return Err(insecure(backend, LocalFileSecurityProblem::ParentOwner));
+        return Err(untrusted_component(
+            backend,
+            "store parent",
+            parent,
+            "foreign owner",
+        ));
     }
     if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(insecure(backend, LocalFileSecurityProblem::ParentWritable));
+        return Err(untrusted_component(
+            backend,
+            "store parent",
+            parent,
+            "group- or other-writable",
+        ));
     }
     validate_ancestor_chain(parent, backend)?;
     Ok(())
@@ -598,9 +606,11 @@ fn validate_ancestor_chain(parent: &Path, backend: &SecretBackendId) -> Result<(
                     io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
                 ) =>
             {
-                return Err(insecure(
+                return Err(untrusted_component(
                     backend,
-                    LocalFileSecurityProblem::AncestorNotDirectory,
+                    "ancestor",
+                    ancestor,
+                    "not a directory",
                 ));
             }
             Err(error) => {
@@ -612,19 +622,28 @@ fn validate_ancestor_chain(parent: &Path, backend: &SecretBackendId) -> Result<(
             }
         };
         if !metadata.is_dir() {
-            return Err(insecure(
+            return Err(untrusted_component(
                 backend,
-                LocalFileSecurityProblem::AncestorNotDirectory,
+                "ancestor",
+                ancestor,
+                "not a directory",
             ));
         }
-        validate_no_extended_acl(ancestor, backend)?;
+        validate_no_extended_acl(ancestor, backend, false, "ancestor")?;
         if !ancestor_owner_is_trusted(metadata.uid(), effective_uid()) {
-            return Err(insecure(backend, LocalFileSecurityProblem::AncestorOwner));
+            return Err(untrusted_component(
+                backend,
+                "ancestor",
+                ancestor,
+                "foreign owner",
+            ));
         }
         if metadata.permissions().mode() & 0o022 != 0 {
-            return Err(insecure(
+            return Err(untrusted_component(
                 backend,
-                LocalFileSecurityProblem::AncestorWritable,
+                "ancestor",
+                ancestor,
+                "group- or other-writable",
             ));
         }
     }
@@ -655,17 +674,14 @@ fn open_validated_store_if_present(
         }
     };
     if !path_metadata.file_type().is_file() {
-        return Err(insecure(backend, LocalFileSecurityProblem::StoreNotRegular));
+        return Err(insecure(backend, LocalFileSecurityProblem::NotRegular));
     }
-    validate_no_extended_acl(path, backend)?;
+    validate_no_extended_acl(path, backend, true, "store")?;
     if path_metadata.permissions().mode() & 0o077 != 0 {
-        return Err(insecure(
-            backend,
-            LocalFileSecurityProblem::StorePermissions,
-        ));
+        return Err(insecure(backend, LocalFileSecurityProblem::Permissions));
     }
     if !owned_by_effective_uid(path_metadata.uid(), effective_uid()) {
-        return Err(insecure(backend, LocalFileSecurityProblem::StoreOwner));
+        return Err(insecure(backend, LocalFileSecurityProblem::Owner));
     }
     let file = fs::OpenOptions::new()
         .read(true)
@@ -676,21 +692,18 @@ fn open_validated_store_if_present(
         map_io_error(backend, "failed to inspect open local secret store", error)
     })?;
     if !descriptor_metadata.file_type().is_file() {
-        return Err(insecure(backend, LocalFileSecurityProblem::StoreNotRegular));
+        return Err(insecure(backend, LocalFileSecurityProblem::NotRegular));
     }
     if descriptor_metadata.permissions().mode() & 0o077 != 0 {
-        return Err(insecure(
-            backend,
-            LocalFileSecurityProblem::StorePermissions,
-        ));
+        return Err(insecure(backend, LocalFileSecurityProblem::Permissions));
     }
     if !owned_by_effective_uid(descriptor_metadata.uid(), effective_uid()) {
-        return Err(insecure(backend, LocalFileSecurityProblem::StoreOwner));
+        return Err(insecure(backend, LocalFileSecurityProblem::Owner));
     }
     if descriptor_metadata.dev() != path_metadata.dev()
         || descriptor_metadata.ino() != path_metadata.ino()
     {
-        return Err(insecure(backend, LocalFileSecurityProblem::StoreChanged));
+        return Err(insecure(backend, LocalFileSecurityProblem::Changed));
     }
     Ok(Some(file))
 }
@@ -712,24 +725,29 @@ fn effective_uid() -> u32 {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn validate_no_extended_acl(path: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
-    if has_extended_acl(path).map_err(|error| {
+fn validate_no_extended_acl(
+    path: &Path,
+    backend: &SecretBackendId,
+    reject_default_acl: bool,
+    component: &'static str,
+) -> Result<(), SecretError> {
+    if let Some(check) = extended_acl_problem(path, reject_default_acl).map_err(|error| {
         map_io_error(
             backend,
             "failed to inspect local secret store access controls",
             error,
         )
     })? {
-        return Err(SecretError::LockedOrDenied {
-            backend: backend.clone(),
-            remediation: Some(format!("remove ACL entries from {}", path.display())),
-        });
+        return Err(untrusted_component(backend, component, path, check));
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn has_extended_acl(path: &Path) -> io::Result<bool> {
+fn extended_acl_problem(
+    path: &Path,
+    _reject_default_acl: bool,
+) -> io::Result<Option<&'static str>> {
     use std::{os::raw::c_void, os::unix::ffi::OsStrExt, ptr};
 
     unsafe extern "C" {
@@ -752,7 +770,7 @@ fn has_extended_acl(path: &Path) -> io::Result<bool> {
     if acl.is_null() {
         let error = io::Error::last_os_error();
         return if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(false)
+            Ok(None)
         } else {
             Err(error)
         };
@@ -763,13 +781,34 @@ fn has_extended_acl(path: &Path) -> io::Result<bool> {
     // SAFETY: `acl` was returned by `acl_get_file` and has not yet been freed.
     unsafe { acl_free(acl) };
     match result {
-        0 => Ok(true),
+        0 => Ok(Some("extended ACL")),
         _ => Err(io::Error::last_os_error()),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn has_extended_acl(path: &Path) -> io::Result<bool> {
+fn extended_acl_problem(path: &Path, reject_default_acl: bool) -> io::Result<Option<&'static str>> {
+    let (access_acl, default_acl) = linux_acl_xattrs(path)?;
+    Ok(if access_acl {
+        Some("extended access ACL")
+    } else if linux_acl_is_untrusted(access_acl, default_acl, reject_default_acl) {
+        Some("default ACL")
+    } else {
+        None
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+const fn linux_acl_is_untrusted(
+    access_acl: bool,
+    default_acl: bool,
+    is_direct_parent: bool,
+) -> bool {
+    access_acl || (is_direct_parent && default_acl)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_acl_xattrs(path: &Path) -> io::Result<(bool, bool)> {
     use std::{os::unix::ffi::OsStrExt, ptr};
 
     let path = CString::new(path.as_os_str().as_bytes())
@@ -780,7 +819,7 @@ fn has_extended_acl(path: &Path) -> io::Result<bool> {
         return Err(io::Error::last_os_error());
     }
     if size == 0 {
-        return Ok(false);
+        return Ok((false, false));
     }
     let mut names = vec![0_u8; size as usize];
     // SAFETY: `names` exposes `size` writable bytes for the NUL-separated attribute names.
@@ -794,49 +833,41 @@ fn has_extended_acl(path: &Path) -> io::Result<bool> {
     if written < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(names[..written as usize]
-        .split(|byte| *byte == 0)
-        .any(|name| {
-            matches!(
-                name,
-                b"system.posix_acl_access" | b"system.posix_acl_default"
-            )
-        }))
+    let mut access_acl = false;
+    let mut default_acl = false;
+    for name in names[..written as usize].split(|byte| *byte == 0) {
+        access_acl |= name == b"system.posix_acl_access";
+        default_acl |= name == b"system.posix_acl_default";
+    }
+    Ok((access_acl, default_acl))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn untrusted_component(
+    backend: &SecretBackendId,
+    component: &str,
+    path: &Path,
+    check: &str,
+) -> SecretError {
+    SecretError::LockedOrDenied {
+        backend: backend.clone(),
+        remediation: Some(format!("untrusted {component} {}: {check}", path.display())),
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn insecure(backend: &SecretBackendId, problem: LocalFileSecurityProblem) -> SecretError {
     let remediation = match problem {
-        LocalFileSecurityProblem::StoreNotRegular => {
+        LocalFileSecurityProblem::NotRegular => {
             "replace the local secret store with a private regular file"
         }
-        LocalFileSecurityProblem::StorePermissions => {
+        LocalFileSecurityProblem::Permissions => {
             "remove group and other permissions from the local secret store"
         }
-        LocalFileSecurityProblem::StoreOwner => {
+        LocalFileSecurityProblem::Owner => {
             "make the effective user the owner of the local secret store"
         }
-        LocalFileSecurityProblem::StoreChanged => {
-            "retry after securing the replaced local secret store"
-        }
-        LocalFileSecurityProblem::ParentNotDirectory => {
-            "use a private directory for the local secret store"
-        }
-        LocalFileSecurityProblem::ParentWritable => {
-            "remove group and other write permissions from the local secret store directory"
-        }
-        LocalFileSecurityProblem::ParentOwner => {
-            "make the effective user the owner of the local secret store directory"
-        }
-        LocalFileSecurityProblem::AncestorNotDirectory => {
-            "use only directories in the local secret store ancestor chain"
-        }
-        LocalFileSecurityProblem::AncestorWritable => {
-            "remove group and other write permissions from the local secret store ancestor chain"
-        }
-        LocalFileSecurityProblem::AncestorOwner => {
-            "make root or the effective user the owner of every local secret store ancestor"
-        }
+        LocalFileSecurityProblem::Changed => "retry after securing the replaced local secret store",
     };
     SecretError::LockedOrDenied {
         backend: backend.clone(),
@@ -1445,12 +1476,20 @@ mod tests {
             LocalFileBackend::from_config(&config("dev-local", &parent.join("secrets.json")))
                 .unwrap();
 
-        let Err(SecretError::LockedOrDenied {
+        let Err(error) = backend.probe().await else {
+            panic!("mutable intermediate ancestor must be rejected")
+        };
+        let rendered = format!("{error} {error:?}");
+        let intermediate = fs::canonicalize(intermediate).unwrap();
+        assert!(rendered.contains(&intermediate.display().to_string()));
+        assert!(rendered.contains("group- or other-writable"));
+        assert!(!rendered.contains(CANARY));
+        let SecretError::LockedOrDenied {
             remediation: Some(remediation),
             ..
-        }) = backend.probe().await
+        } = error
         else {
-            panic!("mutable intermediate ancestor must be rejected")
+            panic!("mutable intermediate ancestor must map to LockedOrDenied")
         };
         assert!(remediation.contains("ancestor"), "{remediation}");
     }
@@ -1492,10 +1531,8 @@ mod tests {
             panic!("extended ACL must map to LockedOrDenied")
         };
         let path = fs::canonicalize(path).unwrap();
-        assert_eq!(
-            remediation,
-            format!("remove ACL entries from {}", path.display())
-        );
+        assert!(remediation.contains(&path.display().to_string()));
+        assert!(remediation.contains("ACL"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1755,6 +1792,18 @@ mod tests {
         assert!(ancestor_owner_is_trusted(0, 501));
         assert!(ancestor_owner_is_trusted(501, 501));
         assert!(!ancestor_owner_is_trusted(502, 501));
+    }
+
+    #[test]
+    fn linux_acl_classification_distinguishes_ancestor_defaults_from_parent_defaults() {
+        assert!(!linux_acl_is_untrusted(false, false, false));
+        assert!(!linux_acl_is_untrusted(false, true, false));
+        assert!(linux_acl_is_untrusted(true, false, false));
+        assert!(linux_acl_is_untrusted(true, true, false));
+        assert!(!linux_acl_is_untrusted(false, false, true));
+        assert!(linux_acl_is_untrusted(false, true, true));
+        assert!(linux_acl_is_untrusted(true, false, true));
+        assert!(linux_acl_is_untrusted(true, true, true));
     }
 
     #[tokio::test]
