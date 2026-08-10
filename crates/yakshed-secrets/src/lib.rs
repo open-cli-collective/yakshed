@@ -29,7 +29,7 @@ pub use memory::{MemorySecretBackend, MemorySecretFault};
 
 pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
 
-#[cfg(all(feature = "dev-secrets", unix))]
+#[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
 const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
     SecretBackendCapability::available("memory"),
     SecretBackendCapability::available(LOCAL_FILE_BACKEND_KIND),
@@ -44,7 +44,10 @@ const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
         },
     },
 ];
-#[cfg(all(feature = "dev-secrets", not(unix)))]
+#[cfg(all(
+    feature = "dev-secrets",
+    not(any(target_os = "macos", target_os = "linux"))
+))]
 const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
     SecretBackendCapability::available("memory"),
     SecretBackendCapability {

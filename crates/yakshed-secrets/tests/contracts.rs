@@ -27,7 +27,7 @@ use yakshed_secrets::{
     shape_process_environment,
 };
 
-#[cfg(all(feature = "dev-secrets", unix))]
+#[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
 use yakshed_secrets::LocalFileBackend;
 use yakshed_secrets::SecretBackendConfigurationError;
 
@@ -176,7 +176,7 @@ fn build_capabilities_report_local_file_status() {
         .iter()
         .find(|capability| capability.kind == "local-file")
         .unwrap();
-    #[cfg(all(feature = "dev-secrets", unix))]
+    #[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
     assert_eq!(
         local_file.availability,
         SecretBackendAvailability::Available
@@ -188,7 +188,10 @@ fn build_capabilities_report_local_file_status() {
             feature: "dev-secrets"
         }
     );
-    #[cfg(all(feature = "dev-secrets", not(unix)))]
+    #[cfg(all(
+        feature = "dev-secrets",
+        not(any(target_os = "macos", target_os = "linux"))
+    ))]
     assert_eq!(
         local_file.availability,
         SecretBackendAvailability::UnsupportedPlatform
@@ -221,7 +224,7 @@ fn validation_reports_compiled_but_unsupported_platform() {
     ));
 }
 
-#[cfg(all(feature = "dev-secrets", unix))]
+#[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
 #[test]
 fn real_build_capabilities_accept_local_file_config() {
     let config = AppConfig {
@@ -237,7 +240,7 @@ fn real_build_capabilities_accept_local_file_config() {
     assert!(config.validate(backend_capabilities()).is_ok());
 }
 
-#[cfg(all(feature = "dev-secrets", unix))]
+#[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
 #[test]
 fn relative_local_file_path_is_rejected_at_construction() {
     let config = SecretBackend {
@@ -253,7 +256,7 @@ fn relative_local_file_path_is_rejected_at_construction() {
     ));
 }
 
-#[cfg(all(feature = "dev-secrets", unix))]
+#[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
 #[tokio::test]
 async fn local_file_read_only_rejection_is_audited() {
     let temp = tempfile::tempdir().unwrap();

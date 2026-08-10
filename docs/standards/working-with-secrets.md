@@ -572,15 +572,16 @@ path = "/Users/example/.local/share/yakshed/dev-secrets.json"
 ```
 
 - compiled only with the non-default `dev-secrets` Cargo feature;
-- supported only on Unix, where YakShed enforces private directory and file permission bits;
+- supported only on macOS and Linux, where YakShed enforces private directory and file permission bits and validates native
+  ACLs;
 - configured with an absolute path so behavior never depends on the process working directory;
 - allowed only for deliberate development builds and never auto-selected or used as a fallback;
 - refused with a typed configuration error naming the missing feature when ordinary builds reference it;
-- refused with a distinct typed unsupported-platform error when the feature is compiled on non-Unix targets;
+- refused with a distinct typed unsupported-platform error when the feature is compiled outside macOS and Linux;
 - stores plaintext secrets in a private local file and is not suitable for release configuration.
 
-Backend instances targeting the same canonical file share a process-global lock and an exclusive Unix `flock`, held for
-each complete read or read-modify-write operation. Dropping a queued mutation prevents it from starting; dropping one after
+Backend instances targeting the same canonical file share a process-global lock and an exclusive `flock` on macOS and Linux,
+held for each complete read or read-modify-write operation. Dropping a queued mutation prevents it from starting; dropping one after
 its write begins leaves an uncertain outcome that callers must reconcile before retrying. Reads wait for a contended flock;
 mutations poll the flock non-blockingly so abandonment cancels the wait promptly.
 

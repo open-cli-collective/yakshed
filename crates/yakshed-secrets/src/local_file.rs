@@ -1,16 +1,16 @@
 //! Plaintext local-development secret storage.
 //!
-//! Backends targeting the same canonical path share a process-global mutex and an exclusive Unix
-//! `flock` for each operation. Purge unlinks only the store; the zero-length `.lock` sidecar
-//! is persistent coordination state and survives purge. Delete both files manually only after
-//! every backend instance has stopped.
+//! On macOS and Linux, backends targeting the same canonical path share a process-global mutex and
+//! an exclusive `flock` for each operation. Purge unlinks only the store; the zero-length `.lock`
+//! sidecar is persistent coordination state and survives purge. Delete both files manually only
+//! after every backend instance has stopped.
 //! Dropped mutations are suppressed before writing starts. A drop after writing starts has an
 //! uncertain outcome and must be reconciled before retrying. Reads wait for a contended file lock;
 //! abandoned mutations stop waiting promptly.
 //! Extended ACLs are rejected via native macOS ACL inspection or Linux POSIX ACL xattrs; YakShed
 //! never removes filesystem ACLs on the user's behalf.
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -25,39 +25,39 @@ use std::{
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use async_trait::async_trait;
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use atomic_write_file::{AtomicWriteFile, OpenOptions as AtomicOpenOptions};
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use secrecy::{ExposeSecret, SecretString};
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use serde::{Deserialize, Serialize};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::{
     DeleteSecretOutcome, LOCAL_FILE_BACKEND_KIND, PutSecretOptions, PutSecretOutcome,
     ResolvedSecret, ResolvedSecretSource, SecretAccessContext, SecretAdministrator,
-    SecretBackendDescriptor, SecretBackendStatus, SecretError, SecretLocator,
+    SecretBackendDescriptor, SecretBackendId, SecretBackendStatus, SecretError, SecretLocator,
     SecretReferenceSummary, SecretResolver,
 };
 use crate::{
-    SecretBackend, SecretBackendConfigurationError, SecretBackendId, SecretBackendSettings,
+    SecretBackend, SecretBackendConfigurationError, SecretBackendSettings,
     validate_backend_configuration,
 };
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const FORMAT_VERSION: u32 = 1;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static LOCAL_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 
 pub struct LocalFileBackend {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     state: Arc<LocalFileState>,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct LocalFileState {
     id: SecretBackendId,
     configured_path: PathBuf,
@@ -66,13 +66,13 @@ struct LocalFileState {
     fail_next_post_commit_validation: AtomicBool,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct InitializedLocalFile {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalFileSecurityProblem {
     StoreNotRegular,
@@ -84,7 +84,7 @@ enum LocalFileSecurityProblem {
     ParentOwner,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Deserialize, Serialize)]
 struct LocalFileStore {
     format_version: u32,
@@ -100,10 +100,10 @@ impl LocalFileBackend {
             });
         };
         validate_backend_configuration(config, crate::backend_capabilities())?;
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let _ = path;
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             Ok(Self {
                 state: Arc::new(LocalFileState {
@@ -115,20 +115,21 @@ impl LocalFileBackend {
                 }),
             })
         }
-        #[cfg(not(unix))]
-        unreachable!("platform validation rejects local-file on non-Unix targets")
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        unreachable!("platform validation rejects local-file outside macOS and Linux")
     }
 
     /// Removes the local store while holding both coordination locks.
     ///
     /// The `.lock` sidecar is intentionally retained so queued contenders keep using the same
     /// inode across purge. Manual deletion of both files is safe only with all instances stopped.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub async fn purge(&self) -> Result<(), SecretError> {
         self.run_abandonable(|state, abandoned| state.purge(abandoned))
             .await
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     async fn run_abandonable<T>(
         &self,
         action: impl FnOnce(&LocalFileState, &AtomicBool) -> Result<T, SecretError> + Send + 'static,
@@ -162,13 +163,13 @@ impl LocalFileBackend {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct AbandonmentGuard {
     abandoned: Arc<AtomicBool>,
     completed: bool,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for AbandonmentGuard {
     fn drop(&mut self) {
         if !self.completed {
@@ -177,7 +178,7 @@ impl Drop for AbandonmentGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl LocalFileState {
     fn summary(&self, locator: &SecretLocator) -> SecretReferenceSummary {
         SecretReferenceSummary {
@@ -325,7 +326,7 @@ impl LocalFileState {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[async_trait]
 impl SecretResolver for LocalFileBackend {
     fn descriptor(&self) -> SecretBackendDescriptor {
@@ -374,7 +375,7 @@ impl SecretResolver for LocalFileBackend {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[async_trait]
 impl SecretAdministrator for LocalFileBackend {
     fn backend_id(&self) -> SecretBackendId {
@@ -437,7 +438,7 @@ impl SecretAdministrator for LocalFileBackend {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn shared_file_lock(path: &Path) -> Arc<Mutex<()>> {
     let registry = LOCAL_FILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry
@@ -452,7 +453,7 @@ fn shared_file_lock(path: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn canonical_store_path(path: &Path) -> io::Result<PathBuf> {
     create_private_ancestors(path)?;
     let file_name = path.file_name().ok_or_else(|| {
@@ -464,17 +465,17 @@ fn canonical_store_path(path: &Path) -> io::Result<PathBuf> {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn lock_path(path: &Path) -> PathBuf {
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".lock");
     PathBuf::from(lock)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct FlockGuard(File);
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn lock_exclusive(
     path: &Path,
     backend: &SecretBackendId,
@@ -516,7 +517,7 @@ fn lock_exclusive(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for FlockGuard {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
@@ -528,7 +529,7 @@ impl Drop for FlockGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -558,12 +559,12 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_store_if_present(path: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
     open_validated_store_if_present(path, backend).map(|_| ())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn open_validated_store_if_present(
     path: &Path,
     backend: &SecretBackendId,
@@ -622,18 +623,18 @@ fn open_validated_store_if_present(
     Ok(Some(file))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const fn owned_by_effective_uid(owner: u32, effective_uid: u32) -> bool {
     owner == effective_uid
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn effective_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments and has no preconditions.
     unsafe { libc::geteuid() }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_no_extended_acl(path: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
     if has_extended_acl(path).map_err(|error| {
         map_io_error(
@@ -690,14 +691,6 @@ fn has_extended_acl(path: &Path) -> io::Result<bool> {
     }
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn has_extended_acl(_path: &Path) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "ACL inspection is unsupported on this platform",
-    ))
-}
-
 #[cfg(target_os = "linux")]
 fn has_extended_acl(path: &Path) -> io::Result<bool> {
     use std::{os::unix::ffi::OsStrExt, ptr};
@@ -734,7 +727,7 @@ fn has_extended_acl(path: &Path) -> io::Result<bool> {
         }))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn insecure(backend: &SecretBackendId, problem: LocalFileSecurityProblem) -> SecretError {
     let remediation = match problem {
         LocalFileSecurityProblem::StoreNotRegular => {
@@ -765,12 +758,12 @@ fn insecure(backend: &SecretBackendId, problem: LocalFileSecurityProblem) -> Sec
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn claim_or_validate(path: &Path, backend: &SecretBackendId) -> Result<(), SecretError> {
     claim_or_validate_with_hook(path, backend, || Ok(()))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn claim_or_validate_with_hook(
     path: &Path,
     backend: &SecretBackendId,
@@ -799,7 +792,7 @@ fn claim_or_validate_with_hook(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn write_store(
     path: &Path,
     store: &LocalFileStore,
@@ -814,7 +807,7 @@ fn write_store(
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_store(path: &Path, backend: &SecretBackendId) -> Result<LocalFileStore, SecretError> {
     let mut file = open_validated_store_if_present(path, backend)?
         .ok_or_else(|| backend_failure(backend, "local secret store disappeared before opening"))?;
@@ -838,13 +831,13 @@ fn read_store(path: &Path, backend: &SecretBackendId) -> Result<LocalFileStore, 
     Ok(store)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 enum WriteStoreError {
     BeforeCommit,
     AfterCommit,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn write_store_with_hooks(
     path: &Path,
     store: &LocalFileStore,
@@ -861,7 +854,7 @@ fn write_store_with_hooks(
         .map_err(|_| WriteStoreError::AfterCommit)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn map_write_error(backend: &SecretBackendId, error: WriteStoreError) -> SecretError {
     match error {
         WriteStoreError::BeforeCommit => {
@@ -873,7 +866,7 @@ fn map_write_error(backend: &SecretBackendId, error: WriteStoreError) -> SecretE
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn backend_failure(backend: &SecretBackendId, message: &'static str) -> SecretError {
     SecretError::BackendFailure {
         backend: backend.clone(),
@@ -881,7 +874,7 @@ fn backend_failure(backend: &SecretBackendId, message: &'static str) -> SecretEr
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn map_io_error(backend: &SecretBackendId, message: &'static str, error: io::Error) -> SecretError {
     if error.kind() == io::ErrorKind::PermissionDenied {
         SecretError::LockedOrDenied {
@@ -893,7 +886,7 @@ fn map_io_error(backend: &SecretBackendId, message: &'static str, error: io::Err
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn create_private_ancestors(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -922,7 +915,7 @@ fn create_private_ancestors(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn private_atomic_file(path: &Path) -> io::Result<AtomicWriteFile> {
     use atomic_write_file::unix::OpenOptionsExt;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -932,12 +925,12 @@ fn private_atomic_file(path: &Path) -> io::Result<AtomicWriteFile> {
     options.open(path)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
