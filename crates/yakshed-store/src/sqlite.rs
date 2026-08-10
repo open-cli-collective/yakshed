@@ -9,15 +9,15 @@ use std::{
 };
 
 use async_trait::async_trait;
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, Transaction, params};
 use rusqlite_migration::{M, Migrations};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use yakshed_application::{
     AppStore, ApprovalPage, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateProject,
-    CreateRun, CreateWorkItem, GetStreamCursor, ListTimeline, ListWorkItems, PendingApproval,
-    ProjectPage, RunPage, StoreError, StreamCursorState, TimelineBatch, TimelinePage,
-    TransitionRun, WorkItemPage,
+    CreateRun, CreateWorkItem, GetStreamCursor, IdGenerator, ListTimeline, ListWorkItems,
+    PendingApproval, ProjectPage, RunPage, StoreError, StreamCursorState, TimelineBatch,
+    TimelinePage, TransitionRun, WorkItemPage,
 };
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ConnectionId,
@@ -165,25 +165,35 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    pub async fn open(paths: AppPaths, clock: Arc<dyn Clock>) -> Result<Self, StoreError> {
+    pub async fn open(
+        paths: AppPaths,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> Result<Self, StoreError> {
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = oneshot::channel();
+        let worker_clock = Arc::clone(&clock);
         let thread = thread::Builder::new()
             .name("yakshed-sqlite".to_owned())
-            .spawn(move || match open_connection(&paths) {
-                Ok(connection) => {
-                    let _ = ready_sender.send(Ok(()));
-                    run_worker(
-                        Worker {
-                            connection,
-                            #[cfg(test)]
-                            fail_transition_after_update: false,
-                        },
-                        receiver,
-                    );
-                }
-                Err(error) => {
-                    let _ = ready_sender.send(Err(error));
+            .spawn(move || {
+                match open_connection(&paths).and_then(|mut connection| {
+                    reconcile_running_runs(&mut connection, worker_clock.now(), ids.as_ref())?;
+                    Ok(connection)
+                }) {
+                    Ok(connection) => {
+                        let _ = ready_sender.send(Ok(()));
+                        run_worker(
+                            Worker {
+                                connection,
+                                #[cfg(test)]
+                                fail_transition_after_update: false,
+                            },
+                            receiver,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                    }
                 }
             })
             .map_err(|error| StoreError::Open(error.to_string()))?;
@@ -592,6 +602,112 @@ fn run_status_from_value(value: &str) -> rusqlite::Result<RunStatus> {
         "interrupted" => Ok(RunStatus::Interrupted),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
+}
+
+fn apply_run_transition(
+    transaction: &Transaction<'_>,
+    command: &TransitionRun,
+) -> Result<RunSnapshot, StoreError> {
+    let changed = transaction
+        .execute(
+            "UPDATE runs SET status = ?2, ended_at_ms = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                command.run_id.to_string(),
+                run_status_value(command.target),
+                command.occurred_at.unix_millis(),
+                run_status_value(command.expected_current)
+            ],
+        )
+        .map_err(map_database_error)?;
+    if changed == 0 {
+        let current = transaction
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                [command.run_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_database_error)?;
+        return Err(match current {
+            Some(current) => StoreError::Conflict(format!(
+                "run state conflict: expected {}, current {current}",
+                run_status_value(command.expected_current)
+            )),
+            None => StoreError::NotFound {
+                entity: "run",
+                id: command.run_id.to_string(),
+            },
+        });
+    }
+    let voided = transaction
+        .execute(
+            "UPDATE approval_requests
+             SET status = 'voided', voided_at_ms = ?2
+             WHERE run_id = ?1 AND status = 'pending'",
+            params![
+                command.run_id.to_string(),
+                command.occurred_at.unix_millis()
+            ],
+        )
+        .map_err(map_database_error)?;
+    transaction
+        .execute(
+            "INSERT INTO audit_events
+             (id, event_type, entity_type, entity_id, body, created_at_ms)
+             VALUES (?1, 'run_transitioned', 'run', ?2, ?3, ?4)",
+            params![
+                command.audit_event_id.to_string(),
+                command.run_id.to_string(),
+                format!(
+                    "{}->{};voided_approvals={voided}",
+                    run_status_value(command.expected_current),
+                    run_status_value(command.target)
+                ),
+                command.occurred_at.unix_millis()
+            ],
+        )
+        .map_err(map_database_error)?;
+    transaction
+        .query_row(
+            &format!("{RUN_SELECT} WHERE id = ?1"),
+            [command.run_id.to_string()],
+            run_from_row,
+        )
+        .map_err(map_database_error)
+}
+
+fn reconcile_running_runs(
+    connection: &mut Connection,
+    occurred_at: UtcTimestamp,
+    ids: &dyn IdGenerator,
+) -> Result<(), StoreError> {
+    let transaction = connection.transaction().map_err(map_database_error)?;
+    let run_ids = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM runs WHERE status = 'running' ORDER BY id")
+            .map_err(map_database_error)?;
+        statement
+            .query_map([], |row| parse_column::<RunId>(row, 0))
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?
+    };
+    for run_id in run_ids {
+        let audit_event_id = ids.next_audit_event_id();
+        validate_app_id("audit event id", audit_event_id.is_v7())?;
+        apply_run_transition(
+            &transaction,
+            &TransitionRun {
+                run_id,
+                expected_current: RunStatus::Running,
+                target: RunStatus::Interrupted,
+                occurred_at,
+                audit_event_id,
+            },
+        )?;
+    }
+    transaction.commit().map_err(map_database_error)
 }
 
 const APPROVAL_SELECT: &str = "
@@ -1148,79 +1264,13 @@ impl AppStore for SqliteStore {
                 .connection
                 .transaction()
                 .map_err(map_database_error)?;
-            let changed = transaction
-                .execute(
-                    "UPDATE runs SET status = ?2, ended_at_ms = ?3
-                     WHERE id = ?1 AND status = ?4",
-                    params![
-                        command.run_id.to_string(),
-                        run_status_value(command.target),
-                        command.occurred_at.unix_millis(),
-                        run_status_value(command.expected_current)
-                    ],
-                )
-                .map_err(map_database_error)?;
-            if changed == 0 {
-                let current = transaction
-                    .query_row(
-                        "SELECT status FROM runs WHERE id = ?1",
-                        [command.run_id.to_string()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(map_database_error)?;
-                return Err(match current {
-                    Some(current) => StoreError::Conflict(format!(
-                        "run state conflict: expected {}, current {current}",
-                        run_status_value(command.expected_current)
-                    )),
-                    None => StoreError::NotFound {
-                        entity: "run",
-                        id: command.run_id.to_string(),
-                    },
-                });
-            }
-            let voided = transaction
-                .execute(
-                    "UPDATE approval_requests
-                     SET status = 'voided', voided_at_ms = ?2
-                     WHERE run_id = ?1 AND status IN ('pending', 'responding')",
-                    params![
-                        command.run_id.to_string(),
-                        command.occurred_at.unix_millis()
-                    ],
-                )
-                .map_err(map_database_error)?;
+            let snapshot = apply_run_transition(&transaction, &command)?;
             #[cfg(test)]
             if std::mem::take(&mut worker.fail_transition_after_update) {
                 return Err(StoreError::Backend(
                     "injected failure after run transition".to_owned(),
                 ));
             }
-            transaction
-                .execute(
-                    "INSERT INTO audit_events
-                     (id, event_type, entity_type, entity_id, body, created_at_ms)
-                     VALUES (?1, 'run_transitioned', 'run', ?2, ?3, ?4)",
-                    params![
-                        command.audit_event_id.to_string(),
-                        command.run_id.to_string(),
-                        format!(
-                            "{}->{};voided_approvals={voided}",
-                            run_status_value(command.expected_current),
-                            run_status_value(command.target)
-                        ),
-                        command.occurred_at.unix_millis()
-                    ],
-                )
-                .map_err(map_database_error)?;
-            let snapshot = transaction
-                .query_row(
-                    &format!("{RUN_SELECT} WHERE id = ?1"),
-                    [command.run_id.to_string()],
-                    run_from_row,
-                )
-                .map_err(map_database_error)?;
             transaction.commit().map_err(map_database_error)?;
             Ok(snapshot)
         })
@@ -1555,6 +1605,28 @@ impl AppStore for SqliteStore {
                 .connection
                 .transaction()
                 .map_err(map_database_error)?;
+            let existing = transaction
+                .query_row(
+                    &format!("{APPROVAL_SELECT} WHERE id = ?1"),
+                    [approval.id.to_string()],
+                    approval_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                return if existing.run_id == approval.run_id
+                    && existing.provider_id == approval.provider_id
+                    && existing.kind == approval.kind
+                    && existing.summary == approval.summary
+                {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Conflict(format!(
+                        "approval id already exists with different content: {}",
+                        approval.id
+                    )))
+                };
+            }
             let run = transaction
                 .query_row(
                     "SELECT connection_id, status FROM runs WHERE id = ?1",
@@ -1578,28 +1650,6 @@ impl AppStore for SqliteStore {
                 return Err(StoreError::Conflict(
                     "cannot record an approval for a terminal run".to_owned(),
                 ));
-            }
-            let existing = transaction
-                .query_row(
-                    &format!("{APPROVAL_SELECT} WHERE id = ?1"),
-                    [approval.id.to_string()],
-                    approval_from_row,
-                )
-                .optional()
-                .map_err(map_database_error)?;
-            if let Some(existing) = existing {
-                return if existing.run_id == approval.run_id
-                    && existing.provider_id == approval.provider_id
-                    && existing.kind == approval.kind
-                    && existing.summary == approval.summary
-                {
-                    Ok(existing)
-                } else {
-                    Err(StoreError::Conflict(format!(
-                        "approval id already exists with different content: {}",
-                        approval.id
-                    )))
-                };
             }
             transaction
                 .execute(
@@ -1898,10 +1948,14 @@ mod tests {
     #[tokio::test]
     async fn approval_and_run_transitions_commit_audits_or_roll_back_together() {
         let temp = tempfile::tempdir().unwrap();
-        let ids = SystemIdGenerator;
-        let store = SqliteStore::open(AppPaths::for_test(temp.path()), Arc::new(FixedClock))
-            .await
-            .unwrap();
+        let ids = Arc::new(SystemIdGenerator);
+        let store = SqliteStore::open(
+            AppPaths::for_test(temp.path()),
+            Arc::new(FixedClock),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
         let project = store
             .create_project(CreateProject {
                 id: ids.next_project_id(),
@@ -2014,6 +2068,24 @@ mod tests {
             })
             .await
             .unwrap();
+        let responding = store
+            .record_pending_approval(PendingApproval {
+                id: ids.next_approval_request_id(),
+                run_id: run.id,
+                provider_id: NamespacedProviderId::new("mock", "approval-3").unwrap(),
+                kind: "command".into(),
+                summary: "in flight".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .begin_approval_response(BeginApprovalResponse {
+                approval_id: responding.id,
+                decision: ApprovalDecision::Denied,
+                audit_event_id: ids.next_audit_event_id(),
+            })
+            .await
+            .unwrap();
         store.fail_next_transition_after_update().await.unwrap();
         assert!(
             store
@@ -2032,7 +2104,7 @@ mod tests {
                 .run_and_approval_statuses(run.id, pending.id)
                 .await
                 .unwrap(),
-            ("running".to_owned(), "pending".to_owned(), 2)
+            ("running".to_owned(), "pending".to_owned(), 3)
         );
         store
             .transition_run(TransitionRun {
@@ -2049,7 +2121,28 @@ mod tests {
                 .run_and_approval_statuses(run.id, pending.id)
                 .await
                 .unwrap(),
-            ("failed".to_owned(), "voided".to_owned(), 3)
+            ("failed".to_owned(), "voided".to_owned(), 4)
+        );
+        assert_eq!(
+            store
+                .approval_status_and_audit_count(responding.id)
+                .await
+                .unwrap(),
+            ("responding".to_owned(), 4)
+        );
+        store
+            .confirm_approval_response(ConfirmApprovalResponse {
+                approval_id: responding.id,
+                audit_event_id: ids.next_audit_event_id(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .approval_status_and_audit_count(responding.id)
+                .await
+                .unwrap(),
+            ("resolved".to_owned(), 5)
         );
     }
 }

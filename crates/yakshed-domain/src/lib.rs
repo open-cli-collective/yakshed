@@ -7,14 +7,28 @@ use uuid::Uuid;
 
 /// Stable identity of a configured connection.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct ConnectionId(Uuid);
 
 impl FromStr for ConnectionId {
-    type Err = uuid::Error;
+    type Err = ValidationError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Uuid::parse_str(value).map(Self)
+        parse_uuid_v7("connection id", value).map(Self)
+    }
+}
+
+impl TryFrom<String> for ConnectionId {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ConnectionId> for String {
+    fn from(value: ConnectionId) -> Self {
+        value.to_string()
     }
 }
 
@@ -72,9 +86,11 @@ impl WorkItemId {
     }
 }
 
-impl From<Uuid> for WorkItemId {
-    fn from(value: Uuid) -> Self {
-        Self(value)
+impl TryFrom<Uuid> for WorkItemId {
+    type Error = ValidationError;
+
+    fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+        validate_uuid_v7("work item id", value).map(Self)
     }
 }
 
@@ -121,9 +137,11 @@ impl RunId {
     }
 }
 
-impl From<Uuid> for RunId {
-    fn from(value: Uuid) -> Self {
-        Self(value)
+impl TryFrom<Uuid> for RunId {
+    type Error = ValidationError;
+
+    fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+        validate_uuid_v7("run id", value).map(Self)
     }
 }
 
@@ -275,9 +293,9 @@ macro_rules! uuid_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
         #[derive(
-            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
         )]
-        #[serde(transparent)]
+        #[serde(try_from = "String", into = "String")]
         pub struct $name(Uuid);
 
         impl $name {
@@ -290,17 +308,33 @@ macro_rules! uuid_id {
             }
         }
 
-        impl From<Uuid> for $name {
-            fn from(value: Uuid) -> Self {
-                Self(value)
+        impl TryFrom<Uuid> for $name {
+            type Error = ValidationError;
+
+            fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+                validate_uuid_v7(stringify!($name), value).map(Self)
             }
         }
 
         impl FromStr for $name {
-            type Err = uuid::Error;
+            type Err = ValidationError;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Uuid::parse_str(value).map(Self)
+                parse_uuid_v7(stringify!($name), value).map(Self)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = ValidationError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                value.parse()
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.to_string()
             }
         }
 
@@ -801,6 +835,10 @@ fn require_nonempty(field: &'static str, value: &str) -> Result<(), ValidationEr
 fn parse_uuid_v7(field: &'static str, value: &str) -> Result<Uuid, ValidationError> {
     let uuid = Uuid::parse_str(value)
         .map_err(|error| ValidationError(format!("invalid {field}: {error}")))?;
+    validate_uuid_v7(field, uuid)
+}
+
+fn validate_uuid_v7(field: &'static str, uuid: Uuid) -> Result<Uuid, ValidationError> {
     if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
         return Err(ValidationError(format!("{field} must be a UUIDv7")));
     }
@@ -849,6 +887,18 @@ mod tests {
     fn app_owned_ids_are_uuid_v7() {
         let parsed = Uuid::parse_str(&WorkItemId::new_v7().to_string()).unwrap();
         assert_eq!(parsed.get_version_num(), 7);
+    }
+
+    #[test]
+    fn app_owned_id_deserialization_rejects_non_v7_uuid() {
+        use serde::Deserialize as _;
+        use serde::de::value::{Error, StrDeserializer};
+
+        let value = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(ConnectionId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
+        assert!(ProjectId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
+        assert!(TimelineBatchId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
+        assert!(ApprovalRequestId::deserialize(StrDeserializer::<Error>::new(value)).is_err());
     }
 
     #[test]

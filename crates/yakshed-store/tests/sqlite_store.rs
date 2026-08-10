@@ -28,31 +28,31 @@ impl TestIds {
 
 impl IdGenerator for TestIds {
     fn next_project_id(&self) -> ProjectId {
-        self.next_uuid().into()
+        self.next_uuid().try_into().unwrap()
     }
 
     fn next_work_item_id(&self) -> WorkItemId {
-        self.next_uuid().into()
+        self.next_uuid().try_into().unwrap()
     }
 
     fn next_run_id(&self) -> RunId {
-        self.next_uuid().into()
+        self.next_uuid().try_into().unwrap()
     }
 
     fn next_timeline_item_id(&self) -> TimelineItemId {
-        self.next_uuid().into()
+        self.next_uuid().try_into().unwrap()
     }
 
     fn next_timeline_batch_id(&self) -> TimelineBatchId {
-        self.next_uuid().into()
+        self.next_uuid().try_into().unwrap()
     }
 
     fn next_approval_request_id(&self) -> ApprovalRequestId {
-        self.next_uuid().into()
+        self.next_uuid().try_into().unwrap()
     }
 
     fn next_audit_event_id(&self) -> AuditEventId {
-        self.next_uuid().into()
+        self.next_uuid().try_into().unwrap()
     }
 }
 
@@ -76,7 +76,7 @@ impl Context {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
         let ids = Arc::new(TestIds::new());
-        let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock))
+        let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone())
             .await
             .unwrap();
         Self {
@@ -157,6 +157,33 @@ async fn empty_database_migrates_to_v1_before_ready() {
 }
 
 #[tokio::test]
+async fn non_v7_id_in_durable_row_is_classified_as_integrity() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let ids = Arc::new(TestIds::new());
+    let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone())
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let connection = rusqlite::Connection::open(paths.data_root.join("yakshed.sqlite3")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects (id, name, created_at_ms) VALUES (?1, 'bad', 1)",
+            ["550e8400-e29b-41d4-a716-446655440000"],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStore::open(paths, Arc::new(FixedClock), ids)
+        .await
+        .unwrap();
+    assert!(matches!(
+        reopened.list_projects(None, 10).await,
+        Err(StoreError::Integrity(_))
+    ));
+}
+
+#[tokio::test]
 async fn newer_schema_is_rejected_without_modification() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
@@ -168,7 +195,7 @@ async fn newer_schema_is_rejected_without_modification() {
     let before = fs::read(&database).unwrap();
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock)).await,
+        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::UnsupportedNewerSchema {
             found: 99,
             supported: 1
@@ -193,7 +220,7 @@ async fn incompatible_prior_schema_is_classified_as_migration_failure_and_retain
     drop(connection);
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock)).await,
+        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::Migration(_))
     ));
     let connection = rusqlite::Connection::open(database).unwrap();
@@ -213,7 +240,7 @@ async fn unusable_data_root_is_classified_as_open_failure() {
     fs::write(&paths.data_root, b"not a directory").unwrap();
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock)).await,
+        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::Open(_))
     ));
 }
@@ -515,19 +542,9 @@ async fn repeated_create_commands_are_idempotent_by_supplied_id() {
     );
 }
 
-#[tokio::test]
-async fn create_rejects_non_v7_app_id() {
-    let context = Context::open().await;
-    assert!(matches!(
-        context
-            .store
-            .create_project(CreateProject {
-                id: uuid::Uuid::nil().into(),
-                name: "invalid id".into(),
-            })
-            .await,
-        Err(StoreError::Conflict(_))
-    ));
+#[test]
+fn app_id_construction_rejects_non_v7_uuid() {
+    assert!(ProjectId::try_from(uuid::Uuid::nil()).is_err());
 }
 
 #[tokio::test]
@@ -828,7 +845,7 @@ async fn corruption_is_classified_and_original_file_is_retained() {
     fs::write(&database, garbage).unwrap();
 
     assert!(matches!(
-        SqliteStore::open(paths, Arc::new(FixedClock)).await,
+        SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::Integrity(_))
     ));
     assert_eq!(fs::read(database).unwrap(), garbage);
@@ -994,7 +1011,7 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
         })
         .await
         .unwrap();
-    context
+    let pending = context
         .store
         .record_pending_approval(PendingApproval {
             id: context.ids.next_approval_request_id(),
@@ -1002,6 +1019,26 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
             provider_id: NamespacedProviderId::new("mock", "void-on-failure").unwrap(),
             kind: "command".into(),
             summary: "cannot proceed".into(),
+        })
+        .await
+        .unwrap();
+    let responding = context
+        .store
+        .record_pending_approval(PendingApproval {
+            id: context.ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "in-flight").unwrap(),
+            kind: "command".into(),
+            summary: "already dispatched".into(),
+        })
+        .await
+        .unwrap();
+    let responding = context
+        .store
+        .begin_approval_response(BeginApprovalResponse {
+            approval_id: responding.id,
+            decision: ApprovalDecision::Approved,
+            audit_event_id: context.ids.next_audit_event_id(),
         })
         .await
         .unwrap();
@@ -1040,6 +1077,40 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
             .items
             .is_empty()
     );
+    assert_eq!(
+        context
+            .store
+            .list_unconfirmed_approval_responses(None, 10)
+            .await
+            .unwrap()
+            .items,
+        vec![responding.clone()]
+    );
+    let resolved = context
+        .store
+        .confirm_approval_response(ConfirmApprovalResponse {
+            approval_id: responding.id,
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.status,
+        ApprovalStatus::Resolved {
+            decision: ApprovalDecision::Approved
+        }
+    );
+    let history = context
+        .store
+        .list_approvals_for_run(run.id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(history.items[0].id, pending.id);
+    assert_eq!(
+        history.items[0].status,
+        ApprovalStatus::Voided { decision: None }
+    );
+    assert_eq!(history.items[1], resolved);
     assert!(
         context
             .store
@@ -1065,7 +1136,7 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
 }
 
 #[tokio::test]
-async fn terminal_run_rejects_late_pending_approval() {
+async fn terminal_run_allows_existing_approval_retry_but_rejects_new_approval() {
     let context = Context::open().await;
     let project_id = context.project().await;
     let work = context
@@ -1088,6 +1159,18 @@ async fn terminal_run_rejects_late_pending_approval() {
         })
         .await
         .unwrap();
+    let original_command = PendingApproval {
+        id: context.ids.next_approval_request_id(),
+        run_id: run.id,
+        provider_id: NamespacedProviderId::new("mock", "before-terminal").unwrap(),
+        kind: "command".into(),
+        summary: "recorded while running".into(),
+    };
+    context
+        .store
+        .record_pending_approval(original_command.clone())
+        .await
+        .unwrap();
     context
         .store
         .transition_run(TransitionRun {
@@ -1099,6 +1182,13 @@ async fn terminal_run_rejects_late_pending_approval() {
         })
         .await
         .unwrap();
+
+    let retried = context
+        .store
+        .record_pending_approval(original_command)
+        .await
+        .unwrap();
+    assert_eq!(retried.status, ApprovalStatus::Voided { decision: None });
 
     assert!(matches!(
         context
@@ -1131,14 +1221,128 @@ async fn terminal_run_rejects_late_pending_approval() {
             .items
             .is_empty()
     );
-    assert!(
+    assert_eq!(
         context
             .store
             .list_approvals_for_run(run.id, None, 10)
             .await
             .unwrap()
+            .items,
+        vec![retried]
+    );
+}
+
+#[tokio::test]
+async fn reopen_interrupts_orphaned_run_and_preserves_responding_approval() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let ids = Arc::new(TestIds::new());
+    let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone())
+        .await
+        .unwrap();
+    let project = store
+        .create_project(CreateProject {
+            id: ids.next_project_id(),
+            name: "orphan recovery".into(),
+        })
+        .await
+        .unwrap();
+    let work = store
+        .create_work_item(CreateWorkItem {
+            id: ids.next_work_item_id(),
+            project_id: project.id,
+            title: "orphaned run".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = store
+        .create_run(CreateRun {
+            id: ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    let pending = store
+        .record_pending_approval(PendingApproval {
+            id: ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "orphan-pending").unwrap(),
+            kind: "command".into(),
+            summary: "not dispatched".into(),
+        })
+        .await
+        .unwrap();
+    let responding = store
+        .record_pending_approval(PendingApproval {
+            id: ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "orphan-responding").unwrap(),
+            kind: "command".into(),
+            summary: "already dispatched".into(),
+        })
+        .await
+        .unwrap();
+    let responding = store
+        .begin_approval_response(BeginApprovalResponse {
+            approval_id: responding.id,
+            decision: ApprovalDecision::Approved,
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(paths, Arc::new(FixedClock), ids.clone())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .list_active_runs(None, 10)
+            .await
+            .unwrap()
             .items
             .is_empty()
+    );
+    let interrupted = reopened.get_run(run.id).await.unwrap();
+    assert_eq!(interrupted.status, RunStatus::Interrupted);
+    assert_eq!(
+        interrupted.ended_at,
+        Some(UtcTimestamp::from_unix_millis(1_735_689_600_123))
+    );
+    let history = reopened
+        .list_approvals_for_run(run.id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(history.items[0].id, pending.id);
+    assert_eq!(
+        history.items[0].status,
+        ApprovalStatus::Voided { decision: None }
+    );
+    assert_eq!(history.items[1].status, responding.status);
+    assert_eq!(
+        reopened
+            .list_unconfirmed_approval_responses(None, 10)
+            .await
+            .unwrap()
+            .items[0]
+            .id,
+        responding.id
+    );
+    let resolved = reopened
+        .confirm_approval_response(ConfirmApprovalResponse {
+            approval_id: responding.id,
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.status,
+        ApprovalStatus::Resolved {
+            decision: ApprovalDecision::Approved
+        }
     );
 }
 
@@ -1146,8 +1350,8 @@ async fn terminal_run_rejects_late_pending_approval() {
 async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
-    let ids = TestIds::new();
-    let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock))
+    let ids = Arc::new(TestIds::new());
+    let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone())
         .await
         .unwrap();
     let project = store
@@ -1325,7 +1529,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
         .unwrap();
     store.shutdown().await.unwrap();
 
-    let reopened = SqliteStore::open(paths, Arc::new(FixedClock))
+    let reopened = SqliteStore::open(paths, Arc::new(FixedClock), ids.clone())
         .await
         .unwrap();
     let first_projects = reopened.list_projects(None, 1).await.unwrap();
@@ -1390,8 +1594,8 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
     );
     assert_eq!(
         approval_history[1].status,
-        ApprovalStatus::Voided {
-            decision: Some(ApprovalDecision::Approved)
+        ApprovalStatus::Responding {
+            decision: ApprovalDecision::Approved
         }
     );
     assert_eq!(
