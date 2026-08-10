@@ -17,15 +17,17 @@ use yakshed_domain::{
     OperationId, ProviderStateRootId,
 };
 use yakshed_secrets::{
-    BrokerCancellation, CredentialBroker, CredentialResolution, CredentialStatus,
-    DeleteSecretOutcome, InvalidBindingReason, MemorySecretBackend, MemorySecretFault,
-    PutSecretOptions, PutSecretOutcome, ResolvedSecret, SecretAccessContext, SecretAccessPurpose,
-    SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackend,
+    BrokerCancellation, CredentialBroker, CredentialResolution, DeleteSecretOutcome,
+    InvalidBindingReason, PutSecretOptions, PutSecretOutcome, ResolvedSecret, SecretAccessContext,
+    SecretAccessPurpose, SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackend,
     SecretBackendAvailability, SecretBackendCapability, SecretBackendDescriptor,
     SecretBackendHandle, SecretBackendId, SecretBackendSettings, SecretBackendStatus, SecretError,
     SecretLocator, SecretOperation, SecretReference, SecretResolver, backend_capabilities,
     shape_process_environment,
 };
+
+#[cfg(feature = "dev-secrets")]
+use yakshed_secrets::{CredentialStatus, MemorySecretBackend, MemorySecretFault};
 
 #[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
 use yakshed_secrets::LocalFileBackend;
@@ -75,6 +77,7 @@ fn connection(id: &str, state: &str, credentials: Vec<CredentialBindingRecord>) 
     }
 }
 
+#[cfg(feature = "dev-secrets")]
 fn handle(backend: Arc<MemorySecretBackend>) -> SecretBackendHandle {
     SecretBackendHandle {
         resolver: backend.clone(),
@@ -91,6 +94,7 @@ impl SecretAuditSink for AuditLog {
     }
 }
 
+#[cfg(feature = "dev-secrets")]
 fn build_broker(
     backend: Arc<MemorySecretBackend>,
     connections: &[Connection],
@@ -196,6 +200,46 @@ fn build_capabilities_report_local_file_status() {
         local_file.availability,
         SecretBackendAvailability::UnsupportedPlatform
     );
+}
+
+#[test]
+fn build_capabilities_gate_memory_backend_configuration() {
+    let memory = backend_capabilities()
+        .iter()
+        .find(|capability| capability.kind == "memory")
+        .unwrap();
+    let config = AppConfig {
+        secret_backends: vec![SecretBackend {
+            id: backend_id("memory"),
+            settings: SecretBackendSettings::Memory,
+        }],
+        ..AppConfig::default()
+    };
+
+    #[cfg(feature = "dev-secrets")]
+    {
+        assert_eq!(memory.availability, SecretBackendAvailability::Available);
+        assert!(config.validate(backend_capabilities()).is_ok());
+    }
+    #[cfg(not(feature = "dev-secrets"))]
+    {
+        assert_eq!(
+            memory.availability,
+            SecretBackendAvailability::MissingFeature {
+                feature: "dev-secrets"
+            }
+        );
+        assert!(matches!(
+            config.validate(backend_capabilities()),
+            Err(ConfigValidationError::SecretBackend(
+                SecretBackendConfigurationError::MissingFeature {
+                    kind: "memory",
+                    feature: "dev-secrets",
+                    ..
+                }
+            ))
+        ));
+    }
 }
 
 #[test]
@@ -316,6 +360,7 @@ async fn local_file_read_only_rejection_is_audited() {
 }
 
 #[tokio::test]
+#[cfg(feature = "dev-secrets")]
 async fn memory_backend_maps_faults_and_preserves_uncertain_write() {
     let backend = MemorySecretBackend::new(backend_id("memory"));
     let ctx = context(CONNECTION_A, "provider.api_key", "request-a");
@@ -369,6 +414,7 @@ async fn memory_backend_maps_faults_and_preserves_uncertain_write() {
 }
 
 #[test]
+#[cfg(feature = "dev-secrets")]
 fn duplicate_secret_references_are_rejected_across_bindings() {
     let connections = vec![
         connection(
@@ -396,6 +442,7 @@ fn duplicate_secret_references_are_rejected_across_bindings() {
 }
 
 #[tokio::test]
+#[cfg(feature = "dev-secrets")]
 async fn duplicate_reference_introduced_later_cannot_delete_shared_secret() {
     let initial = vec![
         connection(
@@ -458,6 +505,7 @@ async fn duplicate_reference_introduced_later_cannot_delete_shared_secret() {
 }
 
 #[test]
+#[cfg(feature = "dev-secrets")]
 fn backend_registry_rejects_mismatched_keys_and_duplicate_descriptor_ids() {
     let connections = [connection(CONNECTION_A, "connection-a", Vec::new())];
     let actual = Arc::new(MemorySecretBackend::new(backend_id("actual")));
@@ -488,6 +536,7 @@ fn backend_registry_rejects_mismatched_keys_and_duplicate_descriptor_ids() {
 }
 
 #[test]
+#[cfg(feature = "dev-secrets")]
 fn backend_registry_rejects_mismatched_resolver_and_administrator_ids() {
     let connections = [connection(CONNECTION_A, "connection-a", Vec::new())];
     let resolver = Arc::new(MemorySecretBackend::new(backend_id("resolver")));
@@ -511,6 +560,7 @@ fn backend_registry_rejects_mismatched_resolver_and_administrator_ids() {
 }
 
 #[tokio::test]
+#[cfg(feature = "dev-secrets")]
 async fn read_only_put_rejection_is_audited() {
     let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
     let connections = [connection(
@@ -558,6 +608,7 @@ async fn read_only_put_rejection_is_audited() {
 }
 
 #[tokio::test]
+#[cfg(feature = "dev-secrets")]
 async fn read_only_delete_rejection_is_audited() {
     let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
     let connections = [connection(
@@ -603,6 +654,7 @@ async fn read_only_delete_rejection_is_audited() {
 }
 
 #[tokio::test]
+#[cfg(feature = "dev-secrets")]
 async fn broker_maps_required_failures_and_uncertain_write_reconciliation() {
     let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
     let connections = vec![connection(
@@ -892,6 +944,7 @@ async fn disabled_and_invalid_scopes_fail_before_backend_access() {
 }
 
 #[tokio::test]
+#[cfg(feature = "dev-secrets")]
 async fn pre_cancelled_put_never_mutates_an_immediately_completing_backend() {
     let backend = Arc::new(MemorySecretBackend::new(backend_id("memory")));
     let connections = vec![connection(
@@ -1393,6 +1446,7 @@ async fn pre_dispatch_mutation_cancellation_is_certain_and_does_not_call_backend
 }
 
 #[tokio::test]
+#[cfg(feature = "dev-secrets")]
 async fn connection_and_slot_namespaces_support_lifecycle_and_restart() {
     let connections = vec![
         connection(

@@ -1,8 +1,9 @@
-//! Secret contracts, an isolated memory backend, and credential brokering.
+//! Secret contracts, feature-gated development backends, and credential brokering.
 
 mod broker;
 #[cfg(feature = "dev-secrets")]
 mod local_file;
+#[cfg(feature = "dev-secrets")]
 mod memory;
 
 use std::{error::Error, fmt, sync::Arc};
@@ -25,6 +26,7 @@ pub use broker::{
 };
 #[cfg(feature = "dev-secrets")]
 pub use local_file::LocalFileBackend;
+#[cfg(feature = "dev-secrets")]
 pub use memory::{MemorySecretBackend, MemorySecretFault};
 
 pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
@@ -36,7 +38,12 @@ const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
 ];
 #[cfg(not(feature = "dev-secrets"))]
 const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
-    SecretBackendCapability::available("memory"),
+    SecretBackendCapability {
+        kind: "memory",
+        availability: SecretBackendAvailability::MissingFeature {
+            feature: "dev-secrets",
+        },
+    },
     SecretBackendCapability {
         kind: LOCAL_FILE_BACKEND_KIND,
         availability: SecretBackendAvailability::MissingFeature {

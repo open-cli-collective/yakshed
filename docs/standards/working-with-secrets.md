@@ -535,11 +535,17 @@ The UI must report that the credential is process-scoped and non-persistent.
 
 A deterministic in-memory backend for unit, integration, and contract tests.
 
+- compiled only with the non-default `dev-secrets` Cargo feature;
 - no persistence;
 - safe parallel test isolation;
 - programmable error responses;
 - never auto-selected;
-- refused in ordinary release configuration unless a dedicated development feature is enabled.
+- refused in ordinary release configuration with the typed `MissingFeature` error.
+
+| Development backend | Default build | `dev-secrets` build |
+|---|---|---|
+| `memory` | `MissingFeature` | available on every platform |
+| `local-file` | `MissingFeature` | available on macOS/Linux; `UnsupportedPlatform` elsewhere |
 
 The `keyring-core` mock store can help test the native-keyring adapter, but YakShed should also provide its own memory backend
 so the broker contract and application composition do not depend on keyring implementation details.
