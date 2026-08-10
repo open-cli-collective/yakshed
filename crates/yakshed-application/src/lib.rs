@@ -17,7 +17,10 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn validate(&self, supported_backend_kinds: &[&str]) -> Result<(), ConfigValidationError> {
+    pub fn validate(
+        &self,
+        backend_capabilities: &[SecretBackendCapability],
+    ) -> Result<(), ConfigValidationError> {
         if self.ui.theme.trim().is_empty() {
             return Err(ConfigValidationError::invalid("ui.theme cannot be empty"));
         }
@@ -28,7 +31,7 @@ impl AppConfig {
             backend
                 .validate()
                 .map_err(|error| ConfigValidationError::invalid(error.to_string()))?;
-            validate_backend_configuration(backend, supported_backend_kinds)?;
+            validate_backend_configuration(backend, backend_capabilities)?;
             if let SecretBackendSettings::LocalFile { path } = &backend.settings
                 && !local_file_paths.insert(path)
             {
@@ -162,6 +165,15 @@ pub enum SecretBackendConfigurationError {
         backend: SecretBackendId,
         kind: &'static str,
     },
+    MissingFeature {
+        backend: SecretBackendId,
+        kind: &'static str,
+        feature: &'static str,
+    },
+    UnsupportedPlatform {
+        backend: SecretBackendId,
+        kind: &'static str,
+    },
     WrongKind {
         backend: SecretBackendId,
     },
@@ -182,6 +194,18 @@ impl fmt::Display for SecretBackendConfigurationError {
                     "secret backend {backend} uses unsupported kind {kind}"
                 )
             }
+            Self::MissingFeature {
+                backend,
+                kind,
+                feature,
+            } => write!(
+                formatter,
+                "secret backend {backend} kind {kind} requires Cargo feature {feature}"
+            ),
+            Self::UnsupportedPlatform { backend, kind } => write!(
+                formatter,
+                "secret backend {backend} kind {kind} is unsupported on this platform"
+            ),
             Self::WrongKind { backend } => {
                 write!(formatter, "secret backend {backend} is not local-file")
             }
@@ -201,9 +225,31 @@ impl fmt::Display for SecretBackendConfigurationError {
 
 impl Error for SecretBackendConfigurationError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecretBackendCapability {
+    pub kind: &'static str,
+    pub availability: SecretBackendAvailability,
+}
+
+impl SecretBackendCapability {
+    pub const fn available(kind: &'static str) -> Self {
+        Self {
+            kind,
+            availability: SecretBackendAvailability::Available,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretBackendAvailability {
+    Available,
+    MissingFeature { feature: &'static str },
+    UnsupportedPlatform,
+}
+
 pub fn validate_backend_configuration(
     backend: &SecretBackend,
-    supported_backend_kinds: &[&str],
+    backend_capabilities: &[SecretBackendCapability],
 ) -> Result<(), SecretBackendConfigurationError> {
     if let SecretBackendSettings::LocalFile { path } = &backend.settings
         && !Path::new(path).is_absolute()
@@ -213,13 +259,31 @@ pub fn validate_backend_configuration(
         });
     }
     let kind = backend.kind();
-    if !supported_backend_kinds.contains(&kind) {
+    let Some(capability) = backend_capabilities
+        .iter()
+        .find(|capability| capability.kind == kind)
+    else {
         return Err(SecretBackendConfigurationError::UnsupportedKind {
             backend: backend.id.clone(),
             kind,
         });
+    };
+    match capability.availability {
+        SecretBackendAvailability::Available => Ok(()),
+        SecretBackendAvailability::MissingFeature { feature } => {
+            Err(SecretBackendConfigurationError::MissingFeature {
+                backend: backend.id.clone(),
+                kind,
+                feature,
+            })
+        }
+        SecretBackendAvailability::UnsupportedPlatform => {
+            Err(SecretBackendConfigurationError::UnsupportedPlatform {
+                backend: backend.id.clone(),
+                kind,
+            })
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]

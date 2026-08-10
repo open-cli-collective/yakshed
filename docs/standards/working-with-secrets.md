@@ -576,11 +576,13 @@ path = "/Users/example/.local/share/yakshed/dev-secrets.json"
 - configured with an absolute path so behavior never depends on the process working directory;
 - allowed only for deliberate development builds and never auto-selected or used as a fallback;
 - refused with a typed configuration error naming the missing feature when ordinary builds reference it;
+- refused with a distinct typed unsupported-platform error when the feature is compiled on non-Unix targets;
 - stores plaintext secrets in a private local file and is not suitable for release configuration.
 
 Backend instances targeting the same canonical file share a process-global lock and an exclusive Unix `flock`, held for
 each complete read or read-modify-write operation. Dropping a queued mutation prevents it from starting; dropping one after
-its write begins leaves an uncertain outcome that callers must reconcile before retrying.
+its write begins leaves an uncertain outcome that callers must reconcile before retrying. Reads wait for a contended flock;
+mutations poll the flock non-blockingly so abandonment cancels the wait promptly.
 
 Removing or resetting a backend's config intentionally retains its plaintext file. Re-adding the same backend ID and path
 restores access to those values; manually delete the file to purge them.

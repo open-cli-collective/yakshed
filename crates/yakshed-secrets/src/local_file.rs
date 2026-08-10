@@ -3,7 +3,8 @@
 //! Backends targeting the same canonical path share a process-global mutex and an exclusive Unix
 //! `flock` for each operation. Config removal retains the file; delete it manually to purge.
 //! Dropped mutations are suppressed before writing starts. A drop after writing starts has an
-//! uncertain outcome and must be reconciled before retrying.
+//! uncertain outcome and must be reconciled before retrying. Reads wait for a contended file lock;
+//! abandoned mutations stop waiting promptly.
 
 #[cfg(unix)]
 use std::{
@@ -29,9 +30,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
 use crate::{
-    DeleteSecretOutcome, LOCAL_FILE_BACKEND_KIND, LocalFileSecurityProblem, PutSecretOptions,
-    PutSecretOutcome, ResolvedSecret, ResolvedSecretSource, SecretAccessContext,
-    SecretAdministrator, SecretBackendDescriptor, SecretBackendStatus, SecretError, SecretLocator,
+    DeleteSecretOutcome, LOCAL_FILE_BACKEND_KIND, PutSecretOptions, PutSecretOutcome,
+    ResolvedSecret, ResolvedSecretSource, SecretAccessContext, SecretAdministrator,
+    SecretBackendDescriptor, SecretBackendStatus, SecretError, SecretLocator,
     SecretReferenceSummary, SecretResolver,
 };
 use crate::{
@@ -64,6 +65,15 @@ struct InitializedLocalFile {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalFileSecurityProblem {
+    StoreNotRegular,
+    StorePermissions,
+    ParentNotDirectory,
+    ParentWritable,
+}
+
+#[cfg(unix)]
 #[derive(Deserialize, Serialize)]
 struct LocalFileStore {
     format_version: u32,
@@ -78,7 +88,7 @@ impl LocalFileBackend {
                 backend: config.id.clone(),
             });
         };
-        validate_backend_configuration(config, crate::supported_backend_kinds())?;
+        validate_backend_configuration(config, crate::backend_capabilities())?;
         #[cfg(not(unix))]
         let _ = path;
 
@@ -182,8 +192,9 @@ impl LocalFileState {
         if let Some(initialized) = initialized.as_ref() {
             return Ok(Arc::clone(initialized));
         }
-        let path = canonical_store_path(&self.configured_path)
-            .map_err(|_| backend_failure(&self.id, "failed to initialize local secret store"))?;
+        let path = canonical_store_path(&self.configured_path).map_err(|error| {
+            map_io_error(&self.id, "failed to initialize local secret store", error)
+        })?;
         let value = Arc::new(InitializedLocalFile {
             lock: shared_file_lock(&path),
             path,
@@ -212,8 +223,7 @@ impl LocalFileState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_parent(&initialized.path, &self.id)?;
-        let _file_guard = lock_exclusive(&lock_path(&initialized.path))
-            .map_err(|_| backend_failure(&self.id, "failed to lock local secret store"))?;
+        let _file_guard = lock_exclusive(&lock_path(&initialized.path), &self.id, abandoned)?;
         validate_parent(&initialized.path, &self.id)?;
         validate_store_if_present(&initialized.path, &self.id)?;
         if abandoned.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -377,7 +387,11 @@ fn lock_path(path: &Path) -> PathBuf {
 struct FlockGuard(File);
 
 #[cfg(unix)]
-fn lock_exclusive(path: &Path) -> io::Result<FlockGuard> {
+fn lock_exclusive(
+    path: &Path,
+    backend: &SecretBackendId,
+    abandoned: Option<&AtomicBool>,
+) -> Result<FlockGuard, SecretError> {
     use std::{os::fd::AsRawFd, os::unix::fs::OpenOptionsExt};
 
     let file = fs::OpenOptions::new()
@@ -387,15 +401,29 @@ fn lock_exclusive(path: &Path) -> io::Result<FlockGuard> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .map_err(|error| map_io_error(backend, "failed to open local secret store lock", error))?;
     loop {
+        if abandoned.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(SecretError::Cancelled {
+                backend: backend.clone(),
+            });
+        }
         // SAFETY: `file` owns a valid descriptor for the lifetime of the returned guard.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(FlockGuard(file));
         }
         let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        match error.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => {
+                return Err(map_io_error(
+                    backend,
+                    "failed to lock local secret store",
+                    error,
+                ));
+            }
         }
     }
 }
@@ -419,8 +447,13 @@ fn validate_parent(path: &Path, backend: &SecretBackendId) -> Result<(), SecretE
     let parent = path
         .parent()
         .ok_or_else(|| insecure(backend, LocalFileSecurityProblem::ParentNotDirectory))?;
-    let metadata = fs::metadata(parent)
-        .map_err(|_| backend_failure(backend, "failed to inspect local secret store parent"))?;
+    let metadata = fs::metadata(parent).map_err(|error| {
+        map_io_error(
+            backend,
+            "failed to inspect local secret store parent",
+            error,
+        )
+    })?;
     if !metadata.is_dir() {
         return Err(insecure(
             backend,
@@ -440,10 +473,11 @@ fn validate_store_if_present(path: &Path, backend: &SecretBackendId) -> Result<(
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {
-            return Err(backend_failure(
+        Err(error) => {
+            return Err(map_io_error(
                 backend,
                 "failed to inspect local secret store",
+                error,
             ));
         }
     };
@@ -461,9 +495,23 @@ fn validate_store_if_present(path: &Path, backend: &SecretBackendId) -> Result<(
 
 #[cfg(unix)]
 fn insecure(backend: &SecretBackendId, problem: LocalFileSecurityProblem) -> SecretError {
-    SecretError::InsecureLocalFile {
+    let remediation = match problem {
+        LocalFileSecurityProblem::StoreNotRegular => {
+            "replace the local secret store with a private regular file"
+        }
+        LocalFileSecurityProblem::StorePermissions => {
+            "remove group and other permissions from the local secret store"
+        }
+        LocalFileSecurityProblem::ParentNotDirectory => {
+            "use a private directory for the local secret store"
+        }
+        LocalFileSecurityProblem::ParentWritable => {
+            "remove group and other write permissions from the local secret store directory"
+        }
+    };
+    SecretError::LockedOrDenied {
         backend: backend.clone(),
-        problem,
+        remediation: Some(remediation.to_owned()),
     }
 }
 
@@ -492,9 +540,10 @@ fn claim_or_validate_with_hook(
             write_store_with_hooks(path, &store, before_commit, sync_directory)
                 .map_err(|error| map_write_error(backend, error))
         }
-        Err(_) => Err(backend_failure(
+        Err(error) => Err(map_io_error(
             backend,
             "failed to inspect local secret store",
+            error,
         )),
     }
 }
@@ -503,10 +552,11 @@ fn claim_or_validate_with_hook(
 fn read_store(path: &Path, backend: &SecretBackendId) -> Result<LocalFileStore, SecretError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(_) => {
-            return Err(backend_failure(
+        Err(error) => {
+            return Err(map_io_error(
                 backend,
                 "failed to read local secret store",
+                error,
             ));
         }
     };
@@ -567,6 +617,18 @@ fn backend_failure(backend: &SecretBackendId, message: &'static str) -> SecretEr
     SecretError::BackendFailure {
         backend: backend.clone(),
         redacted_message: message.to_owned(),
+    }
+}
+
+#[cfg(unix)]
+fn map_io_error(backend: &SecretBackendId, message: &'static str, error: io::Error) -> SecretError {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        SecretError::LockedOrDenied {
+            backend: backend.clone(),
+            remediation: Some("check local secret store ownership and permissions".to_owned()),
+        }
+    } else {
+        backend_failure(backend, message)
     }
 }
 
@@ -820,10 +882,11 @@ mod tests {
 
         let temp = tempdir().unwrap();
         let path = temp.path().join("store.lock");
-        let first = lock_exclusive(&path).unwrap();
+        let backend = SecretBackendId::new("dev-local").unwrap();
+        let first = lock_exclusive(&path, &backend, None).unwrap();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let contender = std::thread::spawn(move || {
-            let _second = lock_exclusive(&path).unwrap();
+            let _second = lock_exclusive(&path, &backend, None).unwrap();
             acquired_tx.send(()).unwrap();
         });
 
@@ -847,10 +910,7 @@ mod tests {
 
         assert!(matches!(
             backend.probe().await,
-            Err(SecretError::InsecureLocalFile {
-                problem: LocalFileSecurityProblem::StorePermissions,
-                ..
-            })
+            Err(SecretError::LockedOrDenied { .. })
         ));
     }
 
@@ -868,10 +928,7 @@ mod tests {
 
         assert!(matches!(
             backend.probe().await,
-            Err(SecretError::InsecureLocalFile {
-                problem: LocalFileSecurityProblem::StoreNotRegular,
-                ..
-            })
+            Err(SecretError::LockedOrDenied { .. })
         ));
     }
 
@@ -889,11 +946,34 @@ mod tests {
 
         assert!(matches!(
             backend.probe().await,
-            Err(SecretError::InsecureLocalFile {
-                problem: LocalFileSecurityProblem::ParentWritable,
-                ..
-            })
+            Err(SecretError::LockedOrDenied { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn permission_denied_read_maps_to_locked_or_denied_without_leaking_values() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("store/secrets.json");
+        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+        let locator = SecretLocator::new("mode-zero").unwrap();
+        backend
+            .put(
+                &locator,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+            )
+            .await
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let Err(error) = backend.resolve(&locator, &context()).await else {
+            panic!("mode-000 store must be rejected")
+        };
+        assert!(matches!(error, SecretError::LockedOrDenied { .. }));
+        assert!(!format!("{error}").contains(CANARY));
+        assert!(!format!("{error:?}").contains(CANARY));
     }
 
     #[tokio::test]
@@ -944,7 +1024,8 @@ mod tests {
         .unwrap();
         let initialized = backend.state.initialized().unwrap();
         let _process_guard = initialized.lock.lock().unwrap();
-        let file_guard = lock_exclusive(&lock_path(&initialized.path)).unwrap();
+        let file_guard =
+            lock_exclusive(&lock_path(&initialized.path), &backend.state.id, None).unwrap();
 
         assert!(matches!(
             claim_or_validate_with_hook(&initialized.path, &backend.state.id, || Err(
@@ -1036,6 +1117,80 @@ mod tests {
                     Err(SecretError::NotFound { .. })
                 ));
             });
+    }
+
+    #[test]
+    fn abandonment_returns_cancelled_while_flock_remains_contended() {
+        use std::{sync::mpsc, time::Duration};
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("store.lock");
+        let backend = SecretBackendId::new("dev-local").unwrap();
+        let held = lock_exclusive(&path, &backend, None).unwrap();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let worker_abandoned = Arc::clone(&abandoned);
+        let (result_tx, result_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            result_tx
+                .send(lock_exclusive(&path, &backend, Some(&worker_abandoned)))
+                .unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        abandoned.store(true, Ordering::Release);
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(250)).unwrap(),
+            Err(SecretError::Cancelled { .. })
+        ));
+        drop(held);
+        contender.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_mutation_stops_waiting_for_flock_and_store_remains_operational() {
+        use std::time::Duration;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("store/secrets.json");
+        let backend = LocalFileBackend::from_config(&config("dev-local", &path)).unwrap();
+        backend.probe().await.unwrap();
+        let initialized = backend.state.initialized().unwrap();
+        let held = lock_exclusive(&lock_path(&path), &backend.state.id, None).unwrap();
+        let locator = SecretLocator::new("contended").unwrap();
+        let value = SecretString::from(CANARY.to_owned());
+        let mut mutation = Box::pin(backend.put(&locator, &value, PutSecretOptions::NO_OVERWRITE));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut mutation)
+                .await
+                .is_err()
+        );
+        assert!(initialized.lock.try_lock().is_err());
+        drop(mutation);
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if initialized.lock.try_lock().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("abandoned mutation must stop before the flock is released");
+        drop(held);
+
+        assert!(matches!(
+            backend.resolve(&locator, &context()).await,
+            Err(SecretError::NotFound { .. })
+        ));
+        backend
+            .put(
+                &locator,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

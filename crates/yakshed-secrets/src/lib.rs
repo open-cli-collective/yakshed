@@ -10,7 +10,10 @@ use std::{error::Error, fmt, sync::Arc};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use time::OffsetDateTime;
-pub use yakshed_application::{SecretBackendConfigurationError, validate_backend_configuration};
+pub use yakshed_application::{
+    SecretBackendAvailability, SecretBackendCapability, SecretBackendConfigurationError,
+    validate_backend_configuration,
+};
 pub use yakshed_domain::{
     ConnectionId, CredentialSlot, OperationId, SecretBackend, SecretBackendId,
     SecretBackendSettings, SecretLocator, SecretReference,
@@ -26,11 +29,32 @@ pub use memory::{MemorySecretBackend, MemorySecretFault};
 
 pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
 
-pub const fn supported_backend_kinds() -> &'static [&'static str] {
-    #[cfg(all(feature = "dev-secrets", unix))]
-    return &["memory", LOCAL_FILE_BACKEND_KIND];
-    #[cfg(not(all(feature = "dev-secrets", unix)))]
-    &["memory"]
+#[cfg(all(feature = "dev-secrets", unix))]
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+    SecretBackendCapability::available("memory"),
+    SecretBackendCapability::available(LOCAL_FILE_BACKEND_KIND),
+];
+#[cfg(not(feature = "dev-secrets"))]
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+    SecretBackendCapability::available("memory"),
+    SecretBackendCapability {
+        kind: LOCAL_FILE_BACKEND_KIND,
+        availability: SecretBackendAvailability::MissingFeature {
+            feature: "dev-secrets",
+        },
+    },
+];
+#[cfg(all(feature = "dev-secrets", not(unix)))]
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+    SecretBackendCapability::available("memory"),
+    SecretBackendCapability {
+        kind: LOCAL_FILE_BACKEND_KIND,
+        availability: SecretBackendAvailability::UnsupportedPlatform,
+    },
+];
+
+pub const fn backend_capabilities() -> &'static [SecretBackendCapability] {
+    &BACKEND_CAPABILITIES
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,14 +240,6 @@ pub enum InvalidBindingReason {
     NotSecretBacked,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LocalFileSecurityProblem {
-    StoreNotRegular,
-    StorePermissions,
-    ParentNotDirectory,
-    ParentWritable,
-}
-
 pub enum SecretError {
     NotFound {
         reference: SecretReferenceSummary,
@@ -271,10 +287,6 @@ pub enum SecretError {
     BackendIdentityMismatch {
         backend: SecretBackendId,
         file_backend: SecretBackendId,
-    },
-    InsecureLocalFile {
-        backend: SecretBackendId,
-        problem: LocalFileSecurityProblem,
     },
     InvalidBinding {
         connection_id: ConnectionId,
@@ -341,10 +353,6 @@ impl fmt::Display for SecretError {
                     "secret backend file identity mismatch: {backend}"
                 )
             }
-            Self::InsecureLocalFile { backend, problem } => write!(
-                formatter,
-                "insecure local secret store ({problem:?}): {backend}"
-            ),
             Self::InvalidBinding {
                 connection_id,
                 slot,

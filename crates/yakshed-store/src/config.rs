@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yakshed_application::{
     AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, ConfigValidationError,
-    SecretBackendConfigurationError, UiConfig,
+    SecretBackendCapability, SecretBackendConfigurationError, UiConfig,
 };
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
@@ -244,7 +244,7 @@ pub struct ConfigStore {
 
 struct StoreInner {
     config_path: PathBuf,
-    supported_backend_kinds: &'static [&'static str],
+    backend_capabilities: &'static [SecretBackendCapability],
     state: RwLock<ConfigSnapshot>,
     updates: Mutex<()>,
     #[cfg(test)]
@@ -255,12 +255,12 @@ impl ConfigStore {
     /// Opens or creates the schema-v1 config beneath the injected config root.
     pub fn open(
         paths: AppPaths,
-        supported_backend_kinds: &'static [&'static str],
+        backend_capabilities: &'static [SecretBackendCapability],
     ) -> Result<Self, ConfigError> {
         paths.create_config_root()?;
         let config_path = paths.config_root.join(CONFIG_FILE);
         let config = if config_path.exists() {
-            read_config(&config_path, supported_backend_kinds)?
+            read_config(&config_path, backend_capabilities)?
         } else {
             let config = AppConfig::default();
             write_config(&config_path, &config)?;
@@ -270,7 +270,7 @@ impl ConfigStore {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 config_path,
-                supported_backend_kinds,
+                backend_capabilities,
                 state: RwLock::new(ConfigSnapshot {
                     revision: ConfigRevision::INITIAL,
                     config,
@@ -328,7 +328,7 @@ impl StoreInner {
 
         let mut config = current.config;
         apply_change(&mut config, change);
-        validate_config(&config, self.supported_backend_kinds)?;
+        validate_config(&config, self.backend_capabilities)?;
         let revision = current
             .revision
             .get()
@@ -382,7 +382,10 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
     }
 }
 
-fn read_config(path: &Path, supported_backend_kinds: &[&str]) -> Result<AppConfig, ConfigError> {
+fn read_config(
+    path: &Path,
+    backend_capabilities: &[SecretBackendCapability],
+) -> Result<AppConfig, ConfigError> {
     let source = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_owned(),
         source,
@@ -391,15 +394,15 @@ fn read_config(path: &Path, supported_backend_kinds: &[&str]) -> Result<AppConfi
     let value = migrate(value)?;
     let config = AppConfig::try_from(value.try_into::<ConfigDto>().map_err(ConfigError::Parse)?)
         .map_err(|error| ConfigError::Validation(error.to_string()))?;
-    validate_config(&config, supported_backend_kinds)?;
+    validate_config(&config, backend_capabilities)?;
     Ok(config)
 }
 
 fn validate_config(
     config: &AppConfig,
-    supported_backend_kinds: &[&str],
+    backend_capabilities: &[SecretBackendCapability],
 ) -> Result<(), ConfigError> {
-    match config.validate(supported_backend_kinds) {
+    match config.validate(backend_capabilities) {
         Ok(()) => Ok(()),
         Err(ConfigValidationError::SecretBackend(error)) => {
             Err(ConfigError::SecretBackendConfiguration(error))

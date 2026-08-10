@@ -20,10 +20,11 @@ use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, CredentialResolution, CredentialStatus,
     DeleteSecretOutcome, InvalidBindingReason, MemorySecretBackend, MemorySecretFault,
     PutSecretOptions, PutSecretOutcome, ResolvedSecret, SecretAccessContext, SecretAccessPurpose,
-    SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackend, SecretBackendDescriptor,
+    SecretAdministrator, SecretAuditEvent, SecretAuditSink, SecretBackend,
+    SecretBackendAvailability, SecretBackendCapability, SecretBackendDescriptor,
     SecretBackendHandle, SecretBackendId, SecretBackendSettings, SecretBackendStatus, SecretError,
-    SecretLocator, SecretOperation, SecretReference, SecretResolver, shape_process_environment,
-    supported_backend_kinds,
+    SecretLocator, SecretOperation, SecretReference, SecretResolver, backend_capabilities,
+    shape_process_environment,
 };
 
 #[cfg(all(feature = "dev-secrets", unix))]
@@ -115,7 +116,8 @@ fn domain_reference_values_reject_unsafe_input() {
 }
 
 #[test]
-fn validation_rejects_backend_kind_absent_from_capabilities() {
+#[cfg(not(feature = "dev-secrets"))]
+fn validation_distinguishes_missing_feature_from_unknown_kind() {
     let config = AppConfig {
         secret_backends: vec![SecretBackend {
             id: backend_id("dev-local"),
@@ -127,7 +129,18 @@ fn validation_rejects_backend_kind_absent_from_capabilities() {
     };
 
     assert!(matches!(
-        config.validate(&["memory"]),
+        config.validate(backend_capabilities()),
+        Err(ConfigValidationError::SecretBackend(
+            SecretBackendConfigurationError::MissingFeature {
+                kind: "local-file",
+                feature: "dev-secrets",
+                ..
+            }
+        ))
+    ));
+
+    assert!(matches!(
+        config.validate(&[SecretBackendCapability::available("memory")]),
         Err(ConfigValidationError::SecretBackend(
             SecretBackendConfigurationError::UnsupportedKind {
                 kind: "local-file",
@@ -150,7 +163,7 @@ fn relative_local_file_path_is_rejected_by_validation() {
     };
 
     assert!(matches!(
-        config.validate(&["local-file"]),
+        config.validate(&[SecretBackendCapability::available("local-file")]),
         Err(ConfigValidationError::SecretBackend(
             SecretBackendConfigurationError::AbsolutePathRequired { .. }
         ))
@@ -158,11 +171,54 @@ fn relative_local_file_path_is_rejected_by_validation() {
 }
 
 #[test]
-fn build_capabilities_report_local_file_exactly_when_available() {
+fn build_capabilities_report_local_file_status() {
+    let local_file = backend_capabilities()
+        .iter()
+        .find(|capability| capability.kind == "local-file")
+        .unwrap();
     #[cfg(all(feature = "dev-secrets", unix))]
-    assert_eq!(supported_backend_kinds(), &["memory", "local-file"]);
-    #[cfg(not(all(feature = "dev-secrets", unix)))]
-    assert_eq!(supported_backend_kinds(), &["memory"]);
+    assert_eq!(
+        local_file.availability,
+        SecretBackendAvailability::Available
+    );
+    #[cfg(not(feature = "dev-secrets"))]
+    assert_eq!(
+        local_file.availability,
+        SecretBackendAvailability::MissingFeature {
+            feature: "dev-secrets"
+        }
+    );
+    #[cfg(all(feature = "dev-secrets", not(unix)))]
+    assert_eq!(
+        local_file.availability,
+        SecretBackendAvailability::UnsupportedPlatform
+    );
+}
+
+#[test]
+fn validation_reports_compiled_but_unsupported_platform() {
+    let config = AppConfig {
+        secret_backends: vec![SecretBackend {
+            id: backend_id("dev-local"),
+            settings: SecretBackendSettings::LocalFile {
+                path: "/tmp/yakshed-dev-secrets.json".to_owned(),
+            },
+        }],
+        ..AppConfig::default()
+    };
+
+    assert!(matches!(
+        config.validate(&[SecretBackendCapability {
+            kind: "local-file",
+            availability: SecretBackendAvailability::UnsupportedPlatform,
+        }]),
+        Err(ConfigValidationError::SecretBackend(
+            SecretBackendConfigurationError::UnsupportedPlatform {
+                kind: "local-file",
+                ..
+            }
+        ))
+    ));
 }
 
 #[cfg(all(feature = "dev-secrets", unix))]
@@ -178,7 +234,7 @@ fn real_build_capabilities_accept_local_file_config() {
         ..AppConfig::default()
     };
 
-    assert!(config.validate(supported_backend_kinds()).is_ok());
+    assert!(config.validate(backend_capabilities()).is_ok());
 }
 
 #[cfg(all(feature = "dev-secrets", unix))]

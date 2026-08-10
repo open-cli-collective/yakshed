@@ -2,7 +2,8 @@ use std::fs;
 
 use tempfile::tempdir;
 use yakshed_application::{
-    AppConfig, ConfigChange, ConfigRevision, SecretBackendConfigurationError,
+    AppConfig, ConfigChange, ConfigRevision, SecretBackendAvailability, SecretBackendCapability,
+    SecretBackendConfigurationError,
 };
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
@@ -11,7 +12,20 @@ use yakshed_domain::{
 };
 use yakshed_store::{AppPaths, ConfigError, ConfigStore};
 
-const SUPPORTED_BACKEND_KINDS: &[&str] = &["memory", "local-os", "onepassword-cli", "environment"];
+const BACKEND_CAPABILITIES: &[SecretBackendCapability] = &[
+    SecretBackendCapability::available("memory"),
+    SecretBackendCapability::available("local-os"),
+    SecretBackendCapability::available("onepassword-cli"),
+    SecretBackendCapability::available("environment"),
+    SecretBackendCapability {
+        kind: "local-file",
+        availability: SecretBackendAvailability::MissingFeature {
+            feature: "dev-secrets",
+        },
+    },
+];
+const LOCAL_FILE_CAPABILITIES: &[SecretBackendCapability] =
+    &[SecretBackendCapability::available("local-file")];
 
 const LOCAL_FILE_CONFIG: &[u8] = br#"schema_version = 1
 
@@ -22,7 +36,7 @@ path = "/tmp/yakshed-dev-secrets.json"
 "#;
 
 fn open(paths: AppPaths) -> Result<ConfigStore, ConfigError> {
-    ConfigStore::open(paths, SUPPORTED_BACKEND_KINDS)
+    ConfigStore::open(paths, BACKEND_CAPABILITIES)
 }
 
 fn connection() -> Connection {
@@ -72,7 +86,7 @@ async fn config_round_trips_through_disk() {
 }
 
 #[test]
-fn injected_capabilities_reject_persisted_local_file_config() {
+fn injected_capabilities_report_missing_feature_for_persisted_local_file_config() {
     let temp = tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
     paths.create_config_root().unwrap();
@@ -81,8 +95,9 @@ fn injected_capabilities_reject_persisted_local_file_config() {
     assert!(matches!(
         open(paths),
         Err(ConfigError::SecretBackendConfiguration(
-            SecretBackendConfigurationError::UnsupportedKind {
+            SecretBackendConfigurationError::MissingFeature {
                 kind: "local-file",
+                feature: "dev-secrets",
                 ..
             }
         ))
@@ -97,7 +112,7 @@ fn injected_capabilities_accept_persisted_local_file_config() {
     fs::write(paths.config_root.join("config.toml"), LOCAL_FILE_CONFIG).unwrap();
 
     assert_eq!(
-        ConfigStore::open(paths, &["local-file"])
+        ConfigStore::open(paths, LOCAL_FILE_CAPABILITIES)
             .unwrap()
             .snapshot()
             .config
@@ -134,7 +149,7 @@ path = "/tmp/shared-dev-secrets.json"
     .unwrap();
 
     assert!(matches!(
-        ConfigStore::open(paths, &["local-file"]),
+        ConfigStore::open(paths, LOCAL_FILE_CAPABILITIES),
         Err(ConfigError::SecretBackendConfiguration(
             yakshed_application::SecretBackendConfigurationError::DuplicateLocalFilePath { .. }
         ))
