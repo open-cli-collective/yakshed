@@ -557,6 +557,14 @@ impl MockHarness {
     }
 
     async fn process_run(&self, run_handle: &ProviderRunHandle) -> Result<(), HarnessError> {
+        self.drive_run(run_handle, false).await
+    }
+
+    async fn drive_run(
+        &self,
+        run_handle: &ProviderRunHandle,
+        release_delayed: bool,
+    ) -> Result<(), HarnessError> {
         loop {
             match self.flush_pending(run_handle).await? {
                 FlushResult::Terminal => return Ok(()),
@@ -580,6 +588,7 @@ impl MockHarness {
                 }
                 if run.fault == Some(MockHarnessFault::DelayApproval)
                     && matches!(run.steps.front(), Some(MockScriptStep::Approval { .. }))
+                    && !release_delayed
                 {
                     run.delayed = true;
                     return Ok(());
@@ -647,6 +656,8 @@ impl MockHarness {
                     )));
                 }
             }
+            let releasing_approval =
+                release_delayed && matches!(&step, MockScriptStep::Approval { .. });
             let pending = match step {
                 MockScriptStep::Message { chunk, native } => PendingDelivery {
                     event: HarnessEvent::MessageDelta {
@@ -795,6 +806,14 @@ impl MockHarness {
                     },
                 },
             };
+            if releasing_approval {
+                let run = state
+                    .runs
+                    .get_mut(run_handle)
+                    .expect("run exists while processing");
+                run.delayed = false;
+                run.fault = None;
+            }
             if self.commit_pending(&mut state, run_handle, pending, permit) == FlushResult::Terminal
             {
                 return Ok(());
@@ -804,17 +823,15 @@ impl MockHarness {
 
     pub async fn release_delayed_approval(&self) -> Result<(), HarnessError> {
         let run_id = {
-            let mut state = self.state.lock().await;
-            let (run_id, run) = state
+            let state = self.state.lock().await;
+            state
                 .runs
-                .iter_mut()
+                .iter()
                 .find(|(_, run)| run.delayed)
-                .ok_or_else(|| HarnessError::Conflict("no delayed approval".to_owned()))?;
-            run.delayed = false;
-            run.fault = None;
-            run_id.clone()
+                .map(|(run_id, _)| run_id.clone())
+                .ok_or_else(|| HarnessError::Conflict("no delayed approval".to_owned()))?
         };
-        self.process_run(&run_id).await
+        self.drive_run(&run_id, true).await
     }
 }
 
@@ -1502,6 +1519,67 @@ mod tests {
                 state: HarnessRunTerminal::Completed,
                 ..
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_delayed_approval_release_retries_exactly_once() {
+        let request_id = ProviderRequestId::new("delayed-request").unwrap();
+        let mock = configured_mock(vec![
+            MockRunPlan::new(vec![
+                MockScriptStep::approval(request_id, "approve"),
+                MockScriptStep::complete(),
+            ])
+            .with_fault(MockHarnessFault::DelayApproval),
+        ]);
+        let session = test_session(&mock).await;
+        let mut stream = mock.subscribe().unwrap();
+        let run = mock
+            .start_run(
+                &session,
+                HarnessInput::new("delay").unwrap(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        for index in 1..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            mock.steer(&run, HarnessInput::new(format!("fill-{index}")).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let reached_reserve = mock.probe_delivery(1);
+        let mut cancelled = Box::pin(mock.release_delayed_approval());
+        tokio::select! {
+            biased;
+            result = &mut cancelled => panic!("release completed before cancellation: {result:?}"),
+            result = reached_reserve => result.unwrap(),
+        }
+        drop(cancelled);
+        assert!(mock.state.lock().await.runs[&run].delayed);
+
+        let retry = mock.release_delayed_approval();
+        let drain = async {
+            let mut approvals = 0;
+            loop {
+                match stream.recv().await.unwrap() {
+                    HarnessEvent::ApprovalRequested { .. } => approvals += 1,
+                    HarnessEvent::RunTerminal {
+                        state: HarnessRunTerminal::Completed,
+                        ..
+                    } => break approvals,
+                    HarnessEvent::RunAccepted { .. } | HarnessEvent::MessageDelta { .. } => {}
+                    event => panic!("unexpected delayed-run event: {event:?}"),
+                }
+            }
+        };
+        let (release_result, approvals) = tokio::join!(retry, drain);
+        release_result.unwrap();
+        assert_eq!(approvals, 1);
+        assert_eq!(mock.state.lock().await.requests.len(), 1);
+        assert!(matches!(
+            mock.release_delayed_approval().await,
+            Err(HarnessError::Conflict(_))
         ));
     }
 
