@@ -249,6 +249,8 @@ pub struct MockHarness {
     steer_pause: Mutex<Option<SteerPause>>,
     #[cfg(test)]
     delivery_probe: Mutex<Option<DeliveryProbe>>,
+    #[cfg(test)]
+    acceptance_probe: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 #[cfg(test)]
@@ -292,6 +294,8 @@ impl MockHarness {
             steer_pause: Mutex::new(None),
             #[cfg(test)]
             delivery_probe: Mutex::new(None),
+            #[cfg(test)]
+            acceptance_probe: Mutex::new(None),
         }
     }
 
@@ -357,6 +361,28 @@ impl MockHarness {
         if current.remaining == 0 {
             let reached = probe.take().expect("delivery probe exists").reached;
             let _ = reached.send(());
+        }
+    }
+
+    #[cfg(test)]
+    fn probe_acceptance_reserve(&self) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        *self
+            .acceptance_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+        receiver
+    }
+
+    #[cfg(test)]
+    fn note_acceptance_reserve(&self) {
+        if let Some(sender) = self
+            .acceptance_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(());
         }
     }
 
@@ -830,6 +856,9 @@ impl HarnessAdapter for MockHarness {
         _options: RunOptions,
     ) -> Result<ProviderRunHandle, HarnessError> {
         self.check_runtime(&session.runtime).await?;
+        #[cfg(test)]
+        self.note_acceptance_reserve();
+        let acceptance = self.events.reserve().await?;
         let (run_id, fault) = {
             let mut state = self.state.lock().await;
             if !state
@@ -865,34 +894,9 @@ impl HarnessAdapter for MockHarness {
             let run_handle =
                 ProviderRunHandle::new(session.runtime.clone(), session.id.clone(), run_id);
             let fault = plan.fault;
-            state.runs.insert(
-                run_handle.clone(),
-                RunRecord {
-                    active: true,
-                    delayed: false,
-                    steps: plan.steps,
-                    fault,
-                    pending: None,
-                },
-            );
-            (run_handle, fault)
-        };
-        self.events
-            .send(HarnessEvent::RunAccepted {
-                run: run_id.clone(),
-                native: self.native(r#"{"type":"run.accepted"}"#),
-            })
-            .await?;
-        match fault {
-            Some(MockHarnessFault::ExitAfterRunAccepted) => {
-                self.state
-                    .lock()
-                    .await
-                    .runs
-                    .get_mut(&run_id)
-                    .expect("new run exists")
-                    .pending = Some(self.terminal_delivery(
-                    run_id.clone(),
+            let pending = match fault {
+                Some(MockHarnessFault::ExitAfterRunAccepted) => Some(self.terminal_delivery(
+                    run_handle.clone(),
                     HarnessRunTerminal::Crashed {
                         diagnostic: SanitizedDiagnostic::sanitized(
                             "mock runtime exited after accepting run",
@@ -900,43 +904,42 @@ impl HarnessAdapter for MockHarness {
                     },
                     r#"{"type":"runtime.exit"}"#,
                     false,
-                ));
-                self.process_run(&run_id).await?;
-            }
-            Some(MockHarnessFault::EmitUnknownEvent) => {
-                self.state
-                    .lock()
-                    .await
-                    .runs
-                    .get_mut(&run_id)
-                    .expect("new run exists")
-                    .pending = Some(PendingDelivery {
+                )),
+                Some(MockHarnessFault::EmitUnknownEvent) => Some(PendingDelivery {
                     event: HarnessEvent::Unknown {
-                        run: Some(run_id.clone()),
+                        run: Some(run_handle.clone()),
                         item_type: "mock.future-item".to_owned(),
                         native: self.native(r#"{"type":"mock.future-item","answer":42}"#),
                     },
                     commit: DeliveryCommit::Standalone,
-                });
-                self.process_run(&run_id).await?;
-            }
-            Some(MockHarnessFault::EmitMalformedNativePayload) => {
-                self.state
-                    .lock()
-                    .await
-                    .runs
-                    .get_mut(&run_id)
-                    .expect("new run exists")
-                    .pending = Some(PendingDelivery {
+                }),
+                Some(MockHarnessFault::EmitMalformedNativePayload) => Some(PendingDelivery {
                     event: HarnessEvent::MalformedNativePayload {
-                        run: Some(run_id.clone()),
+                        run: Some(run_handle.clone()),
                         item_type: "mock.malformed".to_owned(),
                         native: self.native("{not-json"),
                     },
                     commit: DeliveryCommit::Standalone,
-                });
-                self.process_run(&run_id).await?;
-            }
+                }),
+                _ => None,
+            };
+            state.runs.insert(
+                run_handle.clone(),
+                RunRecord {
+                    active: true,
+                    delayed: false,
+                    steps: plan.steps,
+                    fault,
+                    pending,
+                },
+            );
+            acceptance.send(HarnessEvent::RunAccepted {
+                run: run_handle.clone(),
+                native: self.native(r#"{"type":"run.accepted"}"#),
+            });
+            (run_handle, fault)
+        };
+        match fault {
             Some(MockHarnessFault::NeverComplete) => {}
             _ => self.process_run(&run_id).await?,
         }
@@ -1143,6 +1146,71 @@ mod tests {
                 .map(|index| format!("chunk-{index}"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_backpressured_acceptance_leaves_no_orphaned_run() {
+        let mock = configured_mock(vec![
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+            MockRunPlan::new(vec![MockScriptStep::complete()]),
+        ]);
+        let session = test_session(&mock).await;
+        let mut stream = mock.subscribe().unwrap();
+        let first_run = mock
+            .start_run(
+                &session,
+                HarnessInput::new("first").unwrap(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        for index in 1..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            mock.steer(
+                &first_run,
+                HarnessInput::new(format!("fill-{index}")).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let reached_reserve = mock.probe_acceptance_reserve();
+        let mut cancelled = Box::pin(mock.start_run(
+            &session,
+            HarnessInput::new("cancelled").unwrap(),
+            RunOptions::default(),
+        ));
+        tokio::select! {
+            biased;
+            result = &mut cancelled => panic!("acceptance completed before cancellation: {result:?}"),
+            result = reached_reserve => result.unwrap(),
+        }
+        drop(cancelled);
+        {
+            let state = mock.state.lock().await;
+            assert_eq!(state.runs.len(), 1);
+            assert_eq!(state.plans.len(), 1);
+        }
+        for _ in 0..yakshed_harness::EVENT_BUFFER_CAPACITY {
+            stream.recv().await.unwrap();
+        }
+
+        let new_run = mock
+            .start_run(
+                &session,
+                HarnessInput::new("retry").unwrap(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.recv().await,
+            Some(HarnessEvent::RunAccepted { run, .. }) if run == new_run
+        ));
+        assert!(matches!(
+            stream.recv().await,
+            Some(HarnessEvent::RunTerminal { run, .. }) if run == new_run
+        ));
+        assert_eq!(mock.state.lock().await.runs.len(), 2);
     }
 
     #[tokio::test]

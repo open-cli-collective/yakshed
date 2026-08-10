@@ -451,9 +451,26 @@ pub enum HarnessError {
 #[derive(Clone)]
 pub struct HarnessEventSender(mpsc::Sender<HarnessEvent>);
 
+pub struct HarnessEventPermit(mpsc::OwnedPermit<HarnessEvent>);
+
 impl HarnessEventSender {
     pub async fn send(&self, event: HarnessEvent) -> Result<(), HarnessError> {
         self.0.send(event).await.map_err(|_| HarnessError::Closed)
+    }
+
+    pub async fn reserve(&self) -> Result<HarnessEventPermit, HarnessError> {
+        self.0
+            .clone()
+            .reserve_owned()
+            .await
+            .map(HarnessEventPermit)
+            .map_err(|_| HarnessError::Closed)
+    }
+}
+
+impl HarnessEventPermit {
+    pub fn send(self, event: HarnessEvent) {
+        self.0.send(event);
     }
 }
 
