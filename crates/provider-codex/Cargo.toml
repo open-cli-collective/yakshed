@@ -5,5 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "process"] }
 yakshed-domain.workspace = true
 yakshed-harness.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

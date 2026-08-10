@@ -452,6 +452,8 @@ pub enum HarnessError {
     Overloaded,
     #[error("runtime is disconnected")]
     Disconnected,
+    #[error("outcome is unknown for mutating operation: {operation}")]
+    OutcomeUnknown { operation: &'static str },
     #[error("harness event stream is closed")]
     Closed,
     #[error("provider protocol failure: {diagnostic}")]

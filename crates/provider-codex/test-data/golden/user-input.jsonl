@@ -1,0 +1,2 @@
+{"id":"user-input-1","method":"item/tool/requestUserInput","params":{"threadId":"thread-golden","turnId":"turn-golden","itemId":"input-1","isBlocking":true,"questions":[{"id":"color","header":"Color","question":"favorite color?"}]}}
+{"id":"user-input-1","result":{"answers":{"color":{"answers":["blue"]}}}}

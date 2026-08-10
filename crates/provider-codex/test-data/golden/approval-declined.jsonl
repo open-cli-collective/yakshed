@@ -1,0 +1,2 @@
+{"id":"approval-declined","method":"item/fileChange/requestApproval","params":{"threadId":"thread-golden","turnId":"turn-golden","itemId":"file-1","reason":"change file"}}
+{"id":"approval-declined","result":{"decision":"decline"}}

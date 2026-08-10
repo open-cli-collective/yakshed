@@ -1,0 +1,1 @@
+{"method":"item/agentMessage/delta","params":{"threadId":"thread-golden","turnId":"turn-golden","itemId":"steer-1","delta":"new direction"}}
