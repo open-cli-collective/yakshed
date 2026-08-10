@@ -1,21 +1,22 @@
-use std::path::PathBuf;
-
 use yakshed_domain::{ApprovalDecision, ConnectionId};
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessError, HarnessEvent, HarnessInput,
-    HarnessRunTerminal, ProviderRequestId, ProviderResponse, RunOptions, RuntimeHandle,
-    SessionQuery, StartSessionSpec,
+    HarnessRunTerminal, ProviderResponse, RunOptions, RuntimeHandle, RuntimePath, SessionQuery,
+    StartSessionSpec,
 };
 
 #[derive(Clone, Copy)]
 pub enum ContractScenario {
     ChunkedRun,
     ApprovalWhileStreaming,
+    UserInputWhileStreaming,
     InterruptibleRun,
     CrashAfterAccepted,
     UnknownNativeItem,
     Overloaded,
     Disconnected,
+    CredentialCanaryEvent,
+    CredentialCanaryError,
 }
 
 pub trait HarnessContractFixture {
@@ -25,6 +26,9 @@ pub trait HarnessContractFixture {
     fn adapter(&self) -> &Self::Adapter;
     fn runtime(&self) -> &RuntimeHandle;
     fn expected_capabilities(&self) -> HarnessCapabilities;
+    fn expected_unknown_item_type(&self) -> &str;
+    fn expected_unknown_payload(&self) -> &str;
+    fn credential_canary(&self) -> &str;
 }
 
 fn session_spec() -> StartSessionSpec {
@@ -32,7 +36,7 @@ fn session_spec() -> StartSessionSpec {
         connection_id: "0193f26e-7a72-7000-8000-00000000aaa1"
             .parse::<ConnectionId>()
             .unwrap(),
-        working_directory: PathBuf::from("/contract/workspace"),
+        working_directory: RuntimePath::new("contract-runtime://workspace").unwrap(),
         title: "contract session".to_owned(),
     }
 }
@@ -71,7 +75,7 @@ pub async fn steering_an_active_run_emits_normalized_input<F: HarnessContractFix
     let fixture = F::create(ContractScenario::InterruptibleRun);
     let mut stream = fixture.adapter().subscribe().unwrap();
     let session = session(&fixture).await;
-    let run_id = fixture
+    let returned_run = fixture
         .adapter()
         .start_run(
             &session,
@@ -80,20 +84,22 @@ pub async fn steering_an_active_run_emits_normalized_input<F: HarnessContractFix
         )
         .await
         .unwrap();
-    assert!(matches!(
-        next(&mut stream).await,
-        HarnessEvent::RunAccepted { .. }
-    ));
+    let accepted_run = match next(&mut stream).await {
+        HarnessEvent::RunAccepted { run, .. } => run,
+        event => panic!("expected run acceptance, got {event:?}"),
+    };
+    assert_eq!(accepted_run, returned_run);
     fixture
         .adapter()
-        .steer(&run_id, HarnessInput::new("new direction").unwrap())
+        .steer(&accepted_run, HarnessInput::new("new direction").unwrap())
         .await
         .unwrap();
     assert!(matches!(
         next(&mut stream).await,
-        HarnessEvent::MessageDelta { chunk, .. } if chunk == "new direction"
+        HarnessEvent::MessageDelta { run, chunk, .. }
+            if run == accepted_run && chunk == "new direction"
     ));
-    fixture.adapter().interrupt(&run_id).await.unwrap();
+    fixture.adapter().interrupt(&accepted_run).await.unwrap();
 }
 
 pub async fn session_start_list_and_resume<F: HarnessContractFixture>() {
@@ -120,7 +126,7 @@ pub async fn session_start_list_and_resume<F: HarnessContractFixture>() {
         .list_sessions(
             fixture.runtime(),
             SessionQuery {
-                after: first_page.next_after,
+                after: first_page.next,
                 limit: 2,
             },
         )
@@ -142,7 +148,7 @@ pub async fn run_lifecycle_streams_chunked_file_and_command_events<F: HarnessCon
     let fixture = F::create(ContractScenario::ChunkedRun);
     let mut stream = fixture.adapter().subscribe().unwrap();
     let session = session(&fixture).await;
-    let run_id = fixture
+    let returned_run = fixture
         .adapter()
         .start_run(
             &session,
@@ -155,17 +161,39 @@ pub async fn run_lifecycle_streams_chunked_file_and_command_events<F: HarnessCon
     let mut finalized_text = None;
     let mut saw_file = false;
     let mut saw_command = false;
+    let mut accepted_run = None;
     loop {
         match next(&mut stream).await {
-            HarnessEvent::RunAccepted { run_id: event, .. } => assert_eq!(event, run_id),
-            HarnessEvent::MessageDelta { chunk, .. } => text.push_str(&chunk),
-            HarnessEvent::MessageCompleted { text, .. } => finalized_text = Some(text),
-            HarnessEvent::FileMutation { .. } => saw_file = true,
-            HarnessEvent::CommandOutput { .. } => saw_command = true,
+            HarnessEvent::RunAccepted { run, .. } => {
+                assert_eq!(run, returned_run);
+                accepted_run = Some(run);
+            }
+            HarnessEvent::MessageDelta { run, chunk, .. } => {
+                assert_eq!(Some(&run), accepted_run.as_ref());
+                text.push_str(&chunk);
+            }
+            HarnessEvent::MessageCompleted {
+                run, text: body, ..
+            } => {
+                assert_eq!(Some(&run), accepted_run.as_ref());
+                finalized_text = Some(body);
+            }
+            HarnessEvent::FileMutation { run, .. } => {
+                assert_eq!(Some(&run), accepted_run.as_ref());
+                saw_file = true;
+            }
+            HarnessEvent::CommandOutput { run, .. } => {
+                assert_eq!(Some(&run), accepted_run.as_ref());
+                saw_command = true;
+            }
             HarnessEvent::RunTerminal {
+                run,
                 state: HarnessRunTerminal::Completed,
                 ..
-            } => break,
+            } => {
+                assert_eq!(Some(&run), accepted_run.as_ref());
+                break;
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -179,7 +207,7 @@ pub async fn approval_response_does_not_block_event_stream<F: HarnessContractFix
     let fixture = F::create(ContractScenario::ApprovalWhileStreaming);
     let mut stream = fixture.adapter().subscribe().unwrap();
     let session = session(&fixture).await;
-    fixture
+    let returned_run = fixture
         .adapter()
         .start_run(
             &session,
@@ -188,28 +216,25 @@ pub async fn approval_response_does_not_block_event_stream<F: HarnessContractFix
         )
         .await
         .unwrap();
-    assert!(matches!(
-        next(&mut stream).await,
-        HarnessEvent::RunAccepted { .. }
-    ));
-    let request_id = match next(&mut stream).await {
-        HarnessEvent::ApprovalRequested { request_id, .. } => request_id,
+    let accepted_run = match next(&mut stream).await {
+        HarnessEvent::RunAccepted { run, .. } => run,
+        event => panic!("expected run acceptance, got {event:?}"),
+    };
+    assert_eq!(accepted_run, returned_run);
+    let request = match next(&mut stream).await {
+        HarnessEvent::ApprovalRequested { request, .. } => request,
         event => panic!("expected approval request, got {event:?}"),
     };
-    assert_eq!(
+    assert_eq!(request.run(), &accepted_run);
+    assert!(matches!(
         next(&mut stream).await,
-        HarnessEvent::MessageDelta {
-            run_id: "run-0001".parse().unwrap(),
-            chunk: "reader-still-live".to_owned(),
-            native: yakshed_harness::NativePayload::new(
-                r#"{"type":"message.delta","delta":"reader-still-live"}"#,
-            ),
-        }
-    );
+        HarnessEvent::MessageDelta { run, chunk, .. }
+            if run == accepted_run && chunk == "reader-still-live"
+    ));
     fixture
         .adapter()
         .respond_to_request(
-            request_id,
+            request,
             ProviderResponse::Approval(ApprovalDecision::Approved),
         )
         .await
@@ -223,11 +248,59 @@ pub async fn approval_response_does_not_block_event_stream<F: HarnessContractFix
     ));
 }
 
+pub async fn user_input_request_response_continues_run<F: HarnessContractFixture>() {
+    let fixture = F::create(ContractScenario::UserInputWhileStreaming);
+    let mut stream = fixture.adapter().subscribe().unwrap();
+    let session = session(&fixture).await;
+    let returned_run = fixture
+        .adapter()
+        .start_run(
+            &session,
+            HarnessInput::new("needs input").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    let accepted_run = match next(&mut stream).await {
+        HarnessEvent::RunAccepted { run, .. } => run,
+        event => panic!("expected run acceptance, got {event:?}"),
+    };
+    assert_eq!(accepted_run, returned_run);
+    let request = match next(&mut stream).await {
+        HarnessEvent::UserInputRequested {
+            request, prompt, ..
+        } => {
+            assert!(!prompt.is_empty());
+            request
+        }
+        event => panic!("expected user-input request, got {event:?}"),
+    };
+    assert_eq!(request.run(), &accepted_run);
+    fixture
+        .adapter()
+        .respond_to_request(request, ProviderResponse::UserInput("blue".to_owned()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::MessageDelta { run, chunk, .. }
+            if run == accepted_run && chunk == "input-accepted"
+    ));
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal {
+            run,
+            state: HarnessRunTerminal::Completed,
+            ..
+        } if run == accepted_run
+    ));
+}
+
 pub async fn interrupt_has_typed_terminal_semantics<F: HarnessContractFixture>() {
     let fixture = F::create(ContractScenario::InterruptibleRun);
     let mut stream = fixture.adapter().subscribe().unwrap();
     let session = session(&fixture).await;
-    let run_id = fixture
+    let returned_run = fixture
         .adapter()
         .start_run(
             &session,
@@ -236,17 +309,19 @@ pub async fn interrupt_has_typed_terminal_semantics<F: HarnessContractFixture>()
         )
         .await
         .unwrap();
-    assert!(matches!(
-        next(&mut stream).await,
-        HarnessEvent::RunAccepted { .. }
-    ));
-    fixture.adapter().interrupt(&run_id).await.unwrap();
+    let accepted_run = match next(&mut stream).await {
+        HarnessEvent::RunAccepted { run, .. } => run,
+        event => panic!("expected run acceptance, got {event:?}"),
+    };
+    assert_eq!(accepted_run, returned_run);
+    fixture.adapter().interrupt(&accepted_run).await.unwrap();
     assert!(matches!(
         next(&mut stream).await,
         HarnessEvent::RunTerminal {
+            run,
             state: HarnessRunTerminal::Interrupted,
             ..
-        }
+        } if run == accepted_run
     ));
 }
 
@@ -254,7 +329,7 @@ pub async fn crash_mid_run_is_a_typed_terminal_event<F: HarnessContractFixture>(
     let fixture = F::create(ContractScenario::CrashAfterAccepted);
     let mut stream = fixture.adapter().subscribe().unwrap();
     let session = session(&fixture).await;
-    fixture
+    let returned_run = fixture
         .adapter()
         .start_run(
             &session,
@@ -263,16 +338,18 @@ pub async fn crash_mid_run_is_a_typed_terminal_event<F: HarnessContractFixture>(
         )
         .await
         .unwrap();
-    assert!(matches!(
-        next(&mut stream).await,
-        HarnessEvent::RunAccepted { .. }
-    ));
+    let accepted_run = match next(&mut stream).await {
+        HarnessEvent::RunAccepted { run, .. } => run,
+        event => panic!("expected run acceptance, got {event:?}"),
+    };
+    assert_eq!(accepted_run, returned_run);
     assert!(matches!(
         next(&mut stream).await,
         HarnessEvent::RunTerminal {
+            run,
             state: HarnessRunTerminal::Crashed { .. },
             ..
-        }
+        } if run == accepted_run
     ));
 }
 
@@ -297,11 +374,8 @@ pub async fn unknown_native_items_are_preserved<F: HarnessContractFixture>() {
         HarnessEvent::Unknown {
             item_type, native, ..
         } => {
-            assert_eq!(item_type, "mock.future-item");
-            assert_eq!(
-                native.as_str(),
-                r#"{"type":"mock.future-item","answer":42}"#
-            );
+            assert_eq!(item_type, fixture.expected_unknown_item_type());
+            assert_eq!(native.sanitized_raw(), fixture.expected_unknown_payload());
         }
         event => panic!("expected unknown event, got {event:?}"),
     }
@@ -326,6 +400,41 @@ pub async fn unavailable_runtimes_return_typed_errors<F: HarnessContractFixture>
     ));
 }
 
-pub fn approval_request_id() -> ProviderRequestId {
-    "request-0001".parse().unwrap()
+pub async fn credential_canary_is_redacted_from_events_and_errors<F: HarnessContractFixture>() {
+    let fixture = F::create(ContractScenario::CredentialCanaryEvent);
+    let canary = fixture.credential_canary().to_owned();
+    let mut stream = fixture.adapter().subscribe().unwrap();
+    let session = session(&fixture).await;
+    fixture
+        .adapter()
+        .start_run(
+            &session,
+            HarnessInput::new("redact native payload").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    loop {
+        let event = next(&mut stream).await;
+        assert!(!event.native_payload().sanitized_raw().contains(&canary));
+        assert!(!format!("{event:?}").contains(&canary));
+        assert!(!format!("{event}").contains(&canary));
+        if matches!(event, HarnessEvent::RunTerminal { .. }) {
+            break;
+        }
+    }
+
+    let error_fixture = F::create(ContractScenario::CredentialCanaryError);
+    let error = error_fixture
+        .adapter()
+        .capabilities(error_fixture.runtime())
+        .await
+        .unwrap_err();
+    assert!(!format!("{error}").contains(&canary));
+    assert!(!format!("{error:?}").contains(&canary));
+    if let HarnessError::Protocol { diagnostic } = error {
+        assert!(!diagnostic.sanitized_text().contains(&canary));
+    } else {
+        panic!("expected sanitized protocol error");
+    }
 }

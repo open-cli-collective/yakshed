@@ -8,7 +8,7 @@
 //! owner. `ProviderEventStream::recv` is intentionally smaller than a `futures::Stream` dependency;
 //! the future Codex transport can feed the same bounded sender.
 
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -56,6 +56,12 @@ impl RuntimeHandle {
     }
 }
 
+impl fmt::Display for RuntimeHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 macro_rules! opaque_provider_id {
     ($name:ident, $label:literal) => {
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -90,6 +96,7 @@ macro_rules! opaque_provider_id {
 opaque_provider_id!(ProviderSessionId, "provider session id");
 opaque_provider_id!(ProviderRunId, "provider run id");
 opaque_provider_id!(ProviderRequestId, "provider request id");
+opaque_provider_id!(SessionPageCursor, "session page cursor");
 
 fn validate_opaque_id(label: &str, value: String) -> Result<String, HarnessError> {
     if value.trim().is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
@@ -99,23 +106,115 @@ fn validate_opaque_id(label: &str, value: String) -> Result<String, HarnessError
     }
 }
 
+/// Runtime- and session-scoped provider run identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderRunHandle {
+    runtime: RuntimeHandle,
+    session_id: ProviderSessionId,
+    native_id: ProviderRunId,
+}
+
+impl ProviderRunHandle {
+    pub fn new(
+        runtime: RuntimeHandle,
+        session_id: ProviderSessionId,
+        native_id: ProviderRunId,
+    ) -> Self {
+        Self {
+            runtime,
+            session_id,
+            native_id,
+        }
+    }
+
+    pub fn runtime(&self) -> &RuntimeHandle {
+        &self.runtime
+    }
+
+    pub fn session_id(&self) -> &ProviderSessionId {
+        &self.session_id
+    }
+
+    pub fn native_id(&self) -> &ProviderRunId {
+        &self.native_id
+    }
+}
+
+impl fmt::Display for ProviderRunHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}/{}/{}",
+            self.runtime, self.session_id, self.native_id
+        )
+    }
+}
+
+/// Provider request identity scoped through its owning runtime/session/run.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderRequestHandle {
+    run: ProviderRunHandle,
+    native_id: ProviderRequestId,
+}
+
+impl ProviderRequestHandle {
+    pub fn new(run: ProviderRunHandle, native_id: ProviderRequestId) -> Self {
+        Self { run, native_id }
+    }
+
+    pub fn run(&self) -> &ProviderRunHandle {
+        &self.run
+    }
+
+    pub fn native_id(&self) -> &ProviderRequestId {
+        &self.native_id
+    }
+}
+
+impl fmt::Display for ProviderRequestHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.run, self.native_id)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartSessionSpec {
     pub connection_id: ConnectionId,
-    pub working_directory: PathBuf,
+    pub working_directory: RuntimePath,
     pub title: String,
+}
+
+/// Provider/runtime-native path. Interpretation belongs to the selected runtime adapter.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuntimePath(String);
+
+impl RuntimePath {
+    pub fn new(value: impl Into<String>) -> Result<Self, HarnessError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 32_768 || value.contains('\0') {
+            Err(HarnessError::InvalidInput(
+                "invalid runtime path".to_owned(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionQuery {
-    pub after: Option<ProviderSessionId>,
+    pub after: Option<SessionPageCursor>,
     pub limit: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Page<T> {
     pub items: Vec<T>,
-    pub next_after: Option<ProviderSessionId>,
+    pub next: Option<SessionPageCursor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,7 +229,7 @@ pub struct ProviderSession {
     pub id: ProviderSessionId,
     pub runtime: RuntimeHandle,
     pub connection_id: ConnectionId,
-    pub working_directory: PathBuf,
+    pub working_directory: RuntimePath,
     pub title: String,
 }
 
@@ -170,11 +269,13 @@ pub enum ProviderResponse {
 pub struct NativePayload(String);
 
 impl NativePayload {
-    pub fn new(value: impl Into<String>) -> Self {
+    /// Constructs a payload only after the adapter has removed credential material.
+    pub fn sanitized(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
-    pub fn as_str(&self) -> &str {
+    /// Returns the retained post-redaction bytes for rebuildable provider projections.
+    pub fn sanitized_raw(&self) -> &str {
         &self.0
     }
 }
@@ -185,65 +286,140 @@ impl fmt::Debug for NativePayload {
     }
 }
 
+impl fmt::Display for NativePayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[native payload redacted]")
+    }
+}
+
+/// Provider diagnostic after adapter-level credential redaction.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SanitizedDiagnostic(String);
+
+impl SanitizedDiagnostic {
+    /// Constructs a diagnostic only after the adapter has removed credential material.
+    pub fn sanitized(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn sanitized_text(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SanitizedDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SanitizedDiagnostic([redacted])")
+    }
+}
+
+impl fmt::Display for SanitizedDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessRunTerminal {
     Completed,
-    Failed { message: String },
+    Failed { diagnostic: SanitizedDiagnostic },
     Interrupted,
-    Crashed { message: String },
+    Crashed { diagnostic: SanitizedDiagnostic },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessEvent {
     RunAccepted {
-        run_id: ProviderRunId,
+        run: ProviderRunHandle,
         native: NativePayload,
     },
     /// Transient streaming text; reducers batch these rather than persisting each chunk.
     MessageDelta {
-        run_id: ProviderRunId,
+        run: ProviderRunHandle,
         chunk: String,
         native: NativePayload,
     },
     /// Authoritative completed message suitable for finalizing normalized state.
     MessageCompleted {
-        run_id: ProviderRunId,
+        run: ProviderRunHandle,
         text: String,
         native: NativePayload,
     },
     ApprovalRequested {
-        run_id: ProviderRunId,
-        request_id: ProviderRequestId,
+        request: ProviderRequestHandle,
         summary: String,
         native: NativePayload,
     },
+    UserInputRequested {
+        request: ProviderRequestHandle,
+        prompt: String,
+        native: NativePayload,
+    },
     FileMutation {
-        run_id: ProviderRunId,
+        run: ProviderRunHandle,
         path: String,
         summary: String,
         native: NativePayload,
     },
     CommandOutput {
-        run_id: ProviderRunId,
+        run: ProviderRunHandle,
         command: String,
         chunk: String,
         native: NativePayload,
     },
     RunTerminal {
-        run_id: ProviderRunId,
+        run: ProviderRunHandle,
         state: HarnessRunTerminal,
         native: NativePayload,
     },
     Unknown {
-        run_id: Option<ProviderRunId>,
+        run: Option<ProviderRunHandle>,
         item_type: String,
         native: NativePayload,
     },
     MalformedNativePayload {
-        run_id: Option<ProviderRunId>,
+        run: Option<ProviderRunHandle>,
         item_type: String,
         native: NativePayload,
     },
+}
+
+impl HarnessEvent {
+    pub fn native_payload(&self) -> &NativePayload {
+        match self {
+            Self::RunAccepted { native, .. }
+            | Self::MessageDelta { native, .. }
+            | Self::MessageCompleted { native, .. }
+            | Self::ApprovalRequested { native, .. }
+            | Self::UserInputRequested { native, .. }
+            | Self::FileMutation { native, .. }
+            | Self::CommandOutput { native, .. }
+            | Self::RunTerminal { native, .. }
+            | Self::Unknown { native, .. }
+            | Self::MalformedNativePayload { native, .. } => native,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::RunAccepted { .. } => "run_accepted",
+            Self::MessageDelta { .. } => "message_delta",
+            Self::MessageCompleted { .. } => "message_completed",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::UserInputRequested { .. } => "user_input_requested",
+            Self::FileMutation { .. } => "file_mutation",
+            Self::CommandOutput { .. } => "command_output",
+            Self::RunTerminal { .. } => "run_terminal",
+            Self::Unknown { .. } => "unknown",
+            Self::MalformedNativePayload { .. } => "malformed_native_payload",
+        }
+    }
+}
+
+impl fmt::Display for HarnessEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.kind())
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -262,8 +438,12 @@ pub enum HarnessError {
     Disconnected,
     #[error("harness event stream is closed")]
     Closed,
-    #[error("provider backend failure: {0}")]
-    Backend(String),
+    #[error("provider protocol failure: {diagnostic}")]
+    Protocol { diagnostic: SanitizedDiagnostic },
+    #[error("provider transport failure: {diagnostic}")]
+    Transport { diagnostic: SanitizedDiagnostic },
+    #[error("provider runtime failure: {diagnostic}")]
+    Runtime { diagnostic: SanitizedDiagnostic },
 }
 
 #[derive(Clone)]
@@ -320,15 +500,16 @@ pub trait HarnessAdapter: Send + Sync {
         session: &ProviderSession,
         input: HarnessInput,
         options: RunOptions,
-    ) -> Result<ProviderRunId, HarnessError>;
+    ) -> Result<ProviderRunHandle, HarnessError>;
 
-    async fn steer(&self, run: &ProviderRunId, input: HarnessInput) -> Result<(), HarnessError>;
+    async fn steer(&self, run: &ProviderRunHandle, input: HarnessInput)
+    -> Result<(), HarnessError>;
 
-    async fn interrupt(&self, run: &ProviderRunId) -> Result<(), HarnessError>;
+    async fn interrupt(&self, run: &ProviderRunHandle) -> Result<(), HarnessError>;
 
     async fn respond_to_request(
         &self,
-        request: ProviderRequestId,
+        request: ProviderRequestHandle,
         response: ProviderResponse,
     ) -> Result<(), HarnessError>;
 
@@ -341,14 +522,15 @@ mod tests {
 
     #[test]
     fn native_payload_debug_output_is_redacted() {
-        let canary = "YAKSHED_SECRET_CANARY";
+        let retained = "sanitized-native-detail";
         let event = HarnessEvent::Unknown {
-            run_id: None,
+            run: None,
             item_type: "future".to_owned(),
-            native: NativePayload::new(canary),
+            native: NativePayload::sanitized(retained),
         };
 
-        assert!(!format!("{event:?}").contains(canary));
+        assert!(!format!("{event:?}").contains(retained));
+        assert!(!format!("{event}").contains(retained));
     }
 
     #[test]
@@ -356,5 +538,12 @@ mod tests {
         assert!(ProviderRunId::new("provider/native:id").is_ok());
         assert!(ProviderRunId::new("").is_err());
         assert!(ProviderRunId::new("bad\nvalue").is_err());
+    }
+
+    #[test]
+    fn runtime_paths_do_not_assume_host_path_semantics() {
+        assert!(RuntimePath::new(r"C:\workspace\project").is_ok());
+        assert!(RuntimePath::new("ssh://host/workspace").is_ok());
+        assert!(RuntimePath::new("").is_err());
     }
 }

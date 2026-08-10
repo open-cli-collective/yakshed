@@ -1,9 +1,9 @@
-use std::path::PathBuf;
-
 use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
+use yakshed_domain::ApprovalDecision;
 use yakshed_harness::{
     EVENT_BUFFER_CAPACITY, HarnessAdapter, HarnessCapabilities, HarnessEvent, HarnessInput,
-    HarnessRunTerminal, ProviderRequestId, RunOptions, RuntimeHandle, StartSessionSpec,
+    HarnessRunTerminal, ProviderRequestId, ProviderResponse, RunOptions, RuntimeHandle,
+    RuntimePath, SessionQuery, StartSessionSpec,
 };
 
 fn runtime() -> RuntimeHandle {
@@ -11,11 +11,19 @@ fn runtime() -> RuntimeHandle {
 }
 
 async fn session(mock: &MockHarness) -> yakshed_harness::ProviderSession {
+    session_at(mock, &runtime()).await
+}
+
+async fn session_at(
+    mock: &MockHarness,
+    runtime: &RuntimeHandle,
+) -> yakshed_harness::ProviderSession {
     mock.start_session(
-        &runtime(),
+        runtime,
         StartSessionSpec {
             connection_id: "0193f26e-7a72-7000-8000-00000000aaa1".parse().unwrap(),
-            working_directory: PathBuf::from("/mock/workspace"),
+            working_directory: RuntimePath::new(format!("{}://workspace", runtime.as_str()))
+                .unwrap(),
             title: "fault test".to_owned(),
         },
     )
@@ -134,7 +142,7 @@ async fn malformed_native_payload_is_visible_and_preserved() {
     ));
     match next(&mut stream).await {
         HarnessEvent::MalformedNativePayload { native, .. } => {
-            assert_eq!(native.as_str(), "{not-json");
+            assert_eq!(native.sanitized_raw(), "{not-json");
         }
         event => panic!("expected malformed native payload, got {event:?}"),
     }
@@ -268,5 +276,109 @@ async fn a_run_fault_plan_is_scoped_and_consumed_once() {
             state: HarnessRunTerminal::Completed,
             ..
         }
+    ));
+}
+
+#[tokio::test]
+async fn session_pagination_crosses_9999_to_10000_in_creation_order() {
+    let mock = MockHarness::new(HarnessCapabilities::default(), Vec::new(), None);
+    for _ in 0..10_001 {
+        session(&mock).await;
+    }
+
+    let mut after = None;
+    for _ in 0..99 {
+        after = mock
+            .list_sessions(&runtime(), SessionQuery { after, limit: 101 })
+            .await
+            .unwrap()
+            .next;
+    }
+    let page = mock
+        .list_sessions(&runtime(), SessionQuery { after, limit: 2 })
+        .await
+        .unwrap();
+    assert_eq!(page.items[0].id.as_str(), "session-10000");
+    assert_eq!(page.items[1].id.as_str(), "session-10001");
+    assert!(page.next.is_none());
+}
+
+#[tokio::test]
+async fn identical_native_ids_are_isolated_by_runtime_and_session_scope() {
+    let request_id = ProviderRequestId::new("request-0001").unwrap();
+    let plan = || {
+        MockRunPlan::new(vec![
+            MockScriptStep::approval(request_id.clone(), "approve"),
+            MockScriptStep::await_response(request_id.clone()),
+            MockScriptStep::complete(),
+        ])
+    };
+    let mock = MockHarness::new(HarnessCapabilities::default(), vec![plan(), plan()], None);
+    let mut stream = mock.subscribe().unwrap();
+    let runtime_a = RuntimeHandle::new("runtime-a").unwrap();
+    let runtime_b = RuntimeHandle::new("runtime-b").unwrap();
+    let session_a = session_at(&mock, &runtime_a).await;
+    let session_b = session_at(&mock, &runtime_b).await;
+    assert_eq!(session_a.id, session_b.id);
+
+    let run_a = mock
+        .start_run(
+            &session_a,
+            HarnessInput::new("a").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    let run_b = mock
+        .start_run(
+            &session_b,
+            HarnessInput::new("b").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_a.native_id(), run_b.native_id());
+    assert_ne!(run_a, run_b);
+
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { run, .. } if run == run_a
+    ));
+    let request_a = match next(&mut stream).await {
+        HarnessEvent::ApprovalRequested { request, .. } => request,
+        event => panic!("expected first approval, got {event:?}"),
+    };
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { run, .. } if run == run_b
+    ));
+    let request_b = match next(&mut stream).await {
+        HarnessEvent::ApprovalRequested { request, .. } => request,
+        event => panic!("expected second approval, got {event:?}"),
+    };
+    assert_eq!(request_a.native_id(), request_b.native_id());
+    assert_ne!(request_a, request_b);
+    assert_eq!(request_a.run(), &run_a);
+    assert_eq!(request_b.run(), &run_b);
+
+    mock.respond_to_request(
+        request_a,
+        ProviderResponse::Approval(ApprovalDecision::Approved),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal { run, .. } if run == run_a
+    ));
+    mock.respond_to_request(
+        request_b,
+        ProviderResponse::Approval(ApprovalDecision::Denied),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal { run, .. } if run == run_b
     ));
 }

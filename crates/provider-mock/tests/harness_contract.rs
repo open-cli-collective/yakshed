@@ -3,12 +3,14 @@ mod contract_suite;
 
 use contract_suite::{ContractScenario, HarnessContractFixture};
 use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
-use yakshed_harness::{HarnessCapabilities, RuntimeHandle};
+use yakshed_harness::{HarnessCapabilities, ProviderRequestId, RuntimeHandle};
 
 struct MockFixture {
     adapter: MockHarness,
     runtime: RuntimeHandle,
 }
+
+const CREDENTIAL_CANARY: &str = "YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT";
 
 fn capabilities() -> HarnessCapabilities {
     HarnessCapabilities {
@@ -34,7 +36,7 @@ impl HarnessContractFixture for MockFixture {
     type Adapter = MockHarness;
 
     fn create(scenario: ContractScenario) -> Self {
-        let request_id = contract_suite::approval_request_id();
+        let request_id = "request-0001".parse::<ProviderRequestId>().unwrap();
         let (plan, runtime_fault) = match scenario {
             ContractScenario::ChunkedRun => (
                 MockRunPlan::new(vec![
@@ -52,6 +54,15 @@ impl HarnessContractFixture for MockFixture {
                     MockScriptStep::approval(request_id.clone(), "run command"),
                     MockScriptStep::message("reader-still-live"),
                     MockScriptStep::await_response(request_id),
+                    MockScriptStep::complete(),
+                ]),
+                None,
+            ),
+            ContractScenario::UserInputWhileStreaming => (
+                MockRunPlan::new(vec![
+                    MockScriptStep::user_input(request_id.clone(), "favorite color?"),
+                    MockScriptStep::await_response(request_id),
+                    MockScriptStep::message("input-accepted"),
                     MockScriptStep::complete(),
                 ]),
                 None,
@@ -77,9 +88,24 @@ impl HarnessContractFixture for MockFixture {
                 MockRunPlan::new(Vec::new()),
                 Some(MockHarnessFault::Disconnected),
             ),
+            ContractScenario::CredentialCanaryEvent => (
+                MockRunPlan::new(vec![
+                    MockScriptStep::unknown(
+                        "provider.native",
+                        format!(r#"{{"credential":"{CREDENTIAL_CANARY}"}}"#),
+                    ),
+                    MockScriptStep::complete(),
+                ]),
+                None,
+            ),
+            ContractScenario::CredentialCanaryError => (
+                MockRunPlan::new(Vec::new()),
+                Some(MockHarnessFault::ProtocolFailure),
+            ),
         };
         Self {
-            adapter: MockHarness::new(capabilities(), vec![plan], runtime_fault),
+            adapter: MockHarness::new(capabilities(), vec![plan], runtime_fault)
+                .with_native_redaction(CREDENTIAL_CANARY),
             runtime: RuntimeHandle::new("mock-runtime").unwrap(),
         }
     }
@@ -94,6 +120,18 @@ impl HarnessContractFixture for MockFixture {
 
     fn expected_capabilities(&self) -> HarnessCapabilities {
         capabilities()
+    }
+
+    fn expected_unknown_item_type(&self) -> &str {
+        "mock.future-item"
+    }
+
+    fn expected_unknown_payload(&self) -> &str {
+        r#"{"type":"mock.future-item","answer":42}"#
+    }
+
+    fn credential_canary(&self) -> &str {
+        CREDENTIAL_CANARY
     }
 }
 
@@ -123,6 +161,11 @@ async fn approval_response_does_not_block_event_stream() {
 }
 
 #[tokio::test]
+async fn user_input_request_response_continues_run() {
+    contract_suite::user_input_request_response_continues_run::<MockFixture>().await;
+}
+
+#[tokio::test]
 async fn interrupt_has_typed_terminal_semantics() {
     contract_suite::interrupt_has_typed_terminal_semantics::<MockFixture>().await;
 }
@@ -140,4 +183,9 @@ async fn unknown_native_items_are_preserved() {
 #[tokio::test]
 async fn unavailable_runtimes_return_typed_errors() {
     contract_suite::unavailable_runtimes_return_typed_errors::<MockFixture>().await;
+}
+
+#[tokio::test]
+async fn credential_canary_is_redacted_from_events_and_errors() {
+    contract_suite::credential_canary_is_redacted_from_events_and_errors::<MockFixture>().await;
 }
