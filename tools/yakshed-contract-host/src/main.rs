@@ -159,6 +159,10 @@ struct Host {
     harness: MockHarness,
     negotiated: bool,
     shutting_down: bool,
+    /// A failed purge recovery flushes its error response, then `serve` exits nonzero.
+    fatal: bool,
+    #[cfg(test)]
+    fail_next_data_purge: bool,
     _temporary_root: Option<tempfile::TempDir>,
 }
 
@@ -208,6 +212,9 @@ impl Host {
             harness: MockHarness::new(HarnessCapabilities::default(), Vec::new(), None),
             negotiated: false,
             shutting_down: false,
+            fatal: false,
+            #[cfg(test)]
+            fail_next_data_purge: false,
             _temporary_root: options._temporary_root,
         })
     }
@@ -237,6 +244,12 @@ impl Host {
             serde_json::to_writer(&mut stdout, &response).map_err(HostError::protocol)?;
             stdout.write_all(b"\n").map_err(HostError::protocol)?;
             stdout.flush().map_err(HostError::protocol)?;
+            if self.fatal {
+                let _ = self.shutdown().await;
+                return Err(HostError::internal(
+                    "data stores could not be re-established",
+                ));
+            }
             if self.shutting_down {
                 break;
             }
@@ -641,12 +654,28 @@ impl Host {
     }
 
     async fn data_purge(&mut self) -> Result<Value, HostError> {
+        match self.try_data_purge().await {
+            Ok(()) => Ok(json!({"purged": true})),
+            Err(error) => {
+                if self.reestablish_data_stores().await.is_err() {
+                    self.fatal = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn try_data_purge(&mut self) -> Result<(), HostError> {
         self.artifacts.take();
         if let Some(data) = self.data.take() {
             data.shutdown().await?;
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_data_purge) {
+            return Err(HostError::persistence("injected data purge failure"));
+        }
         let paths = self.paths.clone();
-        let artifacts = run_blocking(move || {
+        run_blocking(move || {
             if paths
                 .data_root
                 .try_exists()
@@ -654,20 +683,27 @@ impl Host {
             {
                 std::fs::remove_dir_all(&paths.data_root).map_err(HostError::persistence)?;
             }
-            paths.create_data_root().map_err(HostError::persistence)?;
-            ArtifactStore::new(&paths, ARTIFACT_MAX_BYTES).map_err(Into::into)
+            Ok(())
         })
         .await?;
-        self.data = Some(
-            SqliteStore::open(
-                self.paths.clone(),
-                Arc::new(SystemClock),
-                Arc::new(SystemIdGenerator),
-            )
-            .await?,
-        );
+        self.reestablish_data_stores().await
+    }
+
+    async fn reestablish_data_stores(&mut self) -> Result<(), HostError> {
+        let paths = self.paths.clone();
+        let artifact_paths = paths.clone();
+        let artifacts = run_blocking(move || {
+            artifact_paths
+                .create_data_root()
+                .map_err(HostError::persistence)?;
+            ArtifactStore::new(&artifact_paths, ARTIFACT_MAX_BYTES).map_err(Into::into)
+        })
+        .await?;
+        let data =
+            SqliteStore::open(paths, Arc::new(SystemClock), Arc::new(SystemIdGenerator)).await?;
+        self.data = Some(data);
         self.artifacts = Some(artifacts);
-        Ok(json!({"purged": true}))
+        Ok(())
     }
 
     async fn state_summary(&self) -> Result<Value, HostError> {
@@ -1490,6 +1526,43 @@ mod tests {
             Ok(value) => assert_eq!(value, 7),
             Err(_) => panic!("blocking work failed"),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_data_purge_reestablishes_stores_for_subsequent_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut host = match Host::open(LaunchOptions {
+            root: root.path().to_owned(),
+            _temporary_root: None,
+        })
+        .await
+        {
+            Ok(host) => host,
+            Err(_) => panic!("test host failed to open"),
+        };
+        host.fail_next_data_purge = true;
+
+        let error = match host.data_purge().await {
+            Ok(_) => panic!("injected purge unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "persistence_error");
+        assert!(!host.fatal);
+
+        let created = host
+            .work_create(json!({
+                "id": "0193f26e-7a72-7d42-bf77-0de14c4cc301",
+                "project_id": "0193f26e-7a72-7d42-bf77-0de14c4cc302",
+                "title": "created after failed purge"
+            }))
+            .await;
+        assert!(created.is_ok());
+        let summary = match host.state_summary().await {
+            Ok(summary) => summary,
+            Err(_) => panic!("state summary failed after purge recovery"),
+        };
+        assert_eq!(summary["work_items"], 1);
+        assert!(host.shutdown().await.is_ok());
     }
 
     #[test]
