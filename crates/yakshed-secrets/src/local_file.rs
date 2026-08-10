@@ -1,8 +1,9 @@
 //! Plaintext local-development secret storage.
 //!
 //! Backends targeting the same canonical path share a process-global mutex and an exclusive Unix
-//! `flock` for each operation. Purge unlinks the store and sidecar under those same locks.
-//! Manual deletion is safe only after every backend instance has stopped.
+//! `flock` for each operation. Purge unlinks only the store; the zero-length `.lock` sidecar
+//! is persistent coordination state and survives purge. Delete both files manually only after
+//! every backend instance has stopped.
 //! Dropped mutations are suppressed before writing starts. A drop after writing starts has an
 //! uncertain outcome and must be reconciled before retrying. Reads wait for a contended file lock;
 //! abandoned mutations stop waiting promptly.
@@ -118,7 +119,10 @@ impl LocalFileBackend {
         unreachable!("platform validation rejects local-file on non-Unix targets")
     }
 
-    /// Removes the local store and its lock sidecar while holding both coordination locks.
+    /// Removes the local store while holding both coordination locks.
+    ///
+    /// The `.lock` sidecar is intentionally retained so queued contenders keep using the same
+    /// inode across purge. Manual deletion of both files is safe only with all instances stopped.
     pub async fn purge(&self) -> Result<(), SecretError> {
         self.run_abandonable(|state, abandoned| state.purge(abandoned))
             .await
@@ -229,63 +233,48 @@ impl LocalFileState {
 
     fn purge(&self, abandoned: &AtomicBool) -> Result<(), SecretError> {
         let initialized = self.initialized()?;
-        let _process_guard = initialized
-            .lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_parent(&initialized.path, &self.id)?;
-        let _file_guard = lock_exclusive(&lock_path(&initialized.path), &self.id, Some(abandoned))?;
-        validate_parent(&initialized.path, &self.id)?;
-        if abandoned.load(Ordering::Acquire) {
-            return Err(SecretError::Cancelled {
-                backend: self.id.clone(),
-            });
-        }
-
-        let store_removed = match fs::remove_file(&initialized.path) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(map_io_error(
-                    &self.id,
-                    "failed to purge local secret store",
-                    error,
-                ));
+        self.with_process_lock(&initialized, Some(abandoned), || {
+            validate_parent(&initialized.path, &self.id)?;
+            let _file_guard =
+                lock_exclusive(&lock_path(&initialized.path), &self.id, Some(abandoned))?;
+            validate_parent(&initialized.path, &self.id)?;
+            if abandoned.load(Ordering::Acquire) {
+                return Err(SecretError::Cancelled {
+                    backend: self.id.clone(),
+                });
             }
-        };
-        if abandoned.load(Ordering::Acquire) {
-            return Err(SecretError::UncertainWrite {
-                backend: self.id.clone(),
-            });
-        }
+            if initialized.path.exists() {
+                self.load(&initialized.path)?;
+            }
 
-        let sidecar_removed = match fs::remove_file(lock_path(&initialized.path)) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(_error) if store_removed => {
+            let store_removed = match fs::remove_file(&initialized.path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(map_io_error(
+                        &self.id,
+                        "failed to purge local secret store",
+                        error,
+                    ));
+                }
+            };
+            if abandoned.load(Ordering::Acquire) {
                 return Err(SecretError::UncertainWrite {
                     backend: self.id.clone(),
                 });
             }
-            Err(error) => {
-                return Err(map_io_error(
-                    &self.id,
-                    "failed to purge local secret store lock",
-                    error,
-                ));
-            }
-        };
-        sync_directory(initialized.path.parent().expect("store path has a parent")).map_err(
-            |error| {
-                if store_removed || sidecar_removed {
-                    SecretError::UncertainWrite {
-                        backend: self.id.clone(),
+            sync_directory(initialized.path.parent().expect("store path has a parent")).map_err(
+                |error| {
+                    if store_removed {
+                        SecretError::UncertainWrite {
+                            backend: self.id.clone(),
+                        }
+                    } else {
+                        map_io_error(&self.id, "failed to sync purged local secret store", error)
                     }
-                } else {
-                    map_io_error(&self.id, "failed to sync purged local secret store", error)
-                }
-            },
-        )
+                },
+            )
+        })
     }
 
     fn with_store_lock<T>(
@@ -294,22 +283,45 @@ impl LocalFileState {
         action: impl FnOnce(&Path) -> Result<T, SecretError>,
     ) -> Result<T, SecretError> {
         let initialized = self.initialized()?;
-        let _process_guard = initialized
-            .lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_parent(&initialized.path, &self.id)?;
-        let _file_guard = lock_exclusive(&lock_path(&initialized.path), &self.id, abandoned)?;
-        validate_parent(&initialized.path, &self.id)?;
-        validate_store_if_present(&initialized.path, &self.id)?;
-        if abandoned.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            return Err(SecretError::Cancelled {
-                backend: self.id.clone(),
-            });
-        }
-        claim_or_validate(&initialized.path, &self.id)?;
-        validate_store_if_present(&initialized.path, &self.id)?;
-        action(&initialized.path)
+        self.with_process_lock(&initialized, abandoned, || {
+            validate_parent(&initialized.path, &self.id)?;
+            let _file_guard = lock_exclusive(&lock_path(&initialized.path), &self.id, abandoned)?;
+            validate_parent(&initialized.path, &self.id)?;
+            validate_store_if_present(&initialized.path, &self.id)?;
+            if abandoned.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(SecretError::Cancelled {
+                    backend: self.id.clone(),
+                });
+            }
+            claim_or_validate(&initialized.path, &self.id)?;
+            validate_store_if_present(&initialized.path, &self.id)?;
+            action(&initialized.path)
+        })
+    }
+
+    fn with_process_lock<T>(
+        &self,
+        initialized: &InitializedLocalFile,
+        abandoned: Option<&AtomicBool>,
+        action: impl FnOnce() -> Result<T, SecretError>,
+    ) -> Result<T, SecretError> {
+        let guard = loop {
+            match initialized.lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if abandoned.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                        return Err(SecretError::Cancelled {
+                            backend: self.id.clone(),
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
+        let result = action();
+        drop(guard);
+        result
     }
 }
 
@@ -1060,6 +1072,8 @@ mod tests {
 
     #[tokio::test]
     async fn purge_serializes_with_mutation_and_reinitializes_empty_store() {
+        use std::os::unix::fs::MetadataExt;
+
         let temp = tempdir().unwrap();
         let path = temp.path().join("store/secrets.json");
         let config = config("dev-local", &path);
@@ -1074,6 +1088,8 @@ mod tests {
             .await
             .unwrap();
 
+        let sidecar = lock_path(&backend.state.initialized().unwrap().path);
+        let sidecar_before = fs::metadata(&sidecar).unwrap();
         let concurrent_locator = SecretLocator::new("concurrent").unwrap();
         let concurrent_value = SecretString::from("concurrent-canary");
         let mutation = backend.put(
@@ -1086,12 +1102,52 @@ mod tests {
 
         backend.purge().await.unwrap();
         assert!(!path.exists());
-        assert!(!lock_path(&backend.state.initialized().unwrap().path).exists());
+        let sidecar_after = fs::metadata(&sidecar).unwrap();
+        assert_eq!(sidecar_before.dev(), sidecar_after.dev());
+        assert_eq!(sidecar_before.ino(), sidecar_after.ino());
         assert!(matches!(
             backend.resolve(&existing, &context()).await,
             Err(SecretError::NotFound { .. })
         ));
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn aliased_backend_cannot_purge_foreign_owned_store() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempdir().unwrap();
+        let real_parent = temp.path().join("real");
+        fs::create_dir(&real_parent).unwrap();
+        fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let alias_parent = temp.path().join("alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let path = real_parent.join("secrets.json");
+        let first = LocalFileBackend::from_config(&config("backend-a", &path)).unwrap();
+        let locator = SecretLocator::new("purge-identity").unwrap();
+        first
+            .put(
+                &locator,
+                &SecretString::from(CANARY.to_owned()),
+                PutSecretOptions::NO_OVERWRITE,
+            )
+            .await
+            .unwrap();
+        let second =
+            LocalFileBackend::from_config(&config("backend-b", &alias_parent.join("secrets.json")))
+                .unwrap();
+
+        assert!(matches!(
+            second.purge().await,
+            Err(SecretError::ProtocolViolation { .. })
+        ));
+        assert!(
+            first
+                .resolve(&locator, &context())
+                .await
+                .unwrap()
+                .expose(|value| value == CANARY)
+        );
     }
 
     #[tokio::test]
@@ -1676,6 +1732,43 @@ mod tests {
                 .unwrap()
                 .expose(|value| value == CANARY)
         );
+    }
+
+    #[test]
+    fn abandoned_process_mutex_wait_returns_without_acquiring_mutex() {
+        let temp = tempdir().unwrap();
+        let backend = Arc::new(
+            LocalFileBackend::from_config(&config(
+                "dev-local",
+                &temp.path().join("store/secrets.json"),
+            ))
+            .unwrap(),
+        );
+        let initialized = backend.state.initialized().unwrap();
+        let held = initialized.lock.lock().unwrap();
+        let abandoned = Arc::new(AtomicBool::new(true));
+        let state = Arc::clone(&backend.state);
+        let worker_initialized = Arc::clone(&initialized);
+        let worker_abandoned = Arc::clone(&abandoned);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(
+                    state.with_process_lock(&worker_initialized, Some(&worker_abandoned), || {
+                        Ok::<_, SecretError>(())
+                    }),
+                )
+                .unwrap();
+        });
+
+        assert!(matches!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .unwrap(),
+            Err(SecretError::Cancelled { .. })
+        ));
+        drop(held);
+        worker.join().unwrap();
     }
 
     #[tokio::test]

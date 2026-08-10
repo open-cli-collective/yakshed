@@ -1310,6 +1310,86 @@ async fn same_reference_operations_serialize_and_second_observes_first_completio
 }
 
 #[tokio::test]
+async fn pre_dispatch_mutation_cancellation_is_certain_and_does_not_call_backend() {
+    let backend = Arc::new(SequencedBackend {
+        calls: AtomicUsize::new(0),
+        first_completed: AtomicBool::new(false),
+        first_started: Semaphore::new(0),
+        release_first: Semaphore::new(0),
+    });
+    let connections = Arc::new(vec![connection(
+        CONNECTION_A,
+        "connection-a",
+        vec![secret_binding("provider.api_key", "sequence", "shared/key")],
+    )]);
+    let audit = Arc::new(AuditLog::default());
+    let broker = Arc::new(
+        CredentialBroker::new(
+            [(
+                backend_id("sequence"),
+                SecretBackendHandle {
+                    resolver: backend.clone(),
+                    administrator: Some(backend.clone()),
+                },
+            )],
+            &connections,
+            audit.clone(),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    );
+    let first = {
+        let broker = broker.clone();
+        let connections = connections.clone();
+        tokio::spawn(async move {
+            broker
+                .put(
+                    &connections,
+                    &connections[0].credentials[0],
+                    &context(CONNECTION_A, "provider.api_key", "request-first"),
+                    &SecretString::from("first-canary"),
+                    PutSecretOptions::NO_OVERWRITE,
+                    &BrokerCancellation::default(),
+                )
+                .await
+        })
+    };
+    backend.first_started.acquire().await.unwrap().forget();
+
+    let cancellation = BrokerCancellation::default();
+    let second = {
+        let broker = broker.clone();
+        let connections = connections.clone();
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            broker
+                .put(
+                    &connections,
+                    &connections[0].credentials[0],
+                    &context(CONNECTION_A, "provider.api_key", "request-second"),
+                    &SecretString::from("second-canary"),
+                    PutSecretOptions::OVERWRITE,
+                    &cancellation,
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    cancellation.cancel();
+    assert!(matches!(
+        second.await.unwrap(),
+        Err(SecretError::Cancelled { .. })
+    ));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert!(audit.0.lock().unwrap().iter().any(|event| {
+        event.request_id == OperationId::new("request-second").unwrap()
+            && event.outcome == yakshed_secrets::SecretAuditOutcome::Cancelled
+    }));
+    backend.release_first.add_permits(1);
+    assert_eq!(first.await.unwrap().unwrap(), PutSecretOutcome::Written);
+}
+
+#[tokio::test]
 async fn connection_and_slot_namespaces_support_lifecycle_and_restart() {
     let connections = vec![
         connection(

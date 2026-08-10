@@ -591,9 +591,10 @@ filesystem security state. The direct parent and store file must be owned by the
 are revalidated for type, mode, owner, and path identity before reads.
 
 Removing or resetting a backend's config intentionally retains its plaintext file. While YakShed is running, purge through
-the backend's locked purge operation, which removes both the store and its `.lock` sidecar and syncs the parent directory.
-Manual file deletion is safe only after every backend instance has stopped. Re-adding the same backend ID and path restores
-retained values unless the store was explicitly purged.
+the backend's locked purge operation, which removes only the store and syncs the parent directory. The zero-length `.lock`
+sidecar is persistent coordination state and survives purge, preventing lock-generation splits for queued contenders. Manual
+file deletion is safe only after every backend instance has stopped. Re-adding the same backend ID and path restores retained
+values unless the store was explicitly purged.
 
 The future development launch script must pass `--features dev-secrets`, mirroring Retune's `build-install.sh` pattern.
 

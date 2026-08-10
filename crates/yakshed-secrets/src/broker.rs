@@ -258,8 +258,11 @@ impl CredentialBroker {
             return Err(SecretError::Cancelled { backend });
         }
         let lock = self.locks.get(reference);
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let worker_dispatched = Arc::clone(&dispatched);
         let work = async {
             let _guard = lock.lock().await;
+            worker_dispatched.store(true, Ordering::Release);
             action().await
         };
         let result = tokio::select! {
@@ -268,6 +271,7 @@ impl CredentialBroker {
             result = tokio::time::timeout(self.timeout, work) => result.unwrap_or_else(|_| Err(SecretError::TimedOut { backend: backend.clone() })),
         };
         let result = if matches!(operation, SecretOperation::Put | SecretOperation::Delete)
+            && dispatched.load(Ordering::Acquire)
             && matches!(
                 &result,
                 Err(SecretError::TimedOut { .. } | SecretError::Cancelled { .. })
