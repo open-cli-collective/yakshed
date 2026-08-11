@@ -49,6 +49,8 @@ struct MockPort {
     fail_response: AtomicBool,
     fail_reconnect: AtomicBool,
     fail_lookup: AtomicBool,
+    block_start: AtomicBool,
+    start_release: Notify,
     stream_failure: Notify,
 }
 
@@ -91,6 +93,8 @@ impl MockPort {
             fail_response: AtomicBool::new(false),
             fail_reconnect: AtomicBool::new(false),
             fail_lookup: AtomicBool::new(false),
+            block_start: AtomicBool::new(false),
+            start_release: Notify::new(),
             stream_failure: Notify::new(),
         })
     }
@@ -110,6 +114,14 @@ impl MockPort {
 
     fn fail_next_lookup(&self) {
         self.fail_lookup.store(true, Ordering::SeqCst);
+    }
+
+    fn block_next_start(&self) {
+        self.block_start.store(true, Ordering::SeqCst);
+    }
+
+    fn release_start(&self) {
+        self.start_release.notify_one();
     }
 
     fn run_ref(run: &ProviderRunHandle) -> ProviderRunRef {
@@ -137,6 +149,9 @@ impl RunHarness for MockPort {
         correlation_id: RunId,
         input: String,
     ) -> Result<ProviderRunRef, HarnessPortError> {
+        if self.block_start.swap(false, Ordering::SeqCst) {
+            self.start_release.notified().await;
+        }
         if let Some(run) = self.correlations.lock().await.get(&correlation_id).cloned() {
             return Ok(run);
         }
@@ -818,7 +833,16 @@ async fn event_stream_failure_terminalizes_routes_and_next_run_restarts_pump() {
 #[tokio::test]
 async fn uncertain_start_reconciles_by_correlation_without_duplicate_run() {
     let context = TestContext::with_options(
-        vec![MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete)],
+        vec![
+            MockRunPlan::new(vec![
+                MockScriptStep::message_completed("before reconciliation"),
+                MockScriptStep::approval(
+                    "hold-after-message".parse().unwrap(),
+                    "hold after message",
+                ),
+            ])
+            .with_fault(MockHarnessFault::DelayApproval),
+        ],
         false,
         true,
     )
@@ -851,6 +875,7 @@ async fn uncertain_start_reconciles_by_correlation_without_duplicate_run() {
     let run = context.store.get_run(run_id).await.unwrap();
     assert_eq!(run.status, RunStatus::OutcomeUnknown);
     assert!(run.provider_id.is_none());
+    tokio::time::sleep(Duration::from_millis(20)).await;
     context.harness.fail_next_lookup();
     assert!(matches!(
         context.supervisor.reconcile_run(run_id).await,
@@ -859,12 +884,93 @@ async fn uncertain_start_reconciles_by_correlation_without_duplicate_run() {
     let reconciled = context.supervisor.reconcile_run(run_id).await.unwrap();
     assert_eq!(reconciled.status, RunStatus::Running);
     assert!(reconciled.provider_id.is_some());
+    let timeline = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = context
+                .store
+                .list_timeline_page(ListTimeline {
+                    run_id,
+                    after: None,
+                    limit: 20,
+                })
+                .await
+                .unwrap();
+            if page
+                .items
+                .iter()
+                .any(|item| item.body == "before reconciliation")
+            {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        timeline
+            .items
+            .iter()
+            .any(|item| item.body == "before reconciliation")
+    );
     context
         .supervisor
         .steer(run_id, "after reconcile".to_owned())
         .await
         .unwrap();
     assert_eq!(context.harness.correlations.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_start_caller_leaves_owned_operation_recoverable() {
+    let context =
+        TestContext::new(MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete))
+            .await;
+    context.harness.block_next_start();
+    let supervisor = context.supervisor.clone();
+    let work_item_id = context.work_item_id;
+    let caller = tokio::spawn(async move {
+        supervisor
+            .start_run(work_item_id, connection_id(), "blocked".to_owned())
+            .await
+    });
+    let run_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let page = context
+                .store
+                .list_runs_for_work_item(context.work_item_id, None, 10)
+                .await
+                .unwrap();
+            if let Some(run) = page
+                .items
+                .into_iter()
+                .find(|run| run.status == RunStatus::Starting)
+            {
+                break run.id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    caller.abort();
+    context.harness.release_start();
+    context.wait_for_status(run_id, RunStatus::Running).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if context
+                .supervisor
+                .steer(run_id, "still owned".to_owned())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1075,6 +1181,43 @@ async fn manual_reconcile_after_failed_startup_reconnect_restores_controls() {
     restarted.reconcile_run(run_id).await.unwrap();
     restarted
         .steer(run_id, "reattached".to_owned())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failed_request_restore_keeps_run_recoverable() {
+    let context =
+        TestContext::new(MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete))
+            .await;
+    let run_id = context.start().await;
+    context
+        .store
+        .transition_run(TransitionRun {
+            run_id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Disconnected,
+            provider_id: None,
+            occurred_at: FixedClock.now(),
+            audit_event_id: SystemIdGenerator.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    context.store.fail_next_pending_input_read().await.unwrap();
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    restarted.ready().await;
+    assert_eq!(
+        context.store.get_run(run_id).await.unwrap().status,
+        RunStatus::Disconnected
+    );
+    restarted.reconcile_run(run_id).await.unwrap();
+    restarted
+        .steer(run_id, "recovered".to_owned())
         .await
         .unwrap();
 }

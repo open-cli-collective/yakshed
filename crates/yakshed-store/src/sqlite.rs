@@ -16,14 +16,14 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use yakshed_application::{
     AppStore, ApprovalPage, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateProject,
     CreateRun, CreateWorkItem, GetStreamCursor, IdGenerator, ListTimeline, ListWorkItems,
-    PendingApproval, ProjectPage, RunPage, StoreError, StreamCursorState, TimelineBatch,
-    TimelinePage, TransitionRun, WorkItemPage,
+    PendingApproval, PendingUserInputPage, PendingUserInputSnapshot, ProjectPage, RunPage,
+    StoreError, StreamCursorState, TimelineBatch, TimelinePage, TransitionRun, WorkItemPage,
 };
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ConnectionId,
     DataRevision, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus,
-    StreamCursor, TimelineBatchId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
-    WorkItemId, WorkItemSnapshot, WorkItemStatus,
+    StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision,
+    UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
 };
 
 use crate::AppPaths;
@@ -231,6 +231,8 @@ struct Worker {
     fail_transition_after_update: bool,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_next_append: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_pending_input_read: bool,
 }
 
 /// Async facade over the dedicated SQLite worker.
@@ -259,6 +261,8 @@ impl SqliteStore {
                             fail_transition_after_update: false,
                             #[cfg(any(test, feature = "test-hooks"))]
                             fail_next_append: false,
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            fail_next_pending_input_read: false,
                         },
                         receiver,
                     );
@@ -353,6 +357,15 @@ impl SqliteStore {
     pub async fn fail_next_transition_after_update(&self) -> Result<(), StoreError> {
         self.call(|worker| {
             worker.fail_transition_after_update = true;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn fail_next_pending_input_read(&self) -> Result<(), StoreError> {
+        self.call(|worker| {
+            worker.fail_next_pending_input_read = true;
             Ok(())
         })
         .await
@@ -1831,6 +1844,68 @@ impl AppStore for SqliteStore {
                 None
             };
             Ok(TimelinePage { items, next_after })
+        })
+        .await
+    }
+
+    async fn list_pending_user_inputs_for_run(
+        &self,
+        run_id: RunId,
+        after: Option<TimelineItemId>,
+        limit: u32,
+    ) -> Result<PendingUserInputPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            #[cfg(any(test, feature = "test-hooks"))]
+            if std::mem::take(&mut worker.fail_next_pending_input_read) {
+                return Err(StoreError::Backend(
+                    "injected pending-input read failure".to_owned(),
+                ));
+            }
+            let mut statement = worker
+                .connection
+                .prepare(
+                    "SELECT request.id, request.run_id, request.body,
+                            request.provider_namespace, request.provider_item_id
+                     FROM timeline_items request
+                     WHERE request.run_id = ?1
+                       AND request.kind = 'user_input_requested'
+                       AND (?2 IS NULL OR request.id > ?2)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM timeline_items response
+                           WHERE response.run_id = request.run_id
+                             AND response.kind = 'user_input_responded'
+                             AND response.body = request.id
+                       )
+                     ORDER BY request.id
+                     LIMIT ?3",
+                )
+                .map_err(map_database_error)?;
+            let after = after.map(|id| id.to_string());
+            let mut items = statement
+                .query_map(params![run_id.to_string(), after, fetch_limit], |row| {
+                    Ok(PendingUserInputSnapshot {
+                        id: parse_column(row, 0)?,
+                        run_id: parse_column(row, 1)?,
+                        prompt: row.get(2)?,
+                        provider_id: provider_id(row.get(3)?, row.get(4)?)?.ok_or_else(|| {
+                            rusqlite::Error::InvalidColumnType(
+                                3,
+                                "provider_namespace".to_owned(),
+                                rusqlite::types::Type::Null,
+                            )
+                        })?,
+                    })
+                })
+                .map_err(map_database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_database_error)?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after = has_more.then(|| items.last().map(|item| item.id)).flatten();
+            Ok(PendingUserInputPage { items, next_after })
         })
         .await
     }

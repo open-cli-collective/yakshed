@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -16,12 +16,13 @@ use yakshed_domain::{
 
 use crate::{
     AppStore, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateRun, IdGenerator,
-    ListTimeline, NewTimelineItem, PendingApproval, StoreError, TimelineBatch, TransitionRun,
+    NewTimelineItem, PendingApproval, StoreError, TimelineBatch, TransitionRun,
 };
 
 pub const APP_EVENT_CAPACITY: usize = 128;
 pub const DELTA_BATCH_CHUNKS: usize = 32;
 const ROUTE_CHANNEL_CAPACITY: usize = 64;
+const MAX_UNCERTAIN_STARTS: usize = 64;
 const STREAM_FAILURE_OPERATION: &str = "stream_disconnected";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -288,7 +289,9 @@ struct State {
     routes: HashMap<ProviderRunRef, mpsc::Sender<RunHarnessEvent>>,
     pending_events: HashMap<ProviderRunRef, Vec<RunHarnessEvent>>,
     pending_overflow: bool,
-    start_in_progress: bool,
+    start_in_progress: Option<RunId>,
+    uncertain_starts: HashMap<RunId, PendingStart>,
+    uncertain_start_order: VecDeque<RunId>,
     runs: HashMap<RunId, ProviderRunRef>,
     runs_by_provider: HashMap<ProviderRunRef, RunId>,
     work_items: HashMap<RunId, WorkItemId>,
@@ -298,16 +301,53 @@ struct State {
     uncertain_runs: HashSet<RunId>,
 }
 
+#[derive(Default)]
+struct PendingStart {
+    events: HashMap<ProviderRunRef, Vec<RunHarnessEvent>>,
+    overflow: bool,
+}
+
+#[derive(Default)]
+struct RestoredRequests {
+    approvals: HashMap<ApprovalRequestId, (RunId, ProviderRequestRef)>,
+    user_inputs: HashMap<UserInputRequestId, (RunId, ProviderRequestRef)>,
+    approval_responses: HashMap<ApprovalRequestId, ApprovalDecision>,
+}
+
 impl State {
     fn buffer_handshake_event(&mut self, run: ProviderRunRef, event: RunHarnessEvent) {
-        if !self.start_in_progress {
+        if self.start_in_progress.is_some() {
+            let pending_count = self.pending_events.values().map(Vec::len).sum::<usize>();
+            if pending_count < ROUTE_CHANNEL_CAPACITY {
+                self.pending_events.entry(run).or_default().push(event);
+            } else {
+                self.pending_overflow = true;
+            }
             return;
         }
-        let pending_count = self.pending_events.values().map(Vec::len).sum::<usize>();
-        if pending_count < ROUTE_CHANNEL_CAPACITY {
-            self.pending_events.entry(run).or_default().push(event);
-        } else {
-            self.pending_overflow = true;
+        if let Some(pending) = self
+            .uncertain_starts
+            .values_mut()
+            .find(|pending| pending.events.contains_key(&run))
+        {
+            let count = pending.events.values().map(Vec::len).sum::<usize>();
+            if count < ROUTE_CHANNEL_CAPACITY {
+                pending.events.entry(run).or_default().push(event);
+            } else {
+                pending.overflow = true;
+            }
+        } else if let Some(correlation_id) = self
+            .uncertain_start_order
+            .iter()
+            .find(|id| {
+                self.uncertain_starts
+                    .get(id)
+                    .is_some_and(|pending| pending.events.is_empty())
+            })
+            .copied()
+            && let Some(pending) = self.uncertain_starts.get_mut(&correlation_id)
+        {
+            pending.events.insert(run, vec![event]);
         }
     }
 }
@@ -347,7 +387,27 @@ impl RunSupervisor {
         self.0.events.subscribe()
     }
 
+    pub async fn ready(&self) {
+        self.0.await_startup().await;
+    }
+
     pub async fn start_run(
+        &self,
+        work_item_id: WorkItemId,
+        connection_id: ConnectionId,
+        input: String,
+    ) -> Result<RunSnapshot, RunOrchestrationError> {
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            supervisor
+                .start_run_owned(work_item_id, connection_id, input)
+                .await
+        })
+        .await
+        .map_err(|_| HarnessPortError::Runtime("start task stopped".to_owned()))?
+    }
+
+    async fn start_run_owned(
         &self,
         work_item_id: WorkItemId,
         connection_id: ConnectionId,
@@ -386,15 +446,15 @@ impl RunSupervisor {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.start_in_progress = true;
+            state.start_in_progress = Some(run_id);
             state.pending_events.clear();
             state.pending_overflow = false;
         }
+        self.0.ensure_event_pump();
         let provider_run = match self.0.harness.start_run(connection_id, run_id, input).await {
             Ok(handle) => handle,
             Err(error @ HarnessPortError::OutcomeUnknown { operation }) => {
-                self.0.finish_start_handshake();
-                self.0.close_run(run_id).await;
+                self.0.retain_unknown_handshake(run_id);
                 self.0
                     .transition(run_id, RunStatus::Starting, RunStatus::OutcomeUnknown, None)
                     .await?;
@@ -444,7 +504,7 @@ impl RunSupervisor {
             state.runs.insert(run_id, provider_run.clone());
             state.runs_by_provider.insert(provider_run.clone(), run_id);
             state.routes.insert(provider_run.clone(), sender.clone());
-            state.start_in_progress = false;
+            state.start_in_progress = None;
             let pending = state
                 .pending_events
                 .remove(&provider_run)
@@ -658,9 +718,30 @@ impl Inner {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.start_in_progress = false;
+        state.start_in_progress = None;
         state.pending_events.clear();
         state.pending_overflow = false;
+    }
+
+    fn retain_unknown_handshake(&self, run_id: RunId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.start_in_progress = None;
+        let events = std::mem::take(&mut state.pending_events);
+        let overflow = std::mem::take(&mut state.pending_overflow);
+        // Bound unresolved correlations globally; evicted runs remain durably OutcomeUnknown.
+        if state.uncertain_starts.len() >= MAX_UNCERTAIN_STARTS
+            && let Some(evicted) = state.uncertain_start_order.pop_front()
+        {
+            state.uncertain_starts.remove(&evicted);
+        }
+        state
+            .uncertain_starts
+            .insert(run_id, PendingStart { events, overflow });
+        state.uncertain_start_order.push_back(run_id);
+        state.uncertain_runs.insert(run_id);
     }
 
     async fn retain_uncertain_start(
@@ -674,7 +755,7 @@ impl Inner {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.start_in_progress = false;
+            state.start_in_progress = None;
             let pending = state
                 .pending_events
                 .remove(provider_run)
@@ -692,7 +773,8 @@ impl Inner {
                 Some(provider_run.provider_id()),
             )
             .await;
-        self.attach_route(run_id, work_item_id, provider_run.clone())
+        let _ = self
+            .attach_route(run_id, work_item_id, provider_run.clone())
             .await;
         if let Some(route) = self
             .state
@@ -784,11 +866,25 @@ impl Inner {
         run_id: RunId,
         work_item_id: WorkItemId,
         provider_run: ProviderRunRef,
-    ) {
-        let connection_id = match self.store.get_run(run_id).await {
-            Ok(run) => run.connection_id,
-            Err(_) => return,
-        };
+    ) -> Result<(), StoreError> {
+        let connection_id = self.store.get_run(run_id).await?.connection_id;
+        let receiver = self.prepare_route(
+            run_id,
+            work_item_id,
+            provider_run.clone(),
+            RestoredRequests::default(),
+        );
+        self.activate_route(run_id, work_item_id, connection_id, provider_run, receiver);
+        Ok(())
+    }
+
+    fn prepare_route(
+        self: &Arc<Self>,
+        run_id: RunId,
+        work_item_id: WorkItemId,
+        provider_run: ProviderRunRef,
+        restored: RestoredRequests,
+    ) -> mpsc::Receiver<RunHarnessEvent> {
         let (sender, receiver) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
         {
             let mut state = self
@@ -799,13 +895,33 @@ impl Inner {
             state.runs_by_provider.insert(provider_run.clone(), run_id);
             state.work_items.insert(run_id, work_item_id);
             state.routes.insert(provider_run.clone(), sender);
+            state.approvals.extend(restored.approvals);
+            state.user_inputs.extend(restored.user_inputs);
+            state.approval_responses.extend(restored.approval_responses);
+            state.uncertain_runs.insert(run_id);
         }
+        receiver
+    }
+
+    fn activate_route(
+        self: &Arc<Self>,
+        run_id: RunId,
+        work_item_id: WorkItemId,
+        connection_id: ConnectionId,
+        provider_run: ProviderRunRef,
+        receiver: mpsc::Receiver<RunHarnessEvent>,
+    ) {
         let inner = Arc::clone(self);
         tokio::spawn(async move {
             inner
                 .consume_run(run_id, work_item_id, connection_id, provider_run, receiver)
                 .await;
         });
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .uncertain_runs
+            .remove(&run_id);
         self.ensure_event_pump();
     }
 
@@ -814,17 +930,6 @@ impl Inner {
         run: RunSnapshot,
         provider_run: ProviderRunRef,
     ) -> Result<RunSnapshot, RunOrchestrationError> {
-        let run = if run.status == RunStatus::Running && run.provider_id.is_some() {
-            run
-        } else {
-            self.transition(
-                run.id,
-                run.status,
-                RunStatus::Running,
-                Some(provider_run.provider_id()),
-            )
-            .await?
-        };
         let attached = self
             .state
             .lock()
@@ -832,10 +937,64 @@ impl Inner {
             .runs
             .contains_key(&run.id);
         if !attached {
-            self.attach_route(run.id, run.work_item_id, provider_run.clone())
+            let restored = match self.load_requests(&run, &provider_run).await {
+                Ok(restored) => restored,
+                Err(error) => {
+                    if run.status == RunStatus::Running {
+                        let _ = self
+                            .transition(run.id, RunStatus::Running, RunStatus::Disconnected, None)
+                            .await;
+                    }
+                    return Err(error.into());
+                }
+            };
+            let receiver =
+                self.prepare_route(run.id, run.work_item_id, provider_run.clone(), restored);
+            let transitioned = run.status != RunStatus::Running || run.provider_id.is_none();
+            let run = if transitioned {
+                match self
+                    .store
+                    .transition_run(TransitionRun {
+                        run_id: run.id,
+                        expected_current: run.status,
+                        target: RunStatus::Running,
+                        provider_id: Some(provider_run.provider_id()),
+                        occurred_at: self.clock.now(),
+                        audit_event_id: self.ids.next_audit_event_id(),
+                    })
+                    .await
+                {
+                    Ok(run) => run,
+                    Err(error) => {
+                        drop(receiver);
+                        self.remove_route_state(run.id, &provider_run);
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                run
+            };
+            self.activate_route(
+                run.id,
+                run.work_item_id,
+                run.connection_id,
+                provider_run.clone(),
+                receiver,
+            );
+            if transitioned {
+                self.publish(
+                    run.work_item_id,
+                    AppEventKind::RunStatusChanged {
+                        run_id: run.id,
+                        status: RunStatus::Running,
+                    },
+                )
                 .await;
+            }
+            self.deliver_uncertain_start_events(&run, &provider_run)
+                .await;
+            return Ok(run);
         }
-        self.restore_requests(&run, &provider_run).await;
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -844,17 +1003,39 @@ impl Inner {
         Ok(run)
     }
 
-    async fn restore_requests(&self, run: &RunSnapshot, provider_run: &ProviderRunRef) {
+    fn remove_route_state(&self, run_id: RunId, provider_run: &ProviderRunRef) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.routes.remove(provider_run);
+        state.runs_by_provider.remove(provider_run);
+        state.runs.remove(&run_id);
+        state.work_items.remove(&run_id);
+        state
+            .approvals
+            .retain(|_, (pending_run, _)| *pending_run != run_id);
+        state
+            .user_inputs
+            .retain(|_, (pending_run, _)| *pending_run != run_id);
+        let active_approvals: HashSet<_> = state.approvals.keys().copied().collect();
+        state
+            .approval_responses
+            .retain(|approval_id, _| active_approvals.contains(approval_id));
+    }
+
+    async fn load_requests(
+        &self,
+        run: &RunSnapshot,
+        provider_run: &ProviderRunRef,
+    ) -> Result<RestoredRequests, StoreError> {
+        let mut restored = RestoredRequests::default();
         let mut after = None;
         loop {
-            let page = match self.store.list_approvals_for_run(run.id, after, 200).await {
-                Ok(page) => page,
-                Err(_) => break,
-            };
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let page = self
+                .store
+                .list_approvals_for_run(run.id, after, 200)
+                .await?;
             for approval in page.items {
                 if matches!(
                     approval.status,
@@ -864,7 +1045,7 @@ impl Inner {
                     .value()
                     .strip_prefix(&format!("{}/", provider_run.native_id()))
                 {
-                    state.approvals.insert(
+                    restored.approvals.insert(
                         approval.id,
                         (
                             run.id,
@@ -875,11 +1056,10 @@ impl Inner {
                         ),
                     );
                     if let ApprovalStatus::Responding { decision } = approval.status {
-                        state.approval_responses.insert(approval.id, decision);
+                        restored.approval_responses.insert(approval.id, decision);
                     }
                 }
             }
-            drop(state);
             after = page.next_after;
             if after.is_none() {
                 break;
@@ -887,43 +1067,27 @@ impl Inner {
         }
 
         let mut after = None;
-        let mut pending = HashMap::new();
         loop {
-            let page = match self
+            let page = self
                 .store
-                .list_timeline_page(ListTimeline {
-                    run_id: run.id,
-                    after,
-                    limit: 200,
-                })
-                .await
-            {
-                Ok(page) => page,
-                Err(_) => break,
-            };
+                .list_pending_user_inputs_for_run(run.id, after, 200)
+                .await?;
             for item in page.items {
-                match item.kind.as_str() {
-                    "user_input_requested" => {
-                        if let Some(provider_id) = item.provider_id
-                            && let Some(native_id) = provider_id
-                                .value()
-                                .strip_prefix(&format!("{}/", provider_run.native_id()))
-                        {
-                            pending.insert(
-                                item.id,
-                                ProviderRequestRef {
-                                    run: provider_run.clone(),
-                                    native_id: native_id.to_owned(),
-                                },
-                            );
-                        }
-                    }
-                    "user_input_responded" => {
-                        if let Ok(request_id) = item.body.parse() {
-                            pending.remove(&request_id);
-                        }
-                    }
-                    _ => {}
+                if let Some(native_id) = item
+                    .provider_id
+                    .value()
+                    .strip_prefix(&format!("{}/", provider_run.native_id()))
+                {
+                    restored.user_inputs.insert(
+                        item.id,
+                        (
+                            run.id,
+                            ProviderRequestRef {
+                                run: provider_run.clone(),
+                                native_id: native_id.to_owned(),
+                            },
+                        ),
+                    );
                 }
             }
             after = page.next_after;
@@ -931,15 +1095,47 @@ impl Inner {
                 break;
             }
         }
-        let mut state = self
+        Ok(restored)
+    }
+
+    async fn deliver_uncertain_start_events(
+        &self,
+        run: &RunSnapshot,
+        provider_run: &ProviderRunRef,
+    ) {
+        let pending = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.uncertain_start_order.retain(|id| *id != run.id);
+            state.uncertain_starts.remove(&run.id)
+        };
+        let Some(mut pending) = pending else {
+            return;
+        };
+        let events = pending.events.remove(provider_run).unwrap_or_default();
+        let route = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.user_inputs.extend(
-            pending
-                .into_iter()
-                .map(|(id, request)| (id, (run.id, request))),
-        );
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .routes
+            .get(provider_run)
+            .cloned();
+        let Some(route) = route else {
+            self.handle_route_overflow(run.id, run.work_item_id).await;
+            return;
+        };
+        if pending.overflow {
+            self.handle_route_overflow(run.id, run.work_item_id).await;
+            return;
+        }
+        for event in events {
+            if route.try_send(event).is_err() {
+                self.handle_route_overflow(run.id, run.work_item_id).await;
+                return;
+            }
+        }
     }
 
     fn ensure_event_pump(self: &Arc<Self>) {
@@ -1060,7 +1256,9 @@ impl Inner {
             state.routes.clear();
             state.pending_events.clear();
             state.pending_overflow = false;
-            state.start_in_progress = false;
+            state.start_in_progress = None;
+            state.uncertain_starts.clear();
+            state.uncertain_start_order.clear();
             state.approvals.clear();
             state.user_inputs.clear();
             state.approval_responses.clear();
@@ -1112,6 +1310,8 @@ impl Inner {
             .approval_responses
             .retain(|approval_id, _| active_approvals.contains(approval_id));
         state.uncertain_runs.remove(&run_id);
+        state.uncertain_starts.remove(&run_id);
+        state.uncertain_start_order.retain(|id| *id != run_id);
         if let Some(provider) = provider {
             state.pending_events.remove(&provider);
         }
@@ -1544,7 +1744,7 @@ mod routing_tests {
         }
         assert!(state.pending_events.is_empty());
 
-        state.start_in_progress = true;
+        state.start_in_progress = Some(RunId::new_v7());
         for index in 0..100 {
             let run = ProviderRunRef::new("mock", format!("unknown-{index}")).unwrap();
             state.buffer_handshake_event(run.clone(), RunHarnessEvent::RunAccepted { run });

@@ -650,6 +650,20 @@ pub struct TimelinePage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUserInputSnapshot {
+    pub id: TimelineItemId,
+    pub run_id: RunId,
+    pub prompt: String,
+    pub provider_id: NamespacedProviderId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUserInputPage {
+    pub items: Vec<PendingUserInputSnapshot>,
+    pub next_after: Option<TimelineItemId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetStreamCursor {
     pub connection_id: ConnectionId,
     pub run_id: RunId,
@@ -754,6 +768,12 @@ pub trait AppStore: Send + Sync {
         query: GetStreamCursor,
     ) -> Result<Option<StreamCursorState>, StoreError>;
     async fn list_timeline_page(&self, query: ListTimeline) -> Result<TimelinePage, StoreError>;
+    async fn list_pending_user_inputs_for_run(
+        &self,
+        run_id: RunId,
+        after: Option<TimelineItemId>,
+        limit: u32,
+    ) -> Result<PendingUserInputPage, StoreError>;
     async fn record_pending_approval(
         &self,
         approval: PendingApproval,
