@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "YakShed",
+  "version": "0.1.0",
+  "identifier": "dev.yakshed.desktop",
+  "build": {
+    "frontendDist": "frontend"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "YakShed",
+        "devtools": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; script-src 'self'",
+      "capabilities": [
+        {
+          "identifier": "main",
+          "windows": ["main"],
+          "permissions": [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "allow-create-project",
+            "allow-create-work-item",
+            "allow-list-work-items",
+            "allow-get-work-item-snapshot",
+            "allow-get-work-item-snapshot-page",
+            "allow-get-work-item-timeline-page",
+            "allow-get-work-item-timeline-page-at-revision",
+            "allow-get-run-approval-page",
+            "allow-get-pending-user-input-page",
+            "allow-start-run",
+            "allow-steer-run",
+            "allow-interrupt-run",
+            "allow-reconcile-run",
+            "allow-resolve-approval",
+            "allow-respond-user-input",
+            "allow-connection-put",
+            "allow-connection-get",
+            "allow-list-connections",
+            "allow-set-connection-credential",
+            "allow-list-artifacts",
+            "allow-open-artifact",
+            "allow-clear-cache"
+          ]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../../design/YakShed-UI/uploads/pasted-1786202555766-0.png"]
+  }
+}

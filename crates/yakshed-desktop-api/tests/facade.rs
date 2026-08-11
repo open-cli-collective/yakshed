@@ -1006,6 +1006,7 @@ impl TestFixture {
             artifacts: self.artifact_port.clone(),
         })
         .await
+        .unwrap()
     }
 
     async fn api_for_plan(&self, plan: MockRunPlan) -> DesktopApi {
@@ -1022,6 +1023,7 @@ impl TestFixture {
             artifacts: self.artifact_port.clone(),
         })
         .await
+        .unwrap()
     }
 
     async fn api_for_plan_with_unknown_interrupt(
@@ -1047,6 +1049,7 @@ impl TestFixture {
             artifacts: self.artifact_port.clone(),
         })
         .await
+        .unwrap()
     }
 
     fn slot(&self) -> CredentialSlot {

@@ -4,20 +4,27 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+pub use yakshed_application::RunOrchestrationError;
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
-    Clock, ConfigPort, ConfigPortError, ConfigRevision, CreateProject, CreateWorkItem, IdGenerator,
-    ListWorkItems, OpenArtifactCommand, OpenArtifactPayload, PublicConnection,
-    PublicCredentialBinding, PublicCredentialSource, PutConnectionCommand, RunHarness,
-    RunOrchestrationError, RunSupervisor, SecretPort, SecretPortError,
+    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem, IdGenerator, ListWorkItems,
+    OpenArtifactCommand, OpenArtifactPayload, PublicCredentialBinding, PublicCredentialSource,
+    PutConnectionCommand, RunHarness, RunSupervisor, SecretPort, SecretPortError,
     SetConnectionCredentialCommand, StoreError,
 };
-use yakshed_domain::{
-    ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId, ArtifactKind, Connection,
-    ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot, ProjectId, RunId,
-    RunSnapshot, RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemId,
-    TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
+pub use yakshed_application::{ConfigRevision, PublicConnection, UserInputRequestId};
+pub use yakshed_domain::{
+    ApprovalRequestId, ArtifactId, ConnectionId, CredentialSlot, ProjectId, RunId, TimelineItemId,
+    TimelineRevision, WorkItemId,
 };
+use yakshed_domain::{
+    ApprovalSnapshot, ApprovalStatus, ArtifactKind, Connection, CredentialBinding,
+    CredentialBindingRecord, RunSnapshot, RunStatus, SecretBackendId, SecretLocator,
+    SecretReference, TimelineItemSnapshot, UtcTimestamp, WorkItemSnapshot,
+};
+
+mod ipc;
+pub use ipc::{ApprovalDecisionInput, ConnectionInput};
 
 pub const APP_EVENT_CAPACITY: usize = 32;
 const MAX_OPEN_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
@@ -41,6 +48,36 @@ pub enum DesktopErrorCode {
     PersistenceError,
     OutcomeUnknown,
     InternalError,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupErrorCode {
+    PersistenceError,
+    InternalError,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StartupError {
+    pub code: StartupErrorCode,
+    pub message: &'static str,
+}
+
+impl StartupError {
+    const fn new(code: StartupErrorCode, message: &'static str) -> Self {
+        Self { code, message }
+    }
+
+    pub fn persistence() -> Self {
+        Self::new(
+            StartupErrorCode::PersistenceError,
+            "persistence startup failed",
+        )
+    }
+
+    pub fn internal() -> Self {
+        Self::new(StartupErrorCode::InternalError, "desktop startup failed")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -323,7 +360,7 @@ pub struct DesktopApi {
 
 impl DesktopApi {
     /// Drops oldest events on overflow; consumers recovering missed revisions must call snapshot APIs.
-    pub async fn new(ports: ApiPorts) -> Self {
+    pub async fn new(ports: ApiPorts) -> std::result::Result<Self, StartupError> {
         let (events, _) = broadcast::channel(APP_EVENT_CAPACITY);
         let run_supervisor = Arc::new(RunSupervisor::new(
             ports.store.clone(),
@@ -331,7 +368,10 @@ impl DesktopApi {
             ports.clock,
             ports.ids,
         ));
-        run_supervisor.ready().await;
+        run_supervisor
+            .ready()
+            .await
+            .map_err(Self::map_startup_error)?;
         let mut source = run_supervisor.subscribe();
         let relay = events.clone();
         tokio::spawn(async move {
@@ -348,7 +388,7 @@ impl DesktopApi {
             }
         });
 
-        Self {
+        Ok(Self {
             store: ports.store,
             run_supervisor,
             config: ports.config,
@@ -356,6 +396,13 @@ impl DesktopApi {
             cache: ports.cache,
             artifacts: ports.artifacts,
             events,
+        })
+    }
+
+    fn map_startup_error(error: RunOrchestrationError) -> StartupError {
+        match error {
+            RunOrchestrationError::Store(_) => StartupError::persistence(),
+            _ => StartupError::internal(),
         }
     }
 

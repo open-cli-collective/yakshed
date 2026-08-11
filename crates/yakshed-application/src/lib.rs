@@ -705,7 +705,7 @@ pub struct ApprovalPage {
     pub next_after: Option<ApprovalRequestId>,
 }
 
-#[derive(Debug, ThisError)]
+#[derive(Clone, Debug, ThisError)]
 pub enum StoreError {
     #[error("{entity} not found: {id}")]
     NotFound { entity: &'static str, id: String },

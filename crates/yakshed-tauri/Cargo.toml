@@ -1,0 +1,28 @@
+[package]
+name = "yakshed-tauri"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+yakshed-desktop-api.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri = { workspace = true, features = ["test"] }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+tauri-build.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+provider-mock.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+yakshed-application.workspace = true
+yakshed-domain.workspace = true
+yakshed-harness.workspace = true
+yakshed-store.workspace = true
