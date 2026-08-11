@@ -476,10 +476,14 @@ pub struct WorkItemSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunStatus {
+    /// Run lifecycle is accepted but still pending a provider run handle.
+    Starting,
     Running,
     Completed,
     Failed,
     Interrupted,
+    Disconnected,
+    OutcomeUnknown,
 }
 
 impl RunStatus {
@@ -487,8 +491,25 @@ impl RunStatus {
         matches!(
             (self, target),
             (
+                Self::Starting,
+                Self::Running | Self::Interrupted | Self::Failed | Self::OutcomeUnknown,
+            ) | (
                 Self::Running,
-                Self::Completed | Self::Failed | Self::Interrupted
+                Self::Completed
+                    | Self::Failed
+                    | Self::Interrupted
+                    | Self::Disconnected
+                    | Self::OutcomeUnknown,
+            ) | (
+                Self::Disconnected,
+                Self::Running | Self::Interrupted | Self::OutcomeUnknown,
+            ) | (
+                Self::OutcomeUnknown,
+                Self::Running
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Interrupted
+                    | Self::Disconnected,
             )
         )
     }

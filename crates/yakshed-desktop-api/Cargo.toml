@@ -5,5 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
 yakshed-application.workspace = true
 yakshed-domain.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+async-trait.workspace = true
+provider-mock.workspace = true
+yakshed-harness.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true }
+yakshed-secrets = { workspace = true, features = ["dev-secrets"] }
+yakshed-store.workspace = true

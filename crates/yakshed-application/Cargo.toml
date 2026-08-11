@@ -6,9 +6,15 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+secrecy.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
 yakshed-domain.workspace = true
 
 [dev-dependencies]
+provider-mock.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
+yakshed-harness.workspace = true
+yakshed-store = { workspace = true, features = ["test-hooks"] }

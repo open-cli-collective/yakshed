@@ -376,10 +376,10 @@ async fn memory_backend_maps_faults_and_preserves_uncertain_write() {
         backend.resolve(&loc, &ctx).await,
         Err(SecretError::NotFound { .. })
     ));
-    backend.plan_faults([MemorySecretFault::LockedOrDenied]);
+    backend.plan_faults([MemorySecretFault::Denied]);
     assert!(matches!(
         backend.resolve(&loc, &ctx).await,
-        Err(SecretError::LockedOrDenied { .. })
+        Err(SecretError::Denied { .. })
     ));
     backend.plan_faults([MemorySecretFault::FailNextWrite]);
     assert!(matches!(
@@ -706,12 +706,12 @@ async fn broker_maps_required_failures_and_uncertain_write_reconciliation() {
             .await,
         Err(SecretError::AlreadyExists { .. })
     ));
-    backend.plan_faults([MemorySecretFault::LockedOrDenied]);
+    backend.plan_faults([MemorySecretFault::Denied]);
     assert!(matches!(
         broker
             .resolve(&connections, binding, &ctx, &BrokerCancellation::default())
             .await,
-        Err(SecretError::LockedOrDenied { .. })
+        Err(SecretError::Denied { .. })
     ));
     backend.plan_faults([MemorySecretFault::UncertainWrite]);
     assert!(matches!(

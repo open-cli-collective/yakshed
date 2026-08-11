@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+test-hooks = []
+
 [dependencies]
 async-trait.workspace = true
 atomic-write-file.workspace = true

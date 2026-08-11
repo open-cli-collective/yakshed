@@ -4,14 +4,20 @@ use std::path::Path;
 use std::{collections::HashSet, error::Error, fmt};
 
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error as ThisError;
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, AuditEventId, Connection, ConnectionId,
-    CredentialBinding, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
-    RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings, StreamCursor,
+    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactRecord,
+    AuditEventId, Connection, ConnectionId, CredentialBinding, CredentialSlot,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderStateRootId, RunId, RunSnapshot,
+    RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator, StreamCursor,
     TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
     WorkItemId, WorkItemSnapshot,
 };
+
+mod run_supervisor;
+
+pub use run_supervisor::*;
 
 /// Canonical non-secret application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -116,11 +122,23 @@ impl ConfigRevision {
     }
 }
 
+impl fmt::Display for ConfigRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Config plus the revision at which it was observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigSnapshot {
     pub revision: ConfigRevision,
     pub config: AppConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigConnectionSnapshot {
+    pub config_revision: ConfigRevision,
+    pub connection: PublicConnection,
 }
 
 /// Validated configuration mutations available to application callers.
@@ -300,6 +318,185 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> UtcTimestamp;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicCredentialBinding {
+    pub slot: CredentialSlot,
+    pub source: PublicCredentialSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicCredentialSource {
+    Delegated {
+        authority: String,
+    },
+    Secret {
+        backend: SecretBackendId,
+        locator: SecretLocator,
+    },
+    Disabled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicConnection {
+    pub id: ConnectionId,
+    pub name: String,
+    pub harness: String,
+    pub model_provider: String,
+    pub provider_state: ProviderStateRootId,
+    pub credentials: Vec<PublicCredentialBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicConnectionList {
+    pub config_revision: ConfigRevision,
+    pub connections: Vec<PublicConnection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PutConnectionCommand {
+    pub expected_config_revision: ConfigRevision,
+    pub connection: Connection,
+    pub ensure_memory_secret_backend: bool,
+}
+
+pub struct SetConnectionCredentialCommand {
+    pub connection_id: ConnectionId,
+    pub slot: CredentialSlot,
+    pub value: SecretValue,
+    pub overwrite: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretWriteOutcome {
+    pub overwritten: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenArtifactCommand {
+    pub artifact_id: ArtifactId,
+    pub max_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenArtifactPayload {
+    pub artifact: ArtifactRecord,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, ThisError)]
+pub enum ConfigPortError {
+    #[error("configuration is out of date: expected {expected}, actual {actual}")]
+    Conflict {
+        expected: ConfigRevision,
+        actual: ConfigRevision,
+    },
+    #[error("configuration value is invalid")]
+    Validation,
+    #[error("not found")]
+    NotFound,
+    #[error("unsupported operation")]
+    Unsupported,
+    #[error("configuration service unavailable")]
+    Unavailable,
+}
+
+#[derive(Debug, ThisError)]
+pub enum SecretPortError {
+    #[error("connection not found")]
+    ConnectionNotFound,
+    #[error("credential binding not found")]
+    BindingNotFound,
+    #[error("credential binding is not writeable")]
+    NotSecretBacked,
+    #[error("secret backend unavailable")]
+    BackendUnavailable,
+    #[error("secret backend returned locked")]
+    Locked,
+    #[error("secret backend denied access")]
+    Denied,
+    #[error("secret backend requires authentication")]
+    AuthenticationRequired,
+    #[error("secret already exists and overwrite is disabled")]
+    AlreadyExists,
+    #[error("secret write outcome is uncertain")]
+    UncertainWrite,
+    #[error("credential operation failed")]
+    Failed,
+}
+
+pub struct SecretValue {
+    value: SecretString,
+}
+
+impl SecretValue {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: SecretString::new(value.into().into()),
+        }
+    }
+
+    pub fn expose(&self) -> &str {
+        self.value.expose_secret()
+    }
+}
+
+#[derive(Debug, ThisError)]
+pub enum CachePortError {
+    #[error("cache operation failed")]
+    Failed,
+}
+
+#[derive(Debug, ThisError)]
+pub enum ArtifactPortError {
+    #[error("artifact not found")]
+    NotFound,
+    #[error("artifact exceeds requested size")]
+    TooLarge,
+    #[error("artifact operation failed")]
+    Failed,
+}
+
+#[async_trait]
+pub trait ConfigPort: Send + Sync {
+    async fn put_connection(
+        &self,
+        command: PutConnectionCommand,
+    ) -> Result<ConfigSnapshot, ConfigPortError>;
+
+    async fn get_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<ConfigConnectionSnapshot, ConfigPortError>;
+
+    async fn list_connections(&self) -> Result<PublicConnectionList, ConfigPortError>;
+}
+
+#[async_trait]
+pub trait SecretPort: Send + Sync {
+    async fn set_connection_credential(
+        &self,
+        command: SetConnectionCredentialCommand,
+    ) -> Result<SecretWriteOutcome, SecretPortError>;
+}
+
+#[async_trait]
+pub trait CachePort: Send + Sync {
+    async fn clear(&self) -> Result<(), CachePortError>;
+}
+
+#[async_trait]
+pub trait ArtifactPort: Send + Sync {
+    async fn list_artifacts_for_work_item(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> Result<Vec<ArtifactRecord>, ArtifactPortError>;
+
+    async fn open_artifact(
+        &self,
+        command: OpenArtifactCommand,
+    ) -> Result<OpenArtifactPayload, ArtifactPortError>;
+}
+
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -404,11 +601,12 @@ pub struct CreateRun {
     pub provider_run: Option<NamespacedProviderId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct TransitionRun {
     pub run_id: RunId,
     pub expected_current: RunStatus,
     pub target: RunStatus,
+    pub provider_id: Option<NamespacedProviderId>,
     pub occurred_at: UtcTimestamp,
     pub audit_event_id: AuditEventId,
 }
@@ -449,6 +647,20 @@ pub struct ListTimeline {
 pub struct TimelinePage {
     pub items: Vec<TimelineItemSnapshot>,
     pub next_after: Option<TimelineRevision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUserInputSnapshot {
+    pub id: TimelineItemId,
+    pub run_id: RunId,
+    pub prompt: String,
+    pub provider_id: NamespacedProviderId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUserInputPage {
+    pub items: Vec<PendingUserInputSnapshot>,
+    pub next_after: Option<TimelineItemId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -544,6 +756,11 @@ pub trait AppStore: Send + Sync {
         after: Option<RunId>,
         limit: u32,
     ) -> Result<RunPage, StoreError>;
+    async fn list_runs_needing_reconciliation(
+        &self,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError>;
     async fn append_timeline_batch(&self, batch: TimelineBatch)
     -> Result<StreamCursor, StoreError>;
     async fn get_stream_cursor(
@@ -551,6 +768,12 @@ pub trait AppStore: Send + Sync {
         query: GetStreamCursor,
     ) -> Result<Option<StreamCursorState>, StoreError>;
     async fn list_timeline_page(&self, query: ListTimeline) -> Result<TimelinePage, StoreError>;
+    async fn list_pending_user_inputs_for_run(
+        &self,
+        run_id: RunId,
+        after: Option<TimelineItemId>,
+        limit: u32,
+    ) -> Result<PendingUserInputPage, StoreError>;
     async fn record_pending_approval(
         &self,
         approval: PendingApproval,
