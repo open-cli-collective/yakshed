@@ -8,7 +8,7 @@ use yakshed_application::{
 };
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalStatus, AuditEventId, ConnectionId,
-    NamespacedProviderId, ProjectId, RunId, RunStatus, StreamCursor, TimelineBatchId,
+    NamespacedProviderId, ProjectId, RunId, RunSnapshot, RunStatus, StreamCursor, TimelineBatchId,
     TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
 };
 use yakshed_store::{AppPaths, ConfigStore, SqliteStore};
@@ -111,8 +111,26 @@ fn connection_b() -> ConnectionId {
     "0193f26e-7a72-7000-8000-00000000bbb2".parse().unwrap()
 }
 
+async fn accept_run(store: &SqliteStore, ids: &TestIds, run: RunSnapshot) -> RunSnapshot {
+    let provider_id = run
+        .provider_id
+        .clone()
+        .or_else(|| Some(NamespacedProviderId::new("mock", format!("run/{}", run.id)).unwrap()));
+    store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Starting,
+            target: RunStatus::Running,
+            provider_id,
+            occurred_at: UtcTimestamp::from_unix_millis(1),
+            audit_event_id: ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
-async fn empty_database_migrates_to_v1_before_ready() {
+async fn empty_database_migrates_to_v2_before_ready() {
     let context = Context::open().await;
     let database = context.paths.data_root.join("yakshed.sqlite3");
     context.store.shutdown().await.unwrap();
@@ -131,7 +149,7 @@ async fn empty_database_migrates_to_v1_before_ready() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        1
+        2
     );
     for table in [
         "projects",
@@ -154,6 +172,122 @@ async fn empty_database_migrates_to_v1_before_ready() {
             "missing {table}"
         );
     }
+}
+
+#[tokio::test]
+async fn v2_migration_preserves_run_children() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "migration".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    let run = accept_run(&context.store, &context.ids, run).await;
+    context
+        .store
+        .append_timeline_batch(TimelineBatch {
+            batch_id: context.ids.next_timeline_batch_id(),
+            connection_id: connection_a(),
+            run_id: run.id,
+            source_namespace: "mock".into(),
+            stream_id: "migration".into(),
+            expected_stream_revision: StreamCursor::INITIAL,
+            items: vec![NewTimelineItem {
+                id: context.ids.next_timeline_item_id(),
+                kind: "message".into(),
+                body: "preserved".into(),
+                provider_id: None,
+            }],
+        })
+        .await
+        .unwrap();
+    let approval = context
+        .store
+        .record_pending_approval(PendingApproval {
+            id: context.ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "migration-approval").unwrap(),
+            kind: "command".into(),
+            summary: "preserved".into(),
+        })
+        .await
+        .unwrap();
+    context.store.shutdown().await.unwrap();
+
+    let database = context.paths.data_root.join("yakshed.sqlite3");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE runs_v1 (
+                id TEXT PRIMARY KEY NOT NULL,
+                connection_id TEXT NOT NULL,
+                work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+                status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'interrupted')),
+                provider_namespace TEXT,
+                provider_run_id TEXT,
+                created_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER,
+                CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
+                CHECK ((status = 'running') = (ended_at_ms IS NULL)),
+                UNIQUE (connection_id, id),
+                UNIQUE (connection_id, provider_namespace, provider_run_id)
+            );
+            INSERT INTO runs_v1 SELECT * FROM runs;
+            DROP TABLE runs;
+            ALTER TABLE runs_v1 RENAME TO runs;
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStore::open(
+        context.paths.clone(),
+        Arc::new(FixedClock),
+        context.ids.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened
+            .list_timeline_page(ListTimeline {
+                run_id: run.id,
+                after: None,
+                limit: 10,
+            })
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .list_approvals_for_run(run.id, None, 10)
+            .await
+            .unwrap()
+            .items[0]
+            .id,
+        approval.id
+    );
 }
 
 #[tokio::test]
@@ -198,7 +332,7 @@ async fn newer_schema_is_rejected_without_modification() {
         SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::UnsupportedNewerSchema {
             found: 99,
-            supported: 1
+            supported: 2
         })
     ));
     assert_eq!(fs::read(database).unwrap(), before);
@@ -374,6 +508,8 @@ async fn provider_ids_and_streams_are_scoped_by_connection() {
         })
         .await
         .unwrap();
+    let run_a = accept_run(&context.store, &context.ids, run_a).await;
+    let run_b = accept_run(&context.store, &context.ids, run_b).await;
     assert_eq!(run_a.connection_id, connection_a());
     assert_eq!(run_b.connection_id, connection_b());
 
@@ -480,6 +616,7 @@ async fn repeated_create_commands_are_idempotent_by_supplied_id() {
     };
     let run = context.store.create_run(run_command.clone()).await.unwrap();
     assert_eq!(context.store.create_run(run_command).await.unwrap(), run);
+    let run = accept_run(&context.store, &context.ids, run).await;
     let approval_command = PendingApproval {
         id: context.ids.next_approval_request_id(),
         run_id: run.id,
@@ -948,6 +1085,7 @@ async fn second_open_conflicts_without_reconciling_live_run() {
         })
         .await
         .unwrap();
+    let run = accept_run(&store, &ids, run).await;
 
     match SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone()).await {
         Err(StoreError::Conflict(_)) => {}
@@ -970,6 +1108,50 @@ async fn second_open_conflicts_without_reconciling_live_run() {
     assert_eq!(
         reopened.get_run(run.id).await.unwrap().status,
         RunStatus::Interrupted
+    );
+}
+
+#[tokio::test]
+async fn reopen_marks_dangling_start_as_outcome_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    let ids = Arc::new(TestIds::new());
+    let store = SqliteStore::open(paths.clone(), Arc::new(FixedClock), ids.clone())
+        .await
+        .unwrap();
+    let project = store
+        .create_project(CreateProject {
+            id: ids.next_project_id(),
+            name: "dangling start".into(),
+        })
+        .await
+        .unwrap();
+    let work = store
+        .create_work_item(CreateWorkItem {
+            id: ids.next_work_item_id(),
+            project_id: project.id,
+            title: "dangling start".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = store
+        .create_run(CreateRun {
+            id: ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let reopened = SqliteStore::open(paths, Arc::new(FixedClock), ids)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get_run(run.id).await.unwrap().status,
+        RunStatus::OutcomeUnknown
     );
 }
 
@@ -1020,6 +1202,7 @@ async fn approval_response_transitions_are_application_shaped() {
         })
         .await
         .unwrap();
+    let run = accept_run(&context.store, &context.ids, run).await;
     let approval = context
         .store
         .record_pending_approval(PendingApproval {
@@ -1107,6 +1290,7 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
         })
         .await
         .unwrap();
+    let run = accept_run(&context.store, &context.ids, run).await;
     let pending = context
         .store
         .record_pending_approval(PendingApproval {
@@ -1145,6 +1329,7 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
                 run_id: run.id,
                 expected_current: RunStatus::Running,
                 target: RunStatus::Running,
+                provider_id: None,
                 occurred_at: UtcTimestamp::from_unix_millis(50),
                 audit_event_id: context.ids.next_audit_event_id(),
             })
@@ -1157,6 +1342,7 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
             run_id: run.id,
             expected_current: RunStatus::Running,
             target: RunStatus::Failed,
+            provider_id: None,
             occurred_at: UtcTimestamp::from_unix_millis(51),
             audit_event_id: context.ids.next_audit_event_id(),
         })
@@ -1223,6 +1409,7 @@ async fn terminal_run_transition_reconciles_approvals_and_filters_active_runs() 
                 run_id: run.id,
                 expected_current: RunStatus::Running,
                 target: RunStatus::Interrupted,
+                provider_id: None,
                 occurred_at: UtcTimestamp::from_unix_millis(52),
                 audit_event_id: context.ids.next_audit_event_id(),
             })
@@ -1255,6 +1442,7 @@ async fn terminal_run_allows_existing_approval_retry_but_rejects_new_approval() 
         })
         .await
         .unwrap();
+    let run = accept_run(&context.store, &context.ids, run).await;
     let original_command = PendingApproval {
         id: context.ids.next_approval_request_id(),
         run_id: run.id,
@@ -1273,6 +1461,7 @@ async fn terminal_run_allows_existing_approval_retry_but_rejects_new_approval() 
             run_id: run.id,
             expected_current: RunStatus::Running,
             target: RunStatus::Completed,
+            provider_id: None,
             occurred_at: UtcTimestamp::from_unix_millis(60),
             audit_event_id: context.ids.next_audit_event_id(),
         })
@@ -1361,6 +1550,7 @@ async fn reopen_interrupts_orphaned_run_and_preserves_responding_approval() {
         })
         .await
         .unwrap();
+    let run = accept_run(&store, &ids, run).await;
     let pending = store
         .record_pending_approval(PendingApproval {
             id: ids.next_approval_request_id(),
@@ -1500,6 +1690,8 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
         })
         .await
         .unwrap();
+    let run = accept_run(&store, &ids, run).await;
+    let second_run = accept_run(&store, &ids, second_run).await;
     let first_batch_id = ids.next_timeline_batch_id();
     let restart_batch = TimelineBatch {
         batch_id: first_batch_id,
@@ -1608,6 +1800,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
             run_id: run.id,
             expected_current: RunStatus::Running,
             target: RunStatus::Completed,
+            provider_id: None,
             occurred_at: UtcTimestamp::from_unix_millis(98),
             audit_event_id: ids.next_audit_event_id(),
         })
@@ -1618,6 +1811,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
             run_id: second_run.id,
             expected_current: RunStatus::Running,
             target: RunStatus::Completed,
+            provider_id: None,
             occurred_at: UtcTimestamp::from_unix_millis(99),
             audit_event_id: ids.next_audit_event_id(),
         })

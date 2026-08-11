@@ -29,7 +29,7 @@ use yakshed_domain::{
 use crate::AppPaths;
 
 const DATABASE_FILE: &str = "yakshed.sqlite3";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_PAGE_SIZE: u32 = 200;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 
@@ -64,13 +64,15 @@ CREATE TABLE runs (
     id TEXT PRIMARY KEY NOT NULL,
     connection_id TEXT NOT NULL,
     work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
-    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'interrupted')),
+    status TEXT NOT NULL CHECK (
+        status IN ('starting', 'running', 'completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown')
+    ),
     provider_namespace TEXT,
     provider_run_id TEXT,
     created_at_ms INTEGER NOT NULL,
     ended_at_ms INTEGER,
     CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
-    CHECK ((status = 'running') = (ended_at_ms IS NULL)),
+    CHECK ((status IN ('starting', 'running')) = (ended_at_ms IS NULL)),
     UNIQUE (connection_id, id),
     UNIQUE (connection_id, provider_namespace, provider_run_id)
 );
@@ -141,6 +143,41 @@ CREATE TABLE audit_events (
 );
 "#;
 
+const MIGRATE_V1_TO_V2: &str = r#"
+DROP TABLE IF EXISTS runs_v2;
+CREATE TABLE runs_v2 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (
+        status IN ('starting', 'running', 'completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown')
+    ),
+    provider_namespace TEXT,
+    provider_run_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    ended_at_ms INTEGER,
+    CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
+    CHECK ((status IN ('starting', 'running')) = (ended_at_ms IS NULL)),
+    UNIQUE (connection_id, id),
+    UNIQUE (connection_id, provider_namespace, provider_run_id)
+);
+INSERT INTO runs_v2 (
+    id, connection_id, work_item_id, status, provider_namespace, provider_run_id, created_at_ms, ended_at_ms
+)
+SELECT
+    id,
+    connection_id,
+    work_item_id,
+    status,
+    provider_namespace,
+    provider_run_id,
+    created_at_ms,
+    ended_at_ms
+FROM runs;
+DROP TABLE runs;
+ALTER TABLE runs_v2 RENAME TO runs;
+"#;
+
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
 
 enum Message {
@@ -157,6 +194,8 @@ struct Worker {
     connection: Connection,
     #[cfg(test)]
     fail_transition_after_update: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_append: bool,
 }
 
 /// Async facade over the dedicated SQLite worker.
@@ -188,6 +227,8 @@ impl SqliteStore {
                                 connection,
                                 #[cfg(test)]
                                 fail_transition_after_update: false,
+                                #[cfg(any(test, feature = "test-hooks"))]
+                                fail_next_append: false,
                             },
                             receiver,
                         );
@@ -236,8 +277,8 @@ impl SqliteStore {
         result_receiver.await.map_err(|_| StoreError::Closed)?
     }
 
-    #[cfg(test)]
-    async fn stall_worker(&self) -> Result<std::sync::mpsc::Sender<()>, StoreError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn stall_worker(&self) -> Result<std::sync::mpsc::Sender<()>, StoreError> {
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let (started_sender, started_receiver) = oneshot::channel();
         let sender = self.actor.sender.lock().await;
@@ -253,6 +294,15 @@ impl SqliteStore {
         drop(sender);
         started_receiver.await.map_err(|_| StoreError::Closed)?;
         Ok(release_sender)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn fail_next_append(&self) -> Result<(), StoreError> {
+        self.call(|worker| {
+            worker.fail_next_append = true;
+            Ok(())
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -351,6 +401,8 @@ fn run_worker(mut worker: Worker, mut receiver: mpsc::Receiver<Message>) {
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(INITIAL_SCHEMA).comment("initial durable work state"),
+        M::up(MIGRATE_V1_TO_V2)
+            .comment("expand run lifecycle statuses and start/reconnect transitions"),
     ])
 }
 
@@ -391,9 +443,6 @@ fn open_connection(paths: &AppPaths) -> Result<Connection, StoreError> {
         .busy_timeout(std::time::Duration::from_millis(5_000))
         .map_err(classify_integrity_or_open)?;
     connection
-        .pragma_update(None, "foreign_keys", true)
-        .map_err(classify_integrity_or_open)?;
-    connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(classify_integrity_or_open)?;
     let integrity: String = connection
@@ -402,9 +451,24 @@ fn open_connection(paths: &AppPaths) -> Result<Connection, StoreError> {
     if integrity != "ok" {
         return Err(StoreError::Integrity(integrity));
     }
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(classify_integrity_or_open)?;
     migrations()
         .to_latest(&mut connection)
         .map_err(|error| StoreError::Migration(error.to_string()))?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(classify_integrity_or_open)?;
+    let foreign_key_violation = connection
+        .prepare("PRAGMA foreign_key_check")
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(classify_integrity_or_open)?;
+    if foreign_key_violation {
+        return Err(StoreError::Integrity(
+            "database contains invalid foreign-key references".to_owned(),
+        ));
+    }
     Ok(connection)
 }
 
@@ -644,21 +708,47 @@ fn get_run(connection: &Connection, id: RunId) -> Result<RunSnapshot, StoreError
         })
 }
 
+fn bump_work_item_revision(
+    transaction: &Transaction<'_>,
+    work_item_id: WorkItemId,
+    occurred_at_ms: i64,
+) -> Result<(), StoreError> {
+    let changed = transaction
+        .execute(
+            "UPDATE work_items SET revision = revision + 1, updated_at_ms = ?2 WHERE id = ?1",
+            params![work_item_id.to_string(), occurred_at_ms],
+        )
+        .map_err(map_database_error)?;
+    if changed == 0 {
+        return Err(StoreError::NotFound {
+            entity: "work item",
+            id: work_item_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn run_status_value(status: RunStatus) -> &'static str {
     match status {
+        RunStatus::Starting => "starting",
         RunStatus::Running => "running",
         RunStatus::Completed => "completed",
         RunStatus::Failed => "failed",
         RunStatus::Interrupted => "interrupted",
+        RunStatus::Disconnected => "disconnected",
+        RunStatus::OutcomeUnknown => "outcome_unknown",
     }
 }
 
 fn run_status_from_value(value: &str) -> rusqlite::Result<RunStatus> {
     match value {
+        "starting" => Ok(RunStatus::Starting),
         "running" => Ok(RunStatus::Running),
         "completed" => Ok(RunStatus::Completed),
         "failed" => Ok(RunStatus::Failed),
         "interrupted" => Ok(RunStatus::Interrupted),
+        "disconnected" => Ok(RunStatus::Disconnected),
+        "outcome_unknown" => Ok(RunStatus::OutcomeUnknown),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -667,15 +757,30 @@ fn apply_run_transition(
     transaction: &Transaction<'_>,
     command: &TransitionRun,
 ) -> Result<RunSnapshot, StoreError> {
+    let run = get_run(transaction, command.run_id)?;
+    let (provider_namespace, provider_run_id) =
+        command
+            .provider_id
+            .as_ref()
+            .map_or((None, None), |provider| {
+                (
+                    Some(provider.namespace().to_owned()),
+                    Some(provider.value().to_owned()),
+                )
+            });
     let changed = transaction
         .execute(
-            "UPDATE runs SET status = ?2, ended_at_ms = ?3
+            "UPDATE runs SET status = ?2, ended_at_ms = ?3,
+                 provider_namespace = COALESCE(?5, provider_namespace),
+                 provider_run_id = COALESCE(?6, provider_run_id)
              WHERE id = ?1 AND status = ?4",
             params![
                 command.run_id.to_string(),
                 run_status_value(command.target),
-                command.occurred_at.unix_millis(),
-                run_status_value(command.expected_current)
+                ended_at_ms(command.target, command.occurred_at.unix_millis()),
+                run_status_value(command.expected_current),
+                provider_namespace,
+                provider_run_id,
             ],
         )
         .map_err(map_database_error)?;
@@ -727,6 +832,11 @@ fn apply_run_transition(
             ],
         )
         .map_err(map_database_error)?;
+    bump_work_item_revision(
+        transaction,
+        run.work_item_id,
+        command.occurred_at.unix_millis(),
+    )?;
     transaction
         .query_row(
             &format!("{RUN_SELECT} WHERE id = ?1"),
@@ -736,31 +846,54 @@ fn apply_run_transition(
         .map_err(map_database_error)
 }
 
+fn ended_at_ms(target: RunStatus, occurred_at_ms: i64) -> Option<i64> {
+    if matches!(target, RunStatus::Starting | RunStatus::Running) {
+        None
+    } else {
+        Some(occurred_at_ms)
+    }
+}
+
 fn reconcile_running_runs(
     connection: &mut Connection,
     occurred_at: UtcTimestamp,
     ids: &dyn IdGenerator,
 ) -> Result<(), StoreError> {
     let transaction = connection.transaction().map_err(map_database_error)?;
-    let run_ids = {
+    let run_ids: Vec<(RunId, String)> = {
         let mut statement = transaction
-            .prepare("SELECT id FROM runs WHERE status = 'running' ORDER BY id")
+            .prepare(
+                "SELECT id, status FROM runs WHERE status IN ('starting', 'running') ORDER BY id",
+            )
             .map_err(map_database_error)?;
         statement
-            .query_map([], |row| parse_column::<RunId>(row, 0))
+            .query_map([], |row| {
+                Ok((parse_column::<RunId>(row, 0)?, row.get::<_, String>(1)?))
+            })
             .map_err(map_database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_database_error)?
     };
-    for run_id in run_ids {
+    for (run_id, status) in run_ids {
         let audit_event_id = ids.next_audit_event_id();
         validate_app_id("audit event id", audit_event_id.is_v7())?;
+        let transition = if status == "starting" {
+            RunStatus::OutcomeUnknown
+        } else {
+            RunStatus::Interrupted
+        };
+        let expected = if status == "starting" {
+            RunStatus::Starting
+        } else {
+            RunStatus::Running
+        };
         apply_run_transition(
             &transaction,
             &TransitionRun {
                 run_id,
-                expected_current: RunStatus::Running,
-                target: RunStatus::Interrupted,
+                expected_current: expected,
+                target: transition,
+                provider_id: None,
                 occurred_at,
                 audit_event_id,
             },
@@ -1296,7 +1429,7 @@ impl AppStore for SqliteStore {
                     "INSERT INTO runs
                      (id, connection_id, work_item_id, status, provider_namespace,
                       provider_run_id, created_at_ms)
-                     VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)",
+                     VALUES (?1, ?2, ?3, 'starting', ?4, ?5, ?6)",
                     params![
                         command.id.to_string(),
                         command.connection_id.to_string(),
@@ -1307,11 +1440,12 @@ impl AppStore for SqliteStore {
                     ],
                 )
                 .map_err(map_database_error)?;
+            bump_work_item_revision(&transaction, command.work_item_id, now.unix_millis())?;
             let snapshot = RunSnapshot {
                 id: command.id,
                 connection_id: command.connection_id,
                 work_item_id: command.work_item_id,
-                status: RunStatus::Running,
+                status: RunStatus::Starting,
                 provider_id: command.provider_run,
                 created_at: now,
                 ended_at: None,
@@ -1402,7 +1536,7 @@ impl AppStore for SqliteStore {
                 .connection
                 .prepare(&format!(
                     "{RUN_SELECT}
-                     WHERE status = 'running' AND (?1 IS NULL OR id > ?1)
+                     WHERE status IN ('starting', 'running') AND (?1 IS NULL OR id > ?1)
                      ORDER BY id LIMIT ?2"
                 ))
                 .map_err(map_database_error)?;
@@ -1433,6 +1567,10 @@ impl AppStore for SqliteStore {
         let payload_digest = timeline_payload_digest(&batch.items);
         let now = self.clock.now();
         self.call(move |worker| {
+            #[cfg(any(test, feature = "test-hooks"))]
+            if std::mem::take(&mut worker.fail_next_append) {
+                return Err(StoreError::Backend("injected append failure".to_owned()));
+            }
             let transaction = worker
                 .connection
                 .transaction()
@@ -1444,6 +1582,13 @@ impl AppStore for SqliteStore {
                     |row| parse_column::<ConnectionId>(row, 0),
                 )
                 .optional()
+                .map_err(map_database_error)?;
+            let run_work_item_id = transaction
+                .query_row(
+                    "SELECT work_item_id FROM runs WHERE id = ?1",
+                    [batch.run_id.to_string()],
+                    |row| parse_column::<WorkItemId>(row, 0),
+                )
                 .map_err(map_database_error)?;
             let Some(run_connection) = run_connection else {
                 return Err(StoreError::NotFound {
@@ -1566,6 +1711,7 @@ impl AppStore for SqliteStore {
                     ],
                 )
                 .map_err(map_database_error)?;
+            bump_work_item_revision(&transaction, run_work_item_id, now.unix_millis())?;
             transaction.commit().map_err(map_database_error)?;
             Ok(StreamCursor::new(
                 u64::try_from(stream_revision)
@@ -1704,18 +1850,19 @@ impl AppStore for SqliteStore {
             }
             let run = transaction
                 .query_row(
-                    "SELECT connection_id, status FROM runs WHERE id = ?1",
+                    "SELECT connection_id, work_item_id, status FROM runs WHERE id = ?1",
                     [approval.run_id.to_string()],
                     |row| {
                         Ok((
                             parse_column::<ConnectionId>(row, 0)?,
-                            row.get::<_, String>(1)?,
+                            parse_column::<WorkItemId>(row, 1)?,
+                            row.get::<_, String>(2)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(map_database_error)?;
-            let Some((connection_id, run_status)) = run else {
+            let Some((connection_id, run_work_item_id, run_status)) = run else {
                 return Err(StoreError::NotFound {
                     entity: "run",
                     id: approval.run_id.to_string(),
@@ -1744,6 +1891,7 @@ impl AppStore for SqliteStore {
                     ],
                 )
                 .map_err(map_database_error)?;
+            bump_work_item_revision(&transaction, run_work_item_id, now.unix_millis())?;
             let snapshot = ApprovalSnapshot {
                 id: approval.id,
                 connection_id,
@@ -1824,6 +1972,16 @@ impl AppStore for SqliteStore {
                 .connection
                 .transaction()
                 .map_err(map_database_error)?;
+            let work_item_id = transaction
+                .query_row(
+                    "SELECT runs.work_item_id
+                     FROM approval_requests JOIN runs ON runs.id = approval_requests.run_id
+                     WHERE approval_requests.id = ?1",
+                    [response.approval_id.to_string()],
+                    |row| parse_column::<WorkItemId>(row, 0),
+                )
+                .optional()
+                .map_err(map_database_error)?;
             let changed = transaction
                 .execute(
                     "UPDATE approval_requests
@@ -1874,6 +2032,9 @@ impl AppStore for SqliteStore {
                     ],
                 )
                 .map_err(map_database_error)?;
+            if let Some(work_item_id) = work_item_id {
+                bump_work_item_revision(&transaction, work_item_id, now.unix_millis())?;
+            }
             let snapshot = get_approval(&transaction, response.approval_id)?;
             transaction.commit().map_err(map_database_error)?;
             Ok(snapshot)
@@ -1891,6 +2052,16 @@ impl AppStore for SqliteStore {
             let transaction = worker
                 .connection
                 .transaction()
+                .map_err(map_database_error)?;
+            let work_item_id = transaction
+                .query_row(
+                    "SELECT runs.work_item_id
+                     FROM approval_requests JOIN runs ON runs.id = approval_requests.run_id
+                     WHERE approval_requests.id = ?1",
+                    [response.approval_id.to_string()],
+                    |row| parse_column::<WorkItemId>(row, 0),
+                )
+                .optional()
                 .map_err(map_database_error)?;
             let changed = transaction
                 .execute(
@@ -1920,6 +2091,9 @@ impl AppStore for SqliteStore {
                         id: response.approval_id.to_string(),
                     }
                 });
+            }
+            if let Some(work_item_id) = work_item_id {
+                bump_work_item_revision(&transaction, work_item_id, now.unix_millis())?;
             }
             #[cfg(test)]
             if std::mem::take(&mut worker.fail_transition_after_update) {
@@ -2086,6 +2260,17 @@ mod tests {
             })
             .await
             .unwrap();
+        let run = store
+            .transition_run(TransitionRun {
+                run_id: run.id,
+                expected_current: RunStatus::Starting,
+                target: RunStatus::Running,
+                provider_id: Some(NamespacedProviderId::new("mock", "run-1").unwrap()),
+                occurred_at: UtcTimestamp::from_unix_millis(42),
+                audit_event_id: ids.next_audit_event_id(),
+            })
+            .await
+            .unwrap();
         let approval = store
             .record_pending_approval(PendingApproval {
                 id: ids.next_approval_request_id(),
@@ -2113,7 +2298,7 @@ mod tests {
                 .approval_status_and_audit_count(approval.id)
                 .await
                 .unwrap(),
-            ("pending".to_owned(), 0)
+            ("pending".to_owned(), 1)
         );
         store
             .begin_approval_response(BeginApprovalResponse {
@@ -2128,7 +2313,7 @@ mod tests {
                 .approval_status_and_audit_count(approval.id)
                 .await
                 .unwrap(),
-            ("responding".to_owned(), 1)
+            ("responding".to_owned(), 2)
         );
 
         store.fail_next_transition_after_update().await.unwrap();
@@ -2146,7 +2331,7 @@ mod tests {
                 .approval_status_and_audit_count(approval.id)
                 .await
                 .unwrap(),
-            ("responding".to_owned(), 1)
+            ("responding".to_owned(), 2)
         );
         store
             .confirm_approval_response(ConfirmApprovalResponse {
@@ -2160,7 +2345,7 @@ mod tests {
                 .approval_status_and_audit_count(approval.id)
                 .await
                 .unwrap(),
-            ("resolved".to_owned(), 2)
+            ("resolved".to_owned(), 3)
         );
 
         let pending = store
@@ -2198,6 +2383,7 @@ mod tests {
                     run_id: run.id,
                     expected_current: RunStatus::Running,
                     target: RunStatus::Failed,
+                    provider_id: None,
                     occurred_at: UtcTimestamp::from_unix_millis(43),
                     audit_event_id: ids.next_audit_event_id(),
                 })
@@ -2209,13 +2395,14 @@ mod tests {
                 .run_and_approval_statuses(run.id, pending.id)
                 .await
                 .unwrap(),
-            ("running".to_owned(), "pending".to_owned(), 3)
+            ("running".to_owned(), "pending".to_owned(), 4)
         );
         store
             .transition_run(TransitionRun {
                 run_id: run.id,
                 expected_current: RunStatus::Running,
                 target: RunStatus::Failed,
+                provider_id: None,
                 occurred_at: UtcTimestamp::from_unix_millis(43),
                 audit_event_id: ids.next_audit_event_id(),
             })
@@ -2226,14 +2413,14 @@ mod tests {
                 .run_and_approval_statuses(run.id, pending.id)
                 .await
                 .unwrap(),
-            ("failed".to_owned(), "voided".to_owned(), 4)
+            ("failed".to_owned(), "voided".to_owned(), 5)
         );
         assert_eq!(
             store
                 .approval_status_and_audit_count(responding.id)
                 .await
                 .unwrap(),
-            ("responding".to_owned(), 4)
+            ("responding".to_owned(), 5)
         );
         store
             .confirm_approval_response(ConfirmApprovalResponse {
@@ -2247,7 +2434,7 @@ mod tests {
                 .approval_status_and_audit_count(responding.id)
                 .await
                 .unwrap(),
-            ("resolved".to_owned(), 5)
+            ("resolved".to_owned(), 6)
         );
     }
 }

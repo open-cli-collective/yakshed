@@ -4,6 +4,7 @@ use std::path::Path;
 use std::{collections::HashSet, error::Error, fmt};
 
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error as ThisError;
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactRecord,
@@ -132,6 +133,12 @@ impl fmt::Display for ConfigRevision {
 pub struct ConfigSnapshot {
     pub revision: ConfigRevision,
     pub config: AppConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigConnectionSnapshot {
+    pub config_revision: ConfigRevision,
+    pub connection: PublicConnection,
 }
 
 /// Validated configuration mutations available to application callers.
@@ -352,15 +359,14 @@ pub struct PutConnectionCommand {
     pub ensure_memory_secret_backend: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetConnectionCredentialCommand {
     pub connection_id: ConnectionId,
     pub slot: CredentialSlot,
-    pub value: String,
+    pub value: SecretValue,
     pub overwrite: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretWriteOutcome {
     pub overwritten: bool,
 }
@@ -402,8 +408,36 @@ pub enum SecretPortError {
     BindingNotFound,
     #[error("credential binding is not writeable")]
     NotSecretBacked,
+    #[error("secret backend unavailable")]
+    BackendUnavailable,
+    #[error("secret backend returned locked")]
+    Locked,
+    #[error("secret backend denied access")]
+    Denied,
+    #[error("secret backend requires authentication")]
+    AuthenticationRequired,
+    #[error("secret already exists and overwrite is disabled")]
+    AlreadyExists,
+    #[error("secret write outcome is uncertain")]
+    UncertainWrite,
     #[error("credential operation failed")]
     Failed,
+}
+
+pub struct SecretValue {
+    value: SecretString,
+}
+
+impl SecretValue {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: SecretString::new(value.into().into()),
+        }
+    }
+
+    pub fn expose(&self) -> &str {
+        self.value.expose_secret()
+    }
 }
 
 #[derive(Debug, ThisError)]
@@ -432,7 +466,7 @@ pub trait ConfigPort: Send + Sync {
     async fn get_connection(
         &self,
         connection_id: ConnectionId,
-    ) -> Result<PublicConnection, ConfigPortError>;
+    ) -> Result<ConfigConnectionSnapshot, ConfigPortError>;
 
     async fn list_connections(&self) -> Result<PublicConnectionList, ConfigPortError>;
 }
@@ -567,11 +601,12 @@ pub struct CreateRun {
     pub provider_run: Option<NamespacedProviderId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct TransitionRun {
     pub run_id: RunId,
     pub expected_current: RunStatus,
     pub target: RunStatus,
+    pub provider_id: Option<NamespacedProviderId>,
     pub occurred_at: UtcTimestamp,
     pub audit_event_id: AuditEventId,
 }

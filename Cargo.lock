@@ -939,6 +939,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "provider-mock",
+ "secrecy",
  "serde_json",
  "tempfile",
  "thiserror",

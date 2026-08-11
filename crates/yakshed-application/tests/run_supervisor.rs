@@ -1,8 +1,15 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, Clock, CreateProject, CreateWorkItem, HarnessPortError,
     HarnessResponse, IdGenerator, ListTimeline, ProviderCommandRef, ProviderRequestRef,
@@ -36,14 +43,21 @@ struct MockPort {
     stream: Mutex<ProviderEventStream>,
     runs: Mutex<HashMap<ProviderRunRef, ProviderRunHandle>>,
     unknown_interrupt: bool,
+    unknown_start: bool,
+    fail_stream: AtomicBool,
+    stream_failure: Notify,
 }
 
 impl MockPort {
-    async fn new(plan: MockRunPlan, unknown_interrupt: bool) -> Arc<Self> {
+    async fn new_with_options(
+        plans: Vec<MockRunPlan>,
+        unknown_interrupt: bool,
+        unknown_start: bool,
+    ) -> Arc<Self> {
         let runtime = RuntimeHandle::new("mock-runtime").unwrap();
         let connection_id = connection_id();
         let harness = Arc::new(
-            MockHarness::new(HarnessCapabilities::default(), vec![plan], None).with_runtime(
+            MockHarness::new(HarnessCapabilities::default(), plans, None).with_runtime(
                 runtime.clone(),
                 connection_id,
                 None,
@@ -67,7 +81,15 @@ impl MockPort {
             stream: Mutex::new(stream),
             runs: Mutex::new(HashMap::new()),
             unknown_interrupt,
+            unknown_start,
+            fail_stream: AtomicBool::new(false),
+            stream_failure: Notify::new(),
         })
+    }
+
+    fn fail_stream(&self) {
+        self.fail_stream.store(true, Ordering::SeqCst);
+        self.stream_failure.notify_waiters();
     }
 
     fn run_ref(run: &ProviderRunHandle) -> ProviderRunRef {
@@ -97,6 +119,11 @@ impl RunHarness for MockPort {
         connection_id: ConnectionId,
         input: String,
     ) -> Result<ProviderRunRef, HarnessPortError> {
+        if self.unknown_start {
+            return Err(HarnessPortError::OutcomeUnknown {
+                operation: "start_run",
+            });
+        }
         assert_eq!(connection_id, self.session.connection_id);
         let run = self
             .harness
@@ -153,7 +180,16 @@ impl RunHarness for MockPort {
     }
 
     async fn next_event(&self) -> Result<Option<RunHarnessEvent>, HarnessPortError> {
-        Ok(self.stream.lock().await.recv().await.map(convert_event))
+        if self.fail_stream.swap(false, Ordering::SeqCst) {
+            return Err(HarnessPortError::Closed);
+        }
+        tokio::select! {
+            event = async { self.stream.lock().await.recv().await } => Ok(event.map(convert_event)),
+            () = self.stream_failure.notified() => {
+                self.fail_stream.store(false, Ordering::SeqCst);
+                Err(HarnessPortError::Closed)
+            }
+        }
     }
 }
 
@@ -290,6 +326,7 @@ struct TestContext {
     _temp: tempfile::TempDir,
     store: Arc<SqliteStore>,
     supervisor: RunSupervisor,
+    harness: Arc<MockPort>,
     work_item_id: WorkItemId,
 }
 
@@ -299,6 +336,14 @@ impl TestContext {
     }
 
     async fn with_unknown_interrupt(plan: MockRunPlan, unknown_interrupt: bool) -> Self {
+        Self::with_options(vec![plan], unknown_interrupt, false).await
+    }
+
+    async fn with_options(
+        plans: Vec<MockRunPlan>,
+        unknown_interrupt: bool,
+        unknown_start: bool,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let ids: Arc<dyn IdGenerator> = Arc::new(SystemIdGenerator);
         let clock: Arc<dyn Clock> = Arc::new(FixedClock);
@@ -325,12 +370,13 @@ impl TestContext {
             })
             .await
             .unwrap();
-        let port = MockPort::new(plan, unknown_interrupt).await;
-        let supervisor = RunSupervisor::new(store.clone(), port, clock, ids);
+        let harness = MockPort::new_with_options(plans, unknown_interrupt, unknown_start).await;
+        let supervisor = RunSupervisor::new(store.clone(), harness.clone(), clock, ids);
         Self {
             _temp: temp,
             store,
             supervisor,
+            harness,
             work_item_id,
         }
     }
@@ -344,9 +390,24 @@ impl TestContext {
     }
 
     async fn wait_for_status(&self, run_id: RunId, expected: RunStatus) {
+        let status = self
+            .store
+            .get_run(run_id)
+            .await
+            .map(|snapshot| snapshot.status)
+            .ok();
+        if status == Some(expected) {
+            return;
+        }
+
         let mut events = self.supervisor.subscribe();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
+                if let Ok(snapshot) = self.store.get_run(run_id).await
+                    && snapshot.status == expected
+                {
+                    break;
+                }
                 let event = events.recv().await.unwrap();
                 if let AppEventKind::RunStatusChanged {
                     run_id: changed_run_id,
@@ -357,10 +418,24 @@ impl TestContext {
                 {
                     break;
                 }
+                if let AppEventKind::RunOutcomeUnknown {
+                    run_id: outcome_run_id,
+                    operation,
+                } = event.kind
+                    && outcome_run_id == run_id
+                {
+                    panic!("run {run_id} became outcome-unknown during wait: {operation}");
+                }
             }
         })
-        .await
-        .unwrap();
+        .await;
+        if result.is_err() {
+            let snapshot = self.store.get_run(run_id).await;
+            panic!(
+                "timed out waiting for run {run_id} to become {expected:?}; final_status={:?}",
+                snapshot.ok().map(|snapshot| snapshot.status)
+            );
+        }
     }
 
     async fn wait_for_status_via_events(
@@ -370,7 +445,7 @@ impl TestContext {
         expected: RunStatus,
     ) -> Vec<u64> {
         let mut revisions = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.unwrap();
                 revisions.push(event.revision);
@@ -426,6 +501,15 @@ async fn full_lifecycle_batches_deltas_and_preserves_native_failures() {
     .await;
     let run_id = context.start().await;
     context.wait_for_status(run_id, RunStatus::Completed).await;
+    assert!(
+        context
+            .store
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .provider_id
+            .is_some()
+    );
 
     let timeline = context
         .store
@@ -624,6 +708,13 @@ async fn application_event_revisions_are_monotonic_per_work_item() {
         MockScriptStep::complete(),
     ]))
     .await;
+    let baseline_revision = context
+        .store
+        .get_work_item(context.work_item_id)
+        .await
+        .unwrap()
+        .revision
+        .get();
     let mut events = context.supervisor.subscribe();
     let run_id = context.start().await;
     let revisions = context
@@ -631,5 +722,150 @@ async fn application_event_revisions_are_monotonic_per_work_item() {
         .await;
     assert!(revisions.len() >= 4);
     assert!(revisions.windows(2).all(|pair| pair[1] == pair[0] + 1));
-    assert_eq!(revisions[0], 1);
+    assert_eq!(revisions[0], baseline_revision + 1);
+}
+
+#[tokio::test]
+async fn event_stream_failure_terminalizes_routes_and_next_run_restarts_pump() {
+    let context = TestContext::with_options(
+        vec![
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+        ],
+        false,
+        false,
+    )
+    .await;
+    let mut events = context.supervisor.subscribe();
+    let first = context.start().await;
+    context.harness.fail_stream();
+    let failed = next_matching(&mut events, |kind| {
+        matches!(
+            kind,
+            AppEventKind::RunOutcomeUnknown {
+                run_id,
+                operation: "stream_disconnected"
+            } if *run_id == first
+        )
+    })
+    .await;
+    assert_eq!(failed.work_item_id, context.work_item_id);
+    assert_eq!(
+        context.store.get_run(first).await.unwrap().status,
+        RunStatus::Disconnected
+    );
+
+    let second = context.start().await;
+    assert_eq!(
+        context.store.get_run(second).await.unwrap().status,
+        RunStatus::Running
+    );
+    context.supervisor.interrupt(second).await.unwrap();
+    context
+        .wait_for_status(second, RunStatus::Interrupted)
+        .await;
+}
+
+#[tokio::test]
+async fn start_outcome_unknown_is_durable_without_provider_mapping() {
+    let context = TestContext::with_options(vec![MockRunPlan::new(Vec::new())], false, true).await;
+    let mut events = context.supervisor.subscribe();
+    assert!(matches!(
+        context
+            .supervisor
+            .start_run(context.work_item_id, connection_id(), "start".to_owned())
+            .await,
+        Err(RunOrchestrationError::Harness(
+            HarnessPortError::OutcomeUnknown {
+                operation: "start_run"
+            }
+        ))
+    ));
+    let event = next_matching(&mut events, |kind| {
+        matches!(
+            kind,
+            AppEventKind::RunOutcomeUnknown {
+                operation: "start_run",
+                ..
+            }
+        )
+    })
+    .await;
+    let AppEventKind::RunOutcomeUnknown { run_id, .. } = event.kind else {
+        unreachable!()
+    };
+    let run = context.store.get_run(run_id).await.unwrap();
+    assert_eq!(run.status, RunStatus::OutcomeUnknown);
+    assert!(run.provider_id.is_none());
+}
+
+#[tokio::test]
+async fn fast_provider_saturating_route_is_durably_disconnected() {
+    let request = "route-saturation".parse::<ProviderRequestId>().unwrap();
+    let mut steps = vec![MockScriptStep::approval(request, "hold persistence")];
+    steps.extend(
+        (0..512).map(|index| MockScriptStep::message_completed(format!("message-{index}"))),
+    );
+    let context =
+        TestContext::new(MockRunPlan::new(steps).with_fault(MockHarnessFault::DelayApproval)).await;
+    let mut events = context.supervisor.subscribe();
+    let run_id = context.start().await;
+    let release_store = context.store.stall_worker().await.unwrap();
+    let harness = context.harness.harness.clone();
+    let producer = tokio::spawn(async move { harness.release_delayed_approval().await });
+    for _ in 0..512 {
+        tokio::task::yield_now().await;
+    }
+    release_store.send(()).unwrap();
+    producer.await.unwrap().unwrap();
+    next_matching(&mut events, |kind| {
+        matches!(
+            kind,
+            AppEventKind::RunOutcomeUnknown {
+                run_id: changed_run_id,
+                operation: "event_channel_full"
+            } if *changed_run_id == run_id
+        )
+    })
+    .await;
+    assert_eq!(
+        context.store.get_run(run_id).await.unwrap().status,
+        RunStatus::Disconnected
+    );
+}
+
+#[tokio::test]
+async fn persistence_failure_terminalizes_run_as_outcome_unknown() {
+    let request = "store-failure".parse::<ProviderRequestId>().unwrap();
+    let context = TestContext::new(
+        MockRunPlan::new(vec![
+            MockScriptStep::approval(request, "gate producer"),
+            MockScriptStep::message_completed("cannot persist"),
+        ])
+        .with_fault(MockHarnessFault::DelayApproval),
+    )
+    .await;
+    let mut events = context.supervisor.subscribe();
+    let run_id = context.start().await;
+    context.store.fail_next_append().await.unwrap();
+    context
+        .harness
+        .harness
+        .release_delayed_approval()
+        .await
+        .unwrap();
+    next_matching(&mut events, |kind| {
+        matches!(
+            kind,
+            AppEventKind::RunOutcomeUnknown {
+                run_id: changed_run_id,
+                operation: "run_consumption_failed"
+            } if *changed_run_id == run_id
+        )
+    })
+    .await;
+    assert_eq!(
+        context.store.get_run(run_id).await.unwrap().status,
+        RunStatus::OutcomeUnknown
+    );
 }

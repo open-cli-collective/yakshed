@@ -1,9 +1,6 @@
 use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -21,6 +18,8 @@ use crate::{
 
 pub const APP_EVENT_CAPACITY: usize = 128;
 pub const DELTA_BATCH_CHUNKS: usize = 32;
+const ROUTE_CHANNEL_CAPACITY: usize = 64;
+const STREAM_FAILURE_OPERATION: &str = "stream_disconnected";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProviderRunRef {
@@ -237,19 +236,20 @@ struct Inner {
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
     events: broadcast::Sender<AppEvent>,
-    pump_started: AtomicBool,
+    pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
     state: Mutex<State>,
 }
 
 #[derive(Default)]
 struct State {
-    routes: HashMap<ProviderRunRef, mpsc::UnboundedSender<RunHarnessEvent>>,
+    routes: HashMap<ProviderRunRef, mpsc::Sender<RunHarnessEvent>>,
     pending_events: HashMap<ProviderRunRef, Vec<RunHarnessEvent>>,
+    pending_overflow: HashSet<ProviderRunRef>,
     runs: HashMap<RunId, ProviderRunRef>,
+    runs_by_provider: HashMap<ProviderRunRef, RunId>,
     work_items: HashMap<RunId, WorkItemId>,
     approvals: HashMap<ApprovalRequestId, (RunId, ProviderRequestRef)>,
     user_inputs: HashMap<UserInputRequestId, (RunId, ProviderRequestRef)>,
-    revisions: HashMap<WorkItemId, u64>,
 }
 
 impl RunSupervisor {
@@ -266,7 +266,7 @@ impl RunSupervisor {
             clock,
             ids,
             events,
-            pump_started: AtomicBool::new(false),
+            pump: Mutex::new(None),
             state: Mutex::new(State::default()),
         }))
     }
@@ -295,60 +295,93 @@ impl RunSupervisor {
             })
             .await?;
         self.0
+            .publish(
+                work_item_id,
+                AppEventKind::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Starting,
+                },
+            )
+            .await;
+        self.0
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .work_items
             .insert(run_id, work_item_id);
-        self.0.publish(work_item_id, AppEventKind::WorkItemPatched);
-        self.0.publish(
-            work_item_id,
-            AppEventKind::RunStatusChanged {
-                run_id,
-                status: RunStatus::Running,
-            },
-        );
-        self.0.ensure_event_pump();
-
         let provider_run = match self.0.harness.start_run(connection_id, input).await {
             Ok(handle) => handle,
             Err(error @ HarnessPortError::OutcomeUnknown { operation }) => {
-                self.0.publish(
-                    work_item_id,
-                    AppEventKind::RunOutcomeUnknown { run_id, operation },
-                );
+                self.0.close_run(run_id).await;
+                self.0
+                    .transition(run_id, RunStatus::Starting, RunStatus::OutcomeUnknown, None)
+                    .await?;
+                self.0
+                    .publish(
+                        work_item_id,
+                        AppEventKind::RunOutcomeUnknown { run_id, operation },
+                    )
+                    .await;
                 return Err(error.into());
             }
             Err(error) => {
+                self.0.close_run(run_id).await;
                 self.0
-                    .transition(run_id, work_item_id, RunStatus::Failed)
+                    .transition(run_id, RunStatus::Starting, RunStatus::Failed, None)
                     .await?;
                 return Err(error.into());
             }
         };
-        let (sender, receiver) = mpsc::unbounded_channel();
-        {
+        let (sender, receiver) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
+        let provider_id = NamespacedProviderId::new(
+            provider_run.namespace.clone(),
+            provider_run.native_id.clone(),
+        )
+        .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))?;
+        let _run = run;
+        let run = self
+            .0
+            .transition(
+                run_id,
+                RunStatus::Starting,
+                RunStatus::Running,
+                Some(provider_id),
+            )
+            .await?;
+        let (pending_events, pending_overflow) = {
             let mut state = self
                 .0
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.runs.insert(run_id, provider_run.clone());
+            state.runs_by_provider.insert(provider_run.clone(), run_id);
             state.routes.insert(provider_run.clone(), sender.clone());
-            for event in state
-                .pending_events
-                .remove(&provider_run)
-                .unwrap_or_default()
-            {
-                let _ = sender.send(event);
-            }
-        }
+            (
+                state
+                    .pending_events
+                    .remove(&provider_run)
+                    .unwrap_or_default(),
+                state.pending_overflow.remove(&provider_run),
+            )
+        };
         let inner = Arc::clone(&self.0);
         tokio::spawn(async move {
             inner
                 .consume_run(run_id, work_item_id, connection_id, provider_run, receiver)
                 .await
         });
+        self.0.ensure_event_pump();
+        if pending_overflow {
+            self.0.handle_route_overflow(run_id, work_item_id).await;
+        } else {
+            for event in pending_events {
+                if sender.try_send(event).is_err() {
+                    self.0.handle_route_overflow(run_id, work_item_id).await;
+                    break;
+                }
+            }
+        }
         Ok(run)
     }
 
@@ -411,13 +444,15 @@ impl RunSupervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .approvals
             .remove(&approval_id);
-        self.0.publish(
-            work_item_id,
-            AppEventKind::ApprovalResolved {
-                run_id,
-                approval_id,
-            },
-        );
+        self.0
+            .publish(
+                work_item_id,
+                AppEventKind::ApprovalResolved {
+                    run_id,
+                    approval_id,
+                },
+            )
+            .await;
         Ok(())
     }
 
@@ -464,43 +499,188 @@ impl RunSupervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .user_inputs
             .remove(&request_id);
-        self.0.publish(
-            work_item_id,
-            AppEventKind::UserInputResponded { run_id, request_id },
-        );
+        self.0
+            .publish(
+                work_item_id,
+                AppEventKind::UserInputResponded { run_id, request_id },
+            )
+            .await;
         Ok(())
     }
 }
 
 impl Inner {
     fn ensure_event_pump(self: &Arc<Self>) {
-        if self.pump_started.swap(true, Ordering::AcqRel) {
+        let mut handle = self
+            .pump
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if handle.is_some() {
             return;
         }
         let inner = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                match inner.harness.next_event().await {
-                    Ok(Some(event)) => inner.route_event(event),
-                    Ok(None) | Err(HarnessPortError::Closed) => break,
-                    Err(_) => break,
-                }
-            }
-        });
+        *handle = Some(tokio::spawn(async move {
+            inner.run_event_pump().await;
+        }));
     }
 
-    fn route_event(&self, event: RunHarnessEvent) {
+    async fn run_event_pump(self: Arc<Self>) {
+        loop {
+            let operation = match self.harness.next_event().await {
+                Ok(Some(event)) => {
+                    self.route_event(event).await;
+                    continue;
+                }
+                Ok(None) => STREAM_FAILURE_OPERATION,
+                Err(HarnessPortError::Closed) => STREAM_FAILURE_OPERATION,
+                Err(HarnessPortError::OutcomeUnknown { operation }) => operation,
+                Err(_) => STREAM_FAILURE_OPERATION,
+            };
+            self.handle_pump_failure(operation).await;
+            break;
+        }
+    }
+
+    async fn route_event(&self, event: RunHarnessEvent) {
         let Some(run) = event.run().cloned() else {
             return;
         };
+        let (result, run_id, work_item_id) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let run_id = state.runs_by_provider.get(&run).copied();
+            let work_item_id = run_id.and_then(|id| state.work_items.get(&id).copied());
+            let Some(route) = state.routes.get(&run) else {
+                let queue = state.pending_events.entry(run.clone()).or_default();
+                if queue.len() < ROUTE_CHANNEL_CAPACITY {
+                    queue.push(event);
+                } else {
+                    state.pending_overflow.insert(run);
+                }
+                return;
+            };
+            (route.try_send(event), run_id, work_item_id)
+        };
+        let (run_id, work_item_id) = match (run_id, work_item_id) {
+            (Some(run_id), Some(work_item_id)) => (run_id, work_item_id),
+            _ => return,
+        };
+        match result {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.handle_route_overflow(run_id, work_item_id).await;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.transition_to_disconnected(run_id).await;
+            }
+        }
+    }
+
+    async fn transition_to_disconnected(&self, run_id: RunId) {
+        if let Ok(snapshot) = self.store.get_run(run_id).await
+            && matches!(snapshot.status, RunStatus::Starting | RunStatus::Running)
+        {
+            let _ = self
+                .transition(run_id, snapshot.status, RunStatus::Disconnected, None)
+                .await;
+        }
+    }
+
+    async fn handle_route_overflow(&self, run_id: RunId, work_item_id: WorkItemId) {
+        let _ = self.close_run(run_id).await;
+        if let Ok(current) = self.store.get_run(run_id).await {
+            let target = match current.status {
+                RunStatus::Starting => Some(RunStatus::OutcomeUnknown),
+                RunStatus::Running => Some(RunStatus::Disconnected),
+                _ => None,
+            };
+            if let Some(target) = target {
+                let _ = self.transition(run_id, current.status, target, None).await;
+            }
+            self.publish(
+                work_item_id,
+                AppEventKind::RunOutcomeUnknown {
+                    run_id,
+                    operation: "event_channel_full",
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn handle_pump_failure(&self, operation: &'static str) {
+        let mut affected = Vec::new();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (run_id, run) in state.runs.iter() {
+                if let Some(work_item_id) = state.work_items.get(run_id) {
+                    affected.push((*run_id, run.clone(), *work_item_id));
+                }
+            }
+            let provider_runs: Vec<ProviderRunRef> = state.runs.values().cloned().collect();
+            for run in provider_runs {
+                state.routes.remove(&run);
+                state.runs_by_provider.remove(&run);
+            }
+            state.runs.clear();
+            state.work_items.clear();
+            state.runs_by_provider.clear();
+            state.routes.clear();
+            state.pending_events.clear();
+            state.pending_overflow.clear();
+            state.approvals.clear();
+            state.user_inputs.clear();
+        }
+        self.pump
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        for (run_id, _provider, work_item_id) in affected {
+            if let Ok(current) = self.store.get_run(run_id).await {
+                let target = match current.status {
+                    RunStatus::Starting => Some(RunStatus::OutcomeUnknown),
+                    RunStatus::Running => Some(RunStatus::Disconnected),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    let _ = self.transition(run_id, current.status, target, None).await;
+                }
+            }
+            self.publish(
+                work_item_id,
+                AppEventKind::RunOutcomeUnknown { run_id, operation },
+            )
+            .await;
+        }
+    }
+
+    async fn close_run(&self, run_id: RunId) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(route) = state.routes.get(&run) {
-            let _ = route.send(event);
-        } else {
-            state.pending_events.entry(run).or_default().push(event);
+        let provider = state.runs.get(&run_id).cloned();
+        if let Some(provider) = &provider {
+            state.routes.remove(provider);
+            state.runs_by_provider.remove(provider);
+        }
+        state.runs.remove(&run_id);
+        state.work_items.remove(&run_id);
+        state
+            .approvals
+            .retain(|_, (pending_run_id, _)| *pending_run_id != run_id);
+        state
+            .user_inputs
+            .retain(|_, (pending_run_id, _)| *pending_run_id != run_id);
+        state.pending_events.retain(|_, queue| !queue.is_empty());
+        if let Some(provider) = provider {
+            state.pending_events.remove(&provider);
+            state.pending_overflow.remove(&provider);
         }
     }
 
@@ -537,23 +717,24 @@ impl Inner {
                 self.publish(
                     work_item_id,
                     AppEventKind::RunOutcomeUnknown { run_id, operation },
-                );
+                )
+                .await;
                 Err(error.into())
             }
             Err(error) => Err(error.into()),
         }
     }
 
-    fn publish(&self, work_item_id: WorkItemId, kind: AppEventKind) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let revision = state.revisions.entry(work_item_id).or_default();
-        *revision += 1;
+    async fn publish(&self, work_item_id: WorkItemId, kind: AppEventKind) {
+        let revision = self
+            .store
+            .get_work_item(work_item_id)
+            .await
+            .map(|work_item| work_item.revision.get())
+            .unwrap_or(0);
         let _ = self.events.send(AppEvent {
             work_item_id,
-            revision: *revision,
+            revision,
             kind,
         });
     }
@@ -561,23 +742,38 @@ impl Inner {
     async fn transition(
         &self,
         run_id: RunId,
-        work_item_id: WorkItemId,
+        expected_current: RunStatus,
         status: RunStatus,
-    ) -> Result<(), StoreError> {
-        self.store
+        provider_id: Option<NamespacedProviderId>,
+    ) -> Result<RunSnapshot, StoreError> {
+        let snapshot = self
+            .store
             .transition_run(TransitionRun {
                 run_id,
-                expected_current: RunStatus::Running,
+                expected_current,
                 target: status,
+                provider_id,
                 occurred_at: self.clock.now(),
                 audit_event_id: self.ids.next_audit_event_id(),
             })
             .await?;
         self.publish(
-            work_item_id,
+            snapshot.work_item_id,
             AppEventKind::RunStatusChanged { run_id, status },
-        );
-        Ok(())
+        )
+        .await;
+        Ok(snapshot)
+    }
+
+    async fn transition_to_terminal(
+        &self,
+        run_id: RunId,
+        terminal_status: RunStatus,
+    ) -> Result<(), StoreError> {
+        let snapshot = self.store.get_run(run_id).await?;
+        self.transition(run_id, snapshot.status, terminal_status, None)
+            .await
+            .map(|_| ())
     }
 
     async fn append_items(
@@ -618,7 +814,8 @@ impl Inner {
         self.publish(
             work_item_id,
             AppEventKind::TimelineBatchAppended { run_id, item_count },
-        );
+        )
+        .await;
         Ok(())
     }
 
@@ -628,28 +825,38 @@ impl Inner {
         work_item_id: WorkItemId,
         _connection_id: ConnectionId,
         provider_run: ProviderRunRef,
-        mut events: mpsc::UnboundedReceiver<RunHarnessEvent>,
+        mut events: mpsc::Receiver<RunHarnessEvent>,
     ) {
         let mut deltas = DeltaBuffer::default();
         while let Some(event) = events.recv().await {
             let terminal = matches!(event, RunHarnessEvent::RunTerminal { .. });
-            if let Err(error) = self
+            if self
                 .apply_event(run_id, work_item_id, &provider_run, &mut deltas, event)
                 .await
+                .is_err()
             {
-                let _ = error;
+                if let Ok(current) = self.store.get_run(run_id).await
+                    && matches!(current.status, RunStatus::Starting | RunStatus::Running)
+                {
+                    let _ = self
+                        .transition(run_id, current.status, RunStatus::OutcomeUnknown, None)
+                        .await;
+                    self.publish(
+                        work_item_id,
+                        AppEventKind::RunOutcomeUnknown {
+                            run_id,
+                            operation: "run_consumption_failed",
+                        },
+                    )
+                    .await;
+                }
                 break;
             }
             if terminal {
                 break;
             }
         }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.routes.remove(&provider_run);
-        state.runs.remove(&run_id);
+        self.close_run(run_id).await;
     }
 
     async fn apply_event(
@@ -716,7 +923,8 @@ impl Inner {
                                 run_id,
                                 approval_id,
                             },
-                        );
+                        )
+                        .await;
                         return Ok(());
                     }
                     RunHarnessEvent::UserInputRequested { request, prompt } => {
@@ -741,7 +949,8 @@ impl Inner {
                                 request_id,
                                 prompt,
                             },
-                        );
+                        )
+                        .await;
                         return Ok(());
                     }
                     RunHarnessEvent::Unknown {
@@ -766,7 +975,7 @@ impl Inner {
                             }
                             RunTerminal::Interrupted => RunStatus::Interrupted,
                         };
-                        self.transition(run_id, work_item_id, status).await?;
+                        self.transition_to_terminal(run_id, status).await?;
                         return Ok(());
                     }
                     RunHarnessEvent::RunAccepted { .. }
