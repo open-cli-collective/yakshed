@@ -17,7 +17,8 @@ use yakshed_application::{
     SystemIdGenerator, TransitionRun,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalStatus, ConnectionId, RunId, RunStatus, UtcTimestamp, WorkItemId,
+    ApprovalDecision, ApprovalStatus, ConnectionId, NamespacedProviderId, RunId, RunStatus,
+    UtcTimestamp, WorkItemId,
 };
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessError, HarnessEvent, HarnessInput,
@@ -1267,6 +1268,40 @@ async fn startup_reconnect_failure_does_not_block_desktop_readiness() {
 }
 
 #[tokio::test]
+async fn startup_reconnect_false_transitions_starting_to_outcome_unknown() {
+    let context =
+        TestContext::new(MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete))
+            .await;
+    let dangling = context
+        .store
+        .create_run(yakshed_application::CreateRun {
+            id: SystemIdGenerator.next_run_id(),
+            connection_id: connection_id(),
+            work_item_id: context.work_item_id,
+            provider_run: Some(
+                NamespacedProviderId::new("mock", "run-starting-no-bridge").unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        context.store.get_run(dangling.id).await.unwrap().status,
+        RunStatus::Starting
+    );
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    restarted.ready().await.unwrap();
+    assert_eq!(
+        context.store.get_run(dangling.id).await.unwrap().status,
+        RunStatus::OutcomeUnknown
+    );
+}
+
+#[tokio::test]
 async fn startup_reconcile_stops_partial_activation_on_store_failure_and_retries_cleanly() {
     let context = TestContext::with_options(
         vec![
@@ -1322,6 +1357,47 @@ async fn startup_reconcile_stops_partial_activation_on_store_failure_and_retries
         .steer(second, "still-running".to_owned())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn startup_reconnect_false_transitions_running_to_disconnected() {
+    let context =
+        TestContext::new(MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete))
+            .await;
+    let run = context
+        .store
+        .create_run(yakshed_application::CreateRun {
+            id: SystemIdGenerator.next_run_id(),
+            connection_id: connection_id(),
+            work_item_id: context.work_item_id,
+            provider_run: Some(NamespacedProviderId::new("mock", "run-running-no-bridge").unwrap()),
+        })
+        .await
+        .unwrap();
+    context
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Starting,
+            target: RunStatus::Running,
+            provider_id: Some(NamespacedProviderId::new("mock", "run-running-no-bridge").unwrap()),
+            occurred_at: FixedClock.now(),
+            audit_event_id: SystemIdGenerator.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    restarted.ready().await.unwrap();
+    assert_eq!(
+        context.store.get_run(run.id).await.unwrap().status,
+        RunStatus::Disconnected
+    );
 }
 
 #[tokio::test]

@@ -859,27 +859,25 @@ impl Inner {
                     continue;
                 };
                 let provider_run = ProviderRunRef(provider_id);
-                let can_reconnect = match self.harness.reconnect(&provider_run).await {
-                    Ok(can_reconnect) => can_reconnect,
-                    Err(_) => {
-                        if matches!(run.status, RunStatus::Starting | RunStatus::Running) {
-                            let target = if run.status == RunStatus::Starting {
-                                RunStatus::OutcomeUnknown
-                            } else {
-                                RunStatus::Disconnected
-                            };
-                            if let Err(error) =
-                                self.transition(run.id, run.status, target, None).await
-                            {
-                                for plan in prepared {
-                                    self.remove_route_state(plan.run.id, &plan.provider_run);
-                                }
-                                return Err(error.into());
-                            }
+                let can_reconnect = self
+                    .harness
+                    .reconnect(&provider_run)
+                    .await
+                    .unwrap_or_default();
+                if !can_reconnect && matches!(run.status, RunStatus::Starting | RunStatus::Running)
+                {
+                    let target = if run.status == RunStatus::Starting {
+                        RunStatus::OutcomeUnknown
+                    } else {
+                        RunStatus::Disconnected
+                    };
+                    if let Err(error) = self.transition(run.id, run.status, target, None).await {
+                        for plan in prepared {
+                            self.remove_route_state(plan.run.id, &plan.provider_run);
                         }
-                        false
+                        return Err(error.into());
                     }
-                };
+                }
                 if can_reconnect {
                     match self.prepare_startup_reattach(run, provider_run).await {
                         Ok(plan) => prepared.push(plan),
