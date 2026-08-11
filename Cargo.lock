@@ -971,8 +971,17 @@ dependencies = [
 name = "yakshed-desktop-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "provider-mock",
+ "secrecy",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "yakshed-application",
  "yakshed-domain",
+ "yakshed-harness",
+ "yakshed-secrets",
+ "yakshed-store",
 ]
 
 [[package]]

@@ -344,12 +344,19 @@ impl TestContext {
     }
 
     async fn wait_for_status(&self, run_id: RunId, expected: RunStatus) {
+        let mut events = self.supervisor.subscribe();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if self.store.get_run(run_id).await.unwrap().status == expected {
+                let event = events.recv().await.unwrap();
+                if let AppEventKind::RunStatusChanged {
+                    run_id: changed_run_id,
+                    status,
+                } = event.kind
+                    && changed_run_id == run_id
+                    && status == expected
+                {
                     break;
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await
@@ -371,10 +378,10 @@ impl TestContext {
                     run_id: changed_run_id,
                     status,
                 } = event.kind
+                    && changed_run_id == run_id
+                    && status == expected
                 {
-                    if changed_run_id == run_id && status == expected {
-                        break;
-                    }
+                    break;
                 }
             }
         })
@@ -517,7 +524,9 @@ async fn user_input_round_trip_continues_run() {
         .respond_user_input(request_id, "blue".to_owned())
         .await
         .unwrap();
-    context.wait_for_status(run_id, RunStatus::Completed).await;
+    context
+        .wait_for_status_via_events(&mut events, run_id, RunStatus::Completed)
+        .await;
 }
 
 #[tokio::test]

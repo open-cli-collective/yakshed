@@ -6,9 +6,10 @@ use std::{collections::HashSet, error::Error, fmt};
 use async_trait::async_trait;
 use thiserror::Error as ThisError;
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, AuditEventId, Connection, ConnectionId,
-    CredentialBinding, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
-    RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings, StreamCursor,
+    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactRecord,
+    AuditEventId, Connection, ConnectionId, CredentialBinding, CredentialSlot,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderStateRootId, RunId, RunSnapshot,
+    RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator, StreamCursor,
     TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
     WorkItemId, WorkItemSnapshot,
 };
@@ -117,6 +118,12 @@ impl ConfigRevision {
 
     pub const fn get(self) -> u64 {
         self.0
+    }
+}
+
+impl fmt::Display for ConfigRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -302,6 +309,158 @@ pub fn validate_backend_configuration(
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> UtcTimestamp;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicCredentialBinding {
+    pub slot: CredentialSlot,
+    pub source: PublicCredentialSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicCredentialSource {
+    Delegated {
+        authority: String,
+    },
+    Secret {
+        backend: SecretBackendId,
+        locator: SecretLocator,
+    },
+    Disabled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicConnection {
+    pub id: ConnectionId,
+    pub name: String,
+    pub harness: String,
+    pub model_provider: String,
+    pub provider_state: ProviderStateRootId,
+    pub credentials: Vec<PublicCredentialBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicConnectionList {
+    pub config_revision: ConfigRevision,
+    pub connections: Vec<PublicConnection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PutConnectionCommand {
+    pub expected_config_revision: ConfigRevision,
+    pub connection: Connection,
+    pub ensure_memory_secret_backend: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetConnectionCredentialCommand {
+    pub connection_id: ConnectionId,
+    pub slot: CredentialSlot,
+    pub value: String,
+    pub overwrite: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecretWriteOutcome {
+    pub overwritten: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenArtifactCommand {
+    pub artifact_id: ArtifactId,
+    pub max_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenArtifactPayload {
+    pub artifact: ArtifactRecord,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, ThisError)]
+pub enum ConfigPortError {
+    #[error("configuration is out of date: expected {expected}, actual {actual}")]
+    Conflict {
+        expected: ConfigRevision,
+        actual: ConfigRevision,
+    },
+    #[error("configuration value is invalid")]
+    Validation,
+    #[error("not found")]
+    NotFound,
+    #[error("unsupported operation")]
+    Unsupported,
+    #[error("configuration service unavailable")]
+    Unavailable,
+}
+
+#[derive(Debug, ThisError)]
+pub enum SecretPortError {
+    #[error("connection not found")]
+    ConnectionNotFound,
+    #[error("credential binding not found")]
+    BindingNotFound,
+    #[error("credential binding is not writeable")]
+    NotSecretBacked,
+    #[error("credential operation failed")]
+    Failed,
+}
+
+#[derive(Debug, ThisError)]
+pub enum CachePortError {
+    #[error("cache operation failed")]
+    Failed,
+}
+
+#[derive(Debug, ThisError)]
+pub enum ArtifactPortError {
+    #[error("artifact not found")]
+    NotFound,
+    #[error("artifact exceeds requested size")]
+    TooLarge,
+    #[error("artifact operation failed")]
+    Failed,
+}
+
+#[async_trait]
+pub trait ConfigPort: Send + Sync {
+    async fn put_connection(
+        &self,
+        command: PutConnectionCommand,
+    ) -> Result<ConfigSnapshot, ConfigPortError>;
+
+    async fn get_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<PublicConnection, ConfigPortError>;
+
+    async fn list_connections(&self) -> Result<PublicConnectionList, ConfigPortError>;
+}
+
+#[async_trait]
+pub trait SecretPort: Send + Sync {
+    async fn set_connection_credential(
+        &self,
+        command: SetConnectionCredentialCommand,
+    ) -> Result<SecretWriteOutcome, SecretPortError>;
+}
+
+#[async_trait]
+pub trait CachePort: Send + Sync {
+    async fn clear(&self) -> Result<(), CachePortError>;
+}
+
+#[async_trait]
+pub trait ArtifactPort: Send + Sync {
+    async fn list_artifacts_for_work_item(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> Result<Vec<ArtifactRecord>, ArtifactPortError>;
+
+    async fn open_artifact(
+        &self,
+        command: OpenArtifactCommand,
+    ) -> Result<OpenArtifactPayload, ArtifactPortError>;
 }
 
 pub struct SystemClock;
