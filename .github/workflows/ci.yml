@@ -33,3 +33,4 @@ jobs:
       - run: python3 scripts/verify_schema_pin.py
       - run: python3 scripts/verify_codex_metadata.py
       - run: python3 scripts/check_codex_drift.py --self-test
+      - run: python3 scripts/repin_codex.py --self-test

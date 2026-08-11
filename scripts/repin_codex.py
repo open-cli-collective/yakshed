@@ -69,21 +69,39 @@ def updated_lock(lock: dict, value: dict, schema_digest: str, validated_at: str)
 
 
 def update_last_validated_metadata(
-    root_version: str, repo_root: Path = REPO_ROOT
+    root_version: str,
+    repo_root: Path = REPO_ROOT,
+    replace_fn=Path.replace,
 ) -> list[tuple[Path, str]]:
     paths = [
         (repo_root / LIB_RS, CODEX_VERSION_RE, f'\\g<1>{root_version}\\g<2>'),
         (repo_root / FAKE_CODEX, FAKE_CLI_VERSION_RE, f'\\g<1>{root_version}\\g<2>'),
     ]
-    staged_updates: list[tuple[Path, str, str]] = []
+    staged_updates: list[tuple[Path, str, Path]] = []
     for path, pattern, replacement in paths:
         text = path.read_text(encoding="utf-8")
         rewritten, count = pattern.subn(replacement, text)
         if count != 1:
             raise ValueError(f"unable to update last-validated version in {path}")
-        staged_updates.append((path, text, rewritten))
-    for path, _original_text, rewritten in staged_updates:
-        path.write_text(rewritten, encoding="utf-8")
+        temporary = path.with_suffix(path.suffix + ".codex-repin")
+        temporary.write_text(rewritten, encoding="utf-8")
+        staged_updates.append((path, text, temporary))
+
+    committed: list[tuple[Path, str]] = []
+    try:
+        for path, original_text, temporary in staged_updates:
+            replace_fn(temporary, path)
+            committed.append((path, original_text))
+    except Exception as error:
+        for path, original_text in reversed(committed):
+            path.write_text(original_text, encoding="utf-8")
+        for _, _original_text, temporary in reversed(staged_updates):
+            if temporary.exists():
+                temporary.unlink()
+        raise
+    for _, _original_text, temporary in staged_updates:
+        if temporary.exists():
+            temporary.unlink()
     return [(path, original_text) for path, original_text, _ in staged_updates]
 
 
@@ -202,6 +220,38 @@ def self_test() -> None:
         except Exception as error:
             raise AssertionError(f"expected TarError, got {type(error).__name__}: {error}")
         assert code == 3
+
+    with tempfile.TemporaryDirectory(prefix=".codex-repin-selftest-", dir=Path(__file__).resolve().parent) as temp:
+        root = Path(temp) / "repo"
+        (root / "crates/provider-codex/src").mkdir(parents=True, exist_ok=True)
+        (root / "crates/provider-codex/tests").mkdir(parents=True, exist_ok=True)
+        lib_path = root / LIB_RS
+        fake_path = root / FAKE_CODEX
+        lib_path.write_text('const LAST_VALIDATED_CODEX_VERSION: &str = "9.8.6";\n', encoding="utf-8")
+        fake_path.write_text('{"cliVersion": "9.8.6", "model": "fake-model"}\n', encoding="utf-8")
+
+        call_count = 0
+
+        def flaky_replace(source: Path, destination: Path) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("simulated metadata write failure")
+            return source.replace(destination)
+
+        try:
+            update_last_validated_metadata(
+                "9.9.0",
+                repo_root=root,
+                replace_fn=flaky_replace,
+            )
+            raise AssertionError("expected simulated metadata write failure")
+        except OSError as error:
+            assert str(error) == "simulated metadata write failure"
+
+        assert call_count == 2
+        assert lib_path.read_text(encoding="utf-8").strip() == 'const LAST_VALIDATED_CODEX_VERSION: &str = "9.8.6";'
+        assert fake_path.read_text(encoding="utf-8").strip() == '{"cliVersion": "9.8.6", "model": "fake-model"}'
 
     with tempfile.TemporaryDirectory(prefix=".codex-repin-selftest-", dir=Path(__file__).resolve().parent) as temp:
         root = Path(temp) / "repo"
