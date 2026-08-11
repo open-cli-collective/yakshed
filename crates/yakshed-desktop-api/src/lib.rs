@@ -1,9 +1,9 @@
 //! Frontend-safe command facade over application use-cases and infrastructure ports.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
     ConfigPort, ConfigPortError, ConfigRevision, CreateProject, CreateWorkItem, ListWorkItems,
@@ -12,12 +12,14 @@ use yakshed_application::{
     SecretPortError, SetConnectionCredentialCommand, StoreError,
 };
 use yakshed_domain::{
-    ApprovalRequestId, ArtifactId, ArtifactKind, Connection, ConnectionId, CredentialBinding,
-    CredentialBindingRecord, CredentialSlot, ProjectId, RunId, RunStatus, SecretBackendId,
-    SecretLocator, SecretReference, WorkItemId, WorkItemSnapshot,
+    ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactKind, Connection, ConnectionId,
+    CredentialBinding, CredentialBindingRecord, CredentialSlot, ProjectId, RunId, RunSnapshot,
+    RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemId,
+    TimelineItemSnapshot, TimelineRevision, WorkItemId, WorkItemSnapshot,
 };
 
-pub const APP_EVENT_CAPACITY: usize = 128;
+pub const APP_EVENT_CAPACITY: usize = 32;
+const MAX_OPEN_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesktopErrorCode {
@@ -76,10 +78,13 @@ impl DesktopError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendRunStatus {
+    Starting,
     Running,
     Completed,
     Failed,
     Interrupted,
+    Disconnected,
+    OutcomeUnknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,15 +132,39 @@ pub struct FrontendEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkItemSnapshotEnvelope {
+    /// Durable revision of this work item used for event-gap recovery.
+    pub revision: u64,
+    pub work_item: WorkItemSnapshot,
+    pub runs: Vec<RunSnapshot>,
+    pub pending_approvals: Vec<ApprovalSnapshot>,
+    pub pending_user_inputs: Vec<WorkItemPendingUserInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemPendingUserInput {
+    pub run_id: RunId,
+    pub request_id: TimelineItemId,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemListItem {
     pub work_item: WorkItemSnapshot,
     pub revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkItemListEnvelope {
-    pub items: Vec<WorkItemSnapshot>,
+    pub items: Vec<WorkItemListItem>,
     pub next_after: Option<WorkItemId>,
-    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemTimelineEnvelope {
+    pub run_id: RunId,
+    pub work_item_revision: u64,
+    pub items: Vec<TimelineItemSnapshot>,
+    pub next_after: Option<TimelineRevision>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,7 +225,6 @@ pub struct DesktopApi {
     cache: Arc<dyn CachePort>,
     artifacts: Arc<dyn ArtifactPort>,
     events: broadcast::Sender<FrontendEvent>,
-    event_revisions: Arc<Mutex<HashMap<WorkItemId, u64>>>,
 }
 
 impl DesktopApi {
@@ -205,14 +233,10 @@ impl DesktopApi {
         let (events, _) = broadcast::channel(APP_EVENT_CAPACITY);
         let mut source = ports.run_supervisor.subscribe();
         let relay = events.clone();
-        let event_revisions = Arc::new(Mutex::new(HashMap::new()));
-        let revisions = event_revisions.clone();
         tokio::spawn(async move {
             loop {
                 match source.recv().await {
                     Ok(event) => {
-                        let mut revisions = revisions.lock().await;
-                        revisions.insert(event.work_item_id, event.revision);
                         let _ = relay.send(map_frontend_event(event));
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -231,7 +255,6 @@ impl DesktopApi {
             cache: ports.cache,
             artifacts: ports.artifacts,
             events,
-            event_revisions,
         }
     }
 
@@ -263,12 +286,7 @@ impl DesktopApi {
             })
             .await
             .map_err(map_store_error)?;
-        Ok(WorkItemSnapshotEnvelope {
-            revision: self
-                .snapshot_revision(work_item.id, work_item.revision.get())
-                .await,
-            work_item,
-        })
+        self.get_work_item_snapshot(work_item.id).await
     }
 
     pub async fn get_work_item_snapshot(&self, id: WorkItemId) -> Result<WorkItemSnapshotEnvelope> {
@@ -277,9 +295,69 @@ impl DesktopApi {
             .get_work_item(id)
             .await
             .map_err(map_store_error)?;
+        let revision = work_item.revision.get();
+        let runs = self
+            .store
+            .list_runs_for_work_item(id, None, 200)
+            .await
+            .map_err(map_store_error)?
+            .items;
+        let mut pending_approvals = Vec::new();
+        let mut pending_user_inputs = Vec::new();
+        for run in &runs {
+            let mut approvals = self
+                .store
+                .list_approvals_for_run(run.id, None, 200)
+                .await
+                .map_err(map_store_error)?
+                .items;
+            approvals.retain(|approval| {
+                matches!(approval.status, yakshed_domain::ApprovalStatus::Pending)
+            });
+            pending_approvals.extend(approvals);
+
+            let mut after = None;
+            let mut requested: VecDeque<(TimelineItemId, String)> = VecDeque::new();
+            loop {
+                let page = self
+                    .store
+                    .list_timeline_page(yakshed_application::ListTimeline {
+                        run_id: run.id,
+                        after,
+                        limit: 200,
+                    })
+                    .await
+                    .map_err(map_store_error)?;
+                for item in page.items {
+                    match item.kind.as_str() {
+                        "user_input_requested" => {
+                            requested.push_back((item.id, item.body));
+                        }
+                        "user_input_responded" => {
+                            requested.pop_front();
+                        }
+                        _ => {}
+                    }
+                }
+                after = page.next_after;
+                if after.is_none() {
+                    break;
+                }
+            }
+            pending_user_inputs.extend(requested.into_iter().map(|(request_id, prompt)| {
+                WorkItemPendingUserInput {
+                    run_id: run.id,
+                    request_id,
+                    prompt,
+                }
+            }));
+        }
         Ok(WorkItemSnapshotEnvelope {
-            revision: self.snapshot_revision(id, work_item.revision.get()).await,
+            revision,
             work_item,
+            runs,
+            pending_approvals,
+            pending_user_inputs,
         })
     }
 
@@ -299,19 +377,19 @@ impl DesktopApi {
             })
             .await
             .map_err(map_store_error)?;
-        let mut revision = page
-            .items
-            .iter()
-            .map(|item| item.revision.get())
-            .max()
-            .unwrap_or(0);
-        for item in &page.items {
-            revision = revision.max(self.snapshot_revision(item.id, item.revision.get()).await);
-        }
         Ok(WorkItemListEnvelope {
-            items: page.items,
+            items: page
+                .items
+                .into_iter()
+                .map(|work_item| {
+                    let revision = work_item.revision.get();
+                    WorkItemListItem {
+                        work_item,
+                        revision,
+                    }
+                })
+                .collect(),
             next_after: page.next_after,
-            revision,
         })
     }
 
@@ -352,20 +430,14 @@ impl DesktopApi {
     }
 
     pub async fn connection_get(&self, id: ConnectionId) -> Result<ConnectionEnvelope> {
-        let connection = self
+        let snapshot = self
             .config
             .get_connection(id)
             .await
             .map_err(map_config_error)?;
-        let config_revision = self
-            .config
-            .list_connections()
-            .await
-            .map_err(map_config_error)?
-            .config_revision;
         Ok(ConnectionEnvelope {
-            config_revision,
-            connection,
+            config_revision: snapshot.config_revision,
+            connection: snapshot.connection,
         })
     }
 
@@ -443,7 +515,7 @@ impl DesktopApi {
             .set_connection_credential(SetConnectionCredentialCommand {
                 connection_id,
                 slot,
-                value: value.into(),
+                value: yakshed_application::SecretValue::new(value.into()),
                 overwrite,
             })
             .await
@@ -470,7 +542,6 @@ impl DesktopApi {
             .map_err(map_store_error)?
             .revision
             .get();
-        let revision = self.snapshot_revision(work_item_id, revision).await;
         Ok(ArtifactListEnvelope {
             revision,
             artifacts: artifacts
@@ -491,6 +562,11 @@ impl DesktopApi {
         artifact_id: ArtifactId,
         max_bytes: u64,
     ) -> Result<OpenArtifactEnvelope> {
+        if max_bytes == 0 || max_bytes > MAX_OPEN_ARTIFACT_BYTES {
+            return Err(DesktopError::invalid_request(
+                "artifact byte limit must be 1..8MiB",
+            ));
+        }
         let OpenArtifactPayload { artifact, bytes } = self
             .artifacts
             .open_artifact(OpenArtifactCommand {
@@ -516,14 +592,41 @@ impl DesktopApi {
         })
     }
 
-    async fn snapshot_revision(&self, work_item_id: WorkItemId, fallback: u64) -> u64 {
-        let current = *self
-            .event_revisions
-            .lock()
+    pub async fn get_work_item_timeline_page(
+        &self,
+        work_item_id: WorkItemId,
+        run_id: RunId,
+        after: Option<TimelineRevision>,
+        limit: u32,
+    ) -> Result<WorkItemTimelineEnvelope> {
+        let run = self.store.get_run(run_id).await.map_err(map_store_error)?;
+        if run.work_item_id != work_item_id {
+            return Err(DesktopError::invalid_request(
+                "run does not belong to work item",
+            ));
+        }
+        let work_item_revision = self
+            .store
+            .get_work_item(work_item_id)
             .await
-            .get(&work_item_id)
-            .unwrap_or(&fallback);
-        current.max(fallback)
+            .map_err(map_store_error)?
+            .revision
+            .get();
+        let page = self
+            .store
+            .list_timeline_page(yakshed_application::ListTimeline {
+                run_id,
+                after,
+                limit,
+            })
+            .await
+            .map_err(map_store_error)?;
+        Ok(WorkItemTimelineEnvelope {
+            run_id,
+            work_item_revision,
+            items: page.items,
+            next_after: page.next_after,
+        })
     }
 }
 
@@ -580,10 +683,13 @@ fn map_frontend_event(event: AppEvent) -> FrontendEvent {
 
 fn map_run_status(status: RunStatus) -> FrontendRunStatus {
     match status {
+        RunStatus::Starting => FrontendRunStatus::Starting,
         RunStatus::Running => FrontendRunStatus::Running,
         RunStatus::Completed => FrontendRunStatus::Completed,
         RunStatus::Failed => FrontendRunStatus::Failed,
         RunStatus::Interrupted => FrontendRunStatus::Interrupted,
+        RunStatus::Disconnected => FrontendRunStatus::Disconnected,
+        RunStatus::OutcomeUnknown => FrontendRunStatus::OutcomeUnknown,
     }
 }
 
@@ -667,6 +773,17 @@ fn map_secret_error(error: SecretPortError) -> DesktopError {
         SecretPortError::ConnectionNotFound | SecretPortError::BindingNotFound => {
             DesktopError::not_found("connection or binding not found")
         }
+        SecretPortError::BackendUnavailable => DesktopError::new(
+            DesktopErrorCode::BackendUnavailable,
+            "secret backend unavailable",
+        ),
+        SecretPortError::Locked => DesktopError::invalid_request("secret backend is locked"),
+        SecretPortError::Denied => DesktopError::unsupported("secret backend denied access"),
+        SecretPortError::AuthenticationRequired => {
+            DesktopError::unsupported("secret backend authentication required")
+        }
+        SecretPortError::AlreadyExists => DesktopError::conflict("credential already exists"),
+        SecretPortError::UncertainWrite => DesktopError::outcome_unknown("secret write uncertain"),
         SecretPortError::NotSecretBacked => {
             DesktopError::unsupported("credential binding is not secret-backed")
         }

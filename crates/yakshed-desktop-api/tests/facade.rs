@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::Read,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -55,12 +55,12 @@ async fn work_item_create_snapshot_round_trip() {
         .await
         .unwrap();
     assert_eq!(created.work_item.id, fetched.work_item.id);
-    assert_eq!(created.revision, fetched.revision);
+    assert_eq!(created.work_item.revision, fetched.work_item.revision);
     assert!(
         listed
             .items
             .iter()
-            .any(|item| item.id == created.work_item.id)
+            .any(|item| item.work_item.id == created.work_item.id)
     );
 }
 
@@ -287,7 +287,7 @@ async fn event_revisions_are_monotonic_and_overflow_recovers_via_snapshot() {
     let fixture = TestFixture::new().await;
     let api = fixture
         .api_for_plan(MockRunPlan::new(
-            (0..600)
+            (0..48)
                 .map(|index| MockScriptStep::file_mutation(format!("file-{index}"), "updated"))
                 .chain(std::iter::once(MockScriptStep::complete()))
                 .collect(),
@@ -297,34 +297,47 @@ async fn event_revisions_are_monotonic_and_overflow_recovers_via_snapshot() {
         .get_work_item_snapshot(fixture.work_item_id)
         .await
         .unwrap()
+        .work_item
         .revision;
     let mut events = api.subscribe_events();
     let run_id = api
         .start_run(fixture.work_item_id, fixture.connection_id, "overflow")
         .await
         .unwrap();
-    wait_for_run_completion(&fixture.store, run_id).await;
-    let mut revisions = Vec::new();
-    let deadline = Instant::now() + Duration::from_millis(250);
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(25), events.recv()).await {
-            Ok(Ok(event)) => {
-                revisions.push(event.revision);
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = api
+                .get_work_item_snapshot(fixture.work_item_id)
+                .await
+                .unwrap();
+            if snapshot
+                .runs
+                .iter()
+                .any(|run| run.id == run_id && run.status == RunStatus::Completed)
+            {
+                break snapshot;
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-            Ok(Err(_)) => break,
-            Err(_) => break,
+            tokio::task::yield_now().await;
         }
+    })
+    .await
+    .unwrap();
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
     }
-    assert!(!revisions.is_empty());
-    assert!(revisions.windows(2).all(|pair| pair[1] >= pair[0]));
-    let snapshot = api
-        .get_work_item_snapshot(fixture.work_item_id)
+    assert!(matches!(
+        events.recv().await,
+        Err(broadcast::error::RecvError::Lagged(_))
+    ));
+    assert!(snapshot.work_item.revision > baseline);
+    assert_eq!(snapshot.runs.len(), 1);
+    assert!(snapshot.pending_approvals.is_empty());
+    assert!(snapshot.pending_user_inputs.is_empty());
+    let timeline = api
+        .get_work_item_timeline_page(fixture.work_item_id, run_id, None, 50)
         .await
         .unwrap();
-    assert!(snapshot.revision > baseline);
-    let run_snapshot = fixture.store.get_run(run_id).await.unwrap();
-    assert_eq!(run_snapshot.status, RunStatus::Completed);
+    assert_eq!(timeline.items.len(), 48);
 }
 
 #[tokio::test]
@@ -393,11 +406,11 @@ async fn clear_cache_removes_entries() {
 }
 
 #[tokio::test]
-async fn event_revision_model_recovers_after_gap() {
+async fn event_revisions_are_contiguous_without_gap() {
     let fixture = TestFixture::new().await;
     let api = fixture
         .api_for_plan(MockRunPlan::new(
-            (0..140)
+            (0..40)
                 .map(|index| MockScriptStep::message(format!("m{index}")))
                 .chain(std::iter::once(MockScriptStep::complete()))
                 .collect(),
@@ -428,6 +441,50 @@ async fn event_revision_model_recovers_after_gap() {
         revisions.windows(2).all(|pair| pair[1] == pair[0] + 1),
         "front-end-visible revisions are monotonic"
     );
+    let snapshot = api
+        .get_work_item_snapshot(fixture.work_item_id)
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .is_some_and(|run| run.status == RunStatus::Completed)
+    );
+    let timeline = api
+        .get_work_item_timeline_page(fixture.work_item_id, run_id, None, 50)
+        .await
+        .unwrap();
+    assert!(!timeline.items.is_empty());
+}
+
+#[tokio::test]
+async fn open_artifact_rejects_unbounded_request() {
+    let fixture = TestFixture::new().await;
+    let api = fixture.api_no_run();
+    let bytes = b"bounded".to_vec();
+    let artifact = fixture
+        .artifact_port
+        .publish(
+            fixture.work_item_id,
+            None,
+            ArtifactKind::File,
+            "text/plain",
+            &bytes,
+        )
+        .await
+        .unwrap();
+    let result = api
+        .open_artifact(fixture.work_item_id, artifact.id, u64::MAX)
+        .await;
+    assert!(matches!(
+        result,
+        Err(yakshed_desktop_api::DesktopError {
+            code: yakshed_desktop_api::DesktopErrorCode::InvalidRequest,
+            ..
+        })
+    ));
 }
 
 struct TestFixture {
@@ -674,7 +731,7 @@ impl ConfigPort for TestConfigPort {
     async fn get_connection(
         &self,
         connection_id: ConnectionId,
-    ) -> Result<PublicConnection, ConfigPortError> {
+    ) -> Result<yakshed_application::ConfigConnectionSnapshot, ConfigPortError> {
         let snapshot = self.store.snapshot();
         let connections = snapshot.config.connections;
         let Some(connection) = connections
@@ -683,7 +740,10 @@ impl ConfigPort for TestConfigPort {
         else {
             return Err(ConfigPortError::NotFound);
         };
-        Ok(to_public_connection(connection))
+        Ok(yakshed_application::ConfigConnectionSnapshot {
+            config_revision: snapshot.revision,
+            connection: to_public_connection(connection),
+        })
     }
 
     async fn list_connections(
@@ -744,7 +804,7 @@ impl SecretPort for TestSecretPort {
                 std::slice::from_ref(connection),
                 binding,
                 &context,
-                &SecretString::from(command.value),
+                &SecretString::from(command.value.expose()),
                 PutSecretOptions {
                     overwrite: command.overwrite,
                 },
@@ -1197,6 +1257,9 @@ async fn wait_for_frontend_status(
                         RunStatus::Completed => FrontendRunStatus::Completed,
                         RunStatus::Failed => FrontendRunStatus::Failed,
                         RunStatus::Interrupted => FrontendRunStatus::Interrupted,
+                        RunStatus::Starting => FrontendRunStatus::Starting,
+                        RunStatus::Disconnected => FrontendRunStatus::Disconnected,
+                        RunStatus::OutcomeUnknown => FrontendRunStatus::OutcomeUnknown,
                     }
                 )
         },
@@ -1229,6 +1292,9 @@ async fn wait_for_frontend_status_with_revisions(
                 RunStatus::Completed => FrontendRunStatus::Completed,
                 RunStatus::Failed => FrontendRunStatus::Failed,
                 RunStatus::Interrupted => FrontendRunStatus::Interrupted,
+                RunStatus::Starting => FrontendRunStatus::Starting,
+                RunStatus::Disconnected => FrontendRunStatus::Disconnected,
+                RunStatus::OutcomeUnknown => FrontendRunStatus::OutcomeUnknown,
             }
         ) {
             return event;
