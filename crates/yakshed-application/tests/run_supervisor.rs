@@ -1210,7 +1210,10 @@ async fn failed_request_restore_keeps_run_recoverable() {
         Arc::new(FixedClock),
         Arc::new(SystemIdGenerator),
     );
-    assert!(matches!(restarted.ready().await, Err(RunOrchestrationError::Store(_))));
+    assert!(matches!(
+        restarted.ready().await,
+        Err(RunOrchestrationError::Store(_))
+    ));
     assert_eq!(
         context.store.get_run(run_id).await.unwrap().status,
         RunStatus::Disconnected
