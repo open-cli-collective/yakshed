@@ -110,6 +110,7 @@ macro_rules! opaque_provider_id {
 opaque_provider_id!(ProviderSessionId, "provider session id");
 opaque_provider_id!(ProviderRunId, "provider run id");
 opaque_provider_id!(ProviderRequestId, "provider request id");
+opaque_provider_id!(ProviderCommandId, "provider command id");
 opaque_provider_id!(SessionPageCursor, "session page cursor");
 
 fn validate_opaque_id(label: &str, value: String) -> Result<String, HarnessError> {
@@ -169,6 +170,32 @@ impl fmt::Display for ProviderRunHandle {
 pub struct ProviderRequestHandle {
     run: ProviderRunHandle,
     native_id: ProviderRequestId,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderCommandHandle {
+    run: ProviderRunHandle,
+    native_id: ProviderCommandId,
+}
+
+impl ProviderCommandHandle {
+    pub fn new(run: ProviderRunHandle, native_id: ProviderCommandId) -> Self {
+        Self { run, native_id }
+    }
+
+    pub fn run(&self) -> &ProviderRunHandle {
+        &self.run
+    }
+
+    pub fn native_id(&self) -> &ProviderCommandId {
+        &self.native_id
+    }
+}
+
+impl fmt::Display for ProviderCommandHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.run, self.native_id)
+    }
 }
 
 impl ProviderRequestHandle {
@@ -377,10 +404,20 @@ pub enum HarnessEvent {
         summary: String,
         native: NativePayload,
     },
-    CommandOutput {
+    /// Transient command output chunk; consumers append but do not finalize from this event.
+    CommandOutputDelta {
         run: ProviderRunHandle,
-        command: String,
+        command: ProviderCommandHandle,
+        command_text: String,
         chunk: String,
+        native: NativePayload,
+    },
+    /// Authoritative completed command output; consumers replace/finalize from this event.
+    CommandOutputCompleted {
+        run: ProviderRunHandle,
+        command: ProviderCommandHandle,
+        command_text: String,
+        output: String,
         native: NativePayload,
     },
     RunTerminal {
@@ -409,7 +446,8 @@ impl HarnessEvent {
             | Self::ApprovalRequested { native, .. }
             | Self::UserInputRequested { native, .. }
             | Self::FileMutation { native, .. }
-            | Self::CommandOutput { native, .. }
+            | Self::CommandOutputDelta { native, .. }
+            | Self::CommandOutputCompleted { native, .. }
             | Self::RunTerminal { native, .. }
             | Self::Unknown { native, .. }
             | Self::MalformedNativePayload { native, .. } => native,
@@ -424,7 +462,8 @@ impl HarnessEvent {
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::UserInputRequested { .. } => "user_input_requested",
             Self::FileMutation { .. } => "file_mutation",
-            Self::CommandOutput { .. } => "command_output",
+            Self::CommandOutputDelta { .. } => "command_output_delta",
+            Self::CommandOutputCompleted { .. } => "command_output_completed",
             Self::RunTerminal { .. } => "run_terminal",
             Self::Unknown { .. } => "unknown",
             Self::MalformedNativePayload { .. } => "malformed_native_payload",
@@ -452,6 +491,8 @@ pub enum HarnessError {
     Overloaded,
     #[error("runtime is disconnected")]
     Disconnected,
+    #[error("outcome is unknown for mutating operation: {operation}")]
+    OutcomeUnknown { operation: &'static str },
     #[error("harness event stream is closed")]
     Closed,
     #[error("provider protocol failure: {diagnostic}")]

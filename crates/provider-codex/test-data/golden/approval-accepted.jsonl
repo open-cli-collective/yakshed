@@ -1,0 +1,2 @@
+{"id":"approval-accepted","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-golden","turnId":"turn-golden","itemId":"command-1","startedAtMs":1,"command":"cargo test","reason":"run tests"}}
+{"id":"approval-accepted","result":{"decision":"accept"}}

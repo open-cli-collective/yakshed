@@ -10,10 +10,11 @@ use yakshed_domain::{ConnectionId, CredentialSlot};
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery, HarnessCredentialRequirement,
     HarnessDescriptor, HarnessError, HarnessEvent, HarnessEventPermit, HarnessEventSender,
-    HarnessInput, HarnessRunTerminal, NativePayload, Page, ProviderEventStream,
-    ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle, ProviderRunId,
-    ProviderSession, ProviderSessionId, ProviderSessionSummary, RunOptions, RuntimeHandle,
-    SanitizedDiagnostic, SessionPageCursor, SessionQuery, StartSessionSpec, event_channel,
+    HarnessInput, HarnessRunTerminal, NativePayload, Page, ProviderCommandHandle,
+    ProviderCommandId, ProviderEventStream, ProviderRequestHandle, ProviderRequestId,
+    ProviderResponse, ProviderRunHandle, ProviderRunId, ProviderSession, ProviderSessionId,
+    ProviderSessionSummary, RunOptions, RuntimeHandle, SanitizedDiagnostic, SessionPageCursor,
+    SessionQuery, StartSessionSpec, event_channel,
 };
 
 /// Deterministic run/runtime faults. `DelayApproval` is released manually rather than by sleep.
@@ -77,6 +78,7 @@ pub enum MockScriptStep {
         native: String,
     },
     CommandOutput {
+        command_id: Option<String>,
         command: String,
         chunk: String,
         native: String,
@@ -147,6 +149,7 @@ impl MockScriptStep {
         let command = command.into();
         let chunk = chunk.into();
         Self::CommandOutput {
+            command_id: None,
             native: format!(
                 r#"{{"type":"command.output","command":{command:?},"chunk":{chunk:?}}}"#
             ),
@@ -179,6 +182,7 @@ impl MockScriptStep {
 struct RunRecord {
     active: bool,
     delayed: bool,
+    next_command_id: u64,
     steps: VecDeque<MockScriptStep>,
     fault: Option<MockHarnessFault>,
     pending: Option<PendingDelivery>,
@@ -767,13 +771,30 @@ impl MockHarness {
                 MockScriptStep::CommandOutput {
                     command,
                     chunk,
+                    command_id,
                     native,
                 } => PendingDelivery {
-                    event: HarnessEvent::CommandOutput {
-                        run: run_handle.clone(),
-                        command,
-                        chunk,
-                        native: self.native(native),
+                    event: {
+                        let command_text = command.clone();
+                        let command_id = command_id
+                            .clone()
+                            .or_else(|| {
+                                let record = state.runs.get_mut(run_handle).expect("run exists");
+                                let id = format!("command-{:04}", record.next_command_id);
+                                record.next_command_id += 1;
+                                Some(id)
+                            })
+                            .expect("command id");
+                        let command_id =
+                            ProviderCommandId::new(command_id).expect("invalid command id");
+                        let command = ProviderCommandHandle::new(run_handle.clone(), command_id);
+                        HarnessEvent::CommandOutputCompleted {
+                            run: run_handle.clone(),
+                            command,
+                            command_text,
+                            output: chunk,
+                            native: self.native(native),
+                        }
                     },
                     commit: DeliveryCommit::Step {
                         terminal_after: None,
@@ -1055,6 +1076,7 @@ impl HarnessAdapter for MockHarness {
                 RunRecord {
                     active: true,
                     delayed: false,
+                    next_command_id: 1,
                     steps: plan.steps,
                     fault,
                     pending,
