@@ -8,7 +8,7 @@
 
 YakShed should be a **work-centric desktop control plane over provider-owned agent harnesses**.
 
-It should not reimplement the Codex agent loop, tool system, session persistence, approvals, authentication, or operating-system sandbox. For Codex, YakShed should launch a pinned `codex` executable, connect to `codex app-server`, translate its protocol into YakShed’s domain model, and supervise the resulting process. Codex App Server is explicitly intended for rich clients that need authentication, conversation history, approvals, and streamed agent events.[^codex-app-server]
+It should not reimplement the Codex agent loop, tool system, session persistence, approvals, authentication, or operating-system sandbox. For Codex, YakShed should launch the latest available `codex` executable, connect to `codex app-server`, translate its protocol into YakShed’s domain model, and supervise the resulting process. Codex App Server is explicitly intended for rich clients that need authentication, conversation history, approvals, and streamed agent events.[^codex-app-server]
 
 The differentiated product is not “a prettier terminal.” It is the structure around the work:
 
@@ -135,7 +135,7 @@ A provider session should remain bound to the connection that created it. Changi
 │  │                                                                 │ │
 │  │  CodexAdapter                                                   │ │
 │  │    └── CodexRpcClient                                           │ │
-│  │          └── pinned `codex app-server` process                  │ │
+│  │          └── latest-tracking `codex app-server` process         │ │
 │  │                                                                 │ │
 │  │  ClaudeAdapter                                                  │ │
 │  │    └── Claude SDK/CLI process                                   │ │
@@ -181,15 +181,15 @@ App Server uses a JSON-RPC-like bidirectional protocol and can generate TypeScri
 
 Treat the executable and generated protocol schema as the supported boundary. Avoid a Git dependency on internal Codex Rust crates unless OpenAI publishes an independently versioned, supported client crate. Linking against workspace internals would couple YakShed’s build graph to implementation details while the shipped sidecar could still be a different version.
 
-### Bundle a pinned binary
+### Track the latest binary
 
-Tauri supports external sidecar binaries through `bundle.externalBin`.[^tauri-sidecar] The normal release channel should bundle a known Codex version and test the exact app/binary/schema combination.
+Tauri supports external sidecar binaries through `bundle.externalBin`.[^tauri-sidecar] The normal release channel should resolve the latest stable Codex version and record the exact app/binary/schema combination last validated.
 
 Maintain a lock record such as:
 
 ```json
 {
-  "codex_version": "<pinned-version>",
+  "codex_version": "<last-validated-version>",
   "targets": {
     "aarch64-apple-darwin": {
       "asset": "...",
@@ -201,7 +201,7 @@ Maintain a lock record such as:
 }
 ```
 
-Offer a system-installed binary only as an explicit advanced mode. Probe and display its version, and warn or refuse when it falls outside YakShed’s tested compatibility range.
+Offer a system-installed binary only as an explicit advanced mode. Probe and display its version and last-validated status, but do not reject a newer runtime by version.
 
 ### Process topology
 
@@ -911,7 +911,7 @@ The protocol spike is not complete until server-initiated requests work. Streami
 
 1. YakShed is a work-management and supervision product, not an agent-harness reimplementation.
 2. Codex App Server over stdio is the primary Codex integration.
-3. The Codex executable is a pinned, supervised sidecar rather than a linked library.
+3. The Codex executable is a latest-tracking, supervised sidecar rather than a linked library.
 4. App `WorkItem` and provider `Session` remain separate entities.
 5. The work graph, notes, todos, labels, and working-copy allocation are YakShed-owned.
 6. Provider context, native session history, sandbox, approvals, and delegated auth remain harness-owned.

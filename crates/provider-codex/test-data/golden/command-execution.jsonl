@@ -1,3 +1,3 @@
-{"method":"item/started","params":{"threadId":"thread-golden","turnId":"turn-golden","startedAtMs":1,"item":{"id":"command-1","type":"commandExecution","command":"cargo test"}}}
+{"method":"item/started","params":{"threadId":"thread-golden","turnId":"turn-golden","startedAtMs":3,"item":{"id":"command-1","type":"commandExecution","command":"cargo test"}}}
 {"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-golden","turnId":"turn-golden","itemId":"command-1","delta":"ok"}}
-{"method":"item/completed","params":{"threadId":"thread-golden","turnId":"turn-golden","completedAtMs":2,"item":{"id":"command-1","type":"commandExecution","command":"cargo test","aggregatedOutput":"ok"}}}
+{"method":"item/completed","params":{"threadId":"thread-golden","turnId":"turn-golden","completedAtMs":4,"item":{"id":"command-1","type":"commandExecution","command":"cargo test","aggregatedOutput":"ok"}}}

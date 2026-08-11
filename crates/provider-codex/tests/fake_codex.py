@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic pinned-schema App Server fake. No network or real Codex state."""
+"""Deterministic last-validated-schema App Server fake. No network or real Codex state."""
 
 import json
 import os
@@ -18,6 +18,57 @@ threads = []
 initialized = False
 active = None
 boundary_errors = set()
+recorded = {}
+
+
+def record_golden(value):
+    if os.environ.get("YAKSHED_UPDATE_GOLDEN") != "1":
+        return
+    method = value.get("method")
+    params = value.get("params", {})
+    item = params.get("item", {})
+    name = None
+    if SCENARIO in ("chunked", "transport_split_batch"):
+        if method == "item/agentMessage/delta" or item.get("type") == "agentMessage" or method == "turn/completed":
+            name = "simple-answer"
+        elif method == "item/commandExecution/outputDelta" or item.get("type") == "commandExecution":
+            name = "command-execution"
+        elif item.get("type") == "fileChange":
+            name = "file-change"
+    elif SCENARIO == "approval" and method == "item/commandExecution/requestApproval":
+        name = "approval-accepted"
+    elif SCENARIO == "approval" and value.get("id") == "request-0001" and "result" in value:
+        name = "approval-accepted"
+    elif SCENARIO == "file_approval" and method == "item/fileChange/requestApproval":
+        name = "approval-declined"
+    elif SCENARIO == "file_approval" and value.get("id") == "approval-declined" and "result" in value:
+        name = "approval-declined"
+    elif SCENARIO == "user_input" and method == "item/tool/requestUserInput":
+        name = "user-input"
+    elif SCENARIO == "user_input" and value.get("id") == "request-0001" and "result" in value:
+        name = "user-input"
+    elif method == "item/agentMessage/delta" and params.get("itemId") == "steer-1":
+        name = "steer"
+    elif method == "turn/completed" and params.get("turn", {}).get("status") == "interrupted":
+        name = "interrupt"
+    elif SCENARIO == "unknown" and method == "codex/future":
+        name = "unknown-event"
+    if name:
+        serialized = (
+            json.dumps(value, separators=(",", ":"))
+            .replace("thread-1", "thread-golden")
+            .replace("turn-1", "turn-golden")
+        )
+        if name == "approval-accepted":
+            serialized = serialized.replace("request-0001", "approval-accepted")
+        elif name == "user-input":
+            serialized = serialized.replace("request-0001", "user-input-1")
+        normalized = json.loads(serialized)
+        recorded.setdefault(name, []).append(normalized)
+        path = os.path.join(os.path.dirname(__file__), "..", "test-data", "golden", f"{name}.jsonl")
+        with open(path, "w", encoding="utf-8") as fixture:
+            for event in recorded[name]:
+                fixture.write(json.dumps(event, separators=(",", ":")) + "\n")
 
 
 def encoded(value):
@@ -25,6 +76,7 @@ def encoded(value):
 
 
 def emit(value, split=False):
+    record_golden(value)
     data = encoded(value)
     if split:
         offsets = (1, 3, 7, len(data))
@@ -37,6 +89,8 @@ def emit(value, split=False):
 
 
 def emit_batch(values):
+    for value in values:
+        record_golden(value)
     os.write(1, b"".join(encoded(value) for value in values))
 
 
@@ -280,6 +334,10 @@ def run_events():
             }
         )
     elif SCENARIO == "malformed":
+        if os.environ.get("YAKSHED_UPDATE_GOLDEN") == "1":
+            path = os.path.join(os.path.dirname(__file__), "..", "test-data", "golden", "malformed-frame.jsonl")
+            with open(path, "w", encoding="utf-8") as fixture:
+                fixture.write("{not-json\n")
         os.write(1, b"{not-json\n")
         terminal()
     elif SCENARIO == "canary_event":
@@ -319,6 +377,7 @@ def run_events():
 
 for line in sys.stdin:
     message = json.loads(line)
+    record_golden(message)
     method = message.get("method")
     request_id = message.get("id")
 

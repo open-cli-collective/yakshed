@@ -31,7 +31,7 @@
   "stable_schema_sha256": "eb325d394d19f2f8d133203885b3d1c2f74dbc5a176f22078a4f99aae5926faa",
   "stable_schema_digest_method": "scripts/verify_schema_pin.py — locale-independent: sha256 of newline-joined `<sha256(file)>  <posix relpath>` lines over pins/codex-app-server-schema/, files ordered by POSIX relative path. The script is the canonical implementation; run `python3 scripts/verify_schema_pin.py` to verify.",
   "schema_generation_command": "codex app-server generate-json-schema --out pins/codex-app-server-schema",
-  "schema_provenance": "Generated output verified byte-identical (diff -rq) between the local Homebrew codex 0.147.0 and the codex-aarch64-apple-darwin release asset for rust-v0.147.0, downloaded and digest-checked (sha256 75984b81f92a…) on 2026-08-09.",
+  "schema_provenance": "Last validated generated output was byte-identical (diff -rq) between the local Homebrew codex 0.147.0 and the codex-aarch64-apple-darwin release asset for rust-v0.147.0, downloaded and digest-checked (sha256 75984b81f92a…) on 2026-08-09.",
   "adapter_revision": 1,
   "toolchain": {
     "rust": "1.96.0",
@@ -53,5 +53,5 @@
     }
   },
   "pinned_at": "2026-08-09",
-  "notes": "Local development machines may run codex 0.147.0 from Homebrew; the Homebrew binary's digest will not match the release tarball digests above. The release assets are what CI and packaging must verify. The `codex-app-server-*` standalone binaries also exist in the release; YakShed pins the main `codex` binary and invokes `codex app-server` per overall.md §5."
+  "notes": "YakShed tracks the latest stable Codex release at runtime; 0.147.0 is the last version validated against the adapter and committed schema, not a runtime gate. Release-asset digests support reproducible validation and drift detection. The `codex-app-server-*` standalone binaries also exist; YakShed invokes the main `codex` binary as `codex app-server` per overall.md §5."
 }

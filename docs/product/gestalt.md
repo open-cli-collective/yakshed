@@ -76,7 +76,7 @@ YakShed is therefore both conversational and operational. The conversation is im
 
 Codex, Claude Code, and future agent systems have their own strengths and their own native concepts. YakShed should consume those harnesses rather than rebuilding their agent loops.
 
-For Codex, the intended shape is a pinned `codex app-server` process supervised by Rust. Codex owns its thread semantics, model interaction, tool execution, sandbox, approvals, context management, and delegated login. YakShed translates those events into its own product projections and attaches them to work items.
+For Codex, the intended shape is a latest-tracking `codex app-server` process supervised by Rust. Codex owns its thread semantics, model interaction, tool execution, sandbox, approvals, context management, and delegated login. YakShed translates those events into its own product projections and attaches them to work items.
 
 The same principle applies to other harnesses:
 
