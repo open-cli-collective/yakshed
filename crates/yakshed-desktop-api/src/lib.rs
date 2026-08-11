@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+pub use yakshed_application::RunOrchestrationError;
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
     Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem, IdGenerator, ListWorkItems,
     OpenArtifactCommand, OpenArtifactPayload, PublicCredentialBinding, PublicCredentialSource,
-    PutConnectionCommand, RunHarness, RunOrchestrationError, RunSupervisor, SecretPort,
-    SecretPortError, SetConnectionCredentialCommand, StoreError,
+    PutConnectionCommand, RunHarness, RunSupervisor, SecretPort, SecretPortError,
+    SetConnectionCredentialCommand, StoreError,
 };
 pub use yakshed_application::{ConfigRevision, PublicConnection, UserInputRequestId};
 pub use yakshed_domain::{
@@ -329,7 +330,7 @@ pub struct DesktopApi {
 
 impl DesktopApi {
     /// Drops oldest events on overflow; consumers recovering missed revisions must call snapshot APIs.
-    pub async fn new(ports: ApiPorts) -> Self {
+    pub async fn new(ports: ApiPorts) -> std::result::Result<Self, RunOrchestrationError> {
         let (events, _) = broadcast::channel(APP_EVENT_CAPACITY);
         let run_supervisor = Arc::new(RunSupervisor::new(
             ports.store.clone(),
@@ -337,7 +338,7 @@ impl DesktopApi {
             ports.clock,
             ports.ids,
         ));
-        run_supervisor.ready().await;
+        run_supervisor.ready().await?;
         let mut source = run_supervisor.subscribe();
         let relay = events.clone();
         tokio::spawn(async move {
@@ -354,7 +355,7 @@ impl DesktopApi {
             }
         });
 
-        Self {
+        Ok(Self {
             store: ports.store,
             run_supervisor,
             config: ports.config,
@@ -362,7 +363,7 @@ impl DesktopApi {
             cache: ports.cache,
             artifacts: ports.artifacts,
             events,
-        }
+        })
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<FrontendEvent> {

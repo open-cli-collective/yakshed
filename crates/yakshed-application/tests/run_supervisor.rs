@@ -1210,16 +1210,11 @@ async fn failed_request_restore_keeps_run_recoverable() {
         Arc::new(FixedClock),
         Arc::new(SystemIdGenerator),
     );
-    restarted.ready().await;
+    assert!(matches!(restarted.ready().await, Err(RunOrchestrationError::Store(_))));
     assert_eq!(
         context.store.get_run(run_id).await.unwrap().status,
         RunStatus::Disconnected
     );
-    restarted.reconcile_run(run_id).await.unwrap();
-    restarted
-        .steer(run_id, "recovered".to_owned())
-        .await
-        .unwrap();
 }
 
 #[tokio::test]

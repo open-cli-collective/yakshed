@@ -25,8 +25,8 @@ use yakshed_application::{
 };
 use yakshed_desktop_api::{ApiPorts, ConnectionInput};
 use yakshed_domain::{
-    ArtifactRecord, Connection, ConnectionId, CredentialBinding, CredentialSlot, ProjectId,
-    ProviderStateRootId, RunId, WorkItemId,
+    ArtifactRecord, Connection, ConnectionId, CredentialBinding, ProjectId, ProviderStateRootId,
+    RunId, WorkItemId,
 };
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessError, HarnessEvent, HarnessInput,
@@ -107,6 +107,32 @@ impl Fixture {
             cache: Arc::new(TestCache),
             artifacts: Arc::new(TestArtifacts),
         }
+    }
+
+    async fn ports_from_paths(paths: AppPaths) -> std::result::Result<ApiPorts, StartupError> {
+        let ids: Arc<dyn IdGenerator> = Arc::new(SystemIdGenerator);
+        let clock = Arc::new(SystemClock);
+        let connection_id = "0193f26e-7a72-7d42-bf77-0de14c4cc001".parse().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(paths.clone(), clock.clone(), ids.clone())
+                .await
+                .map_err(|error| StartupError::persistence(error.to_string()))?,
+        );
+        let harness = MockPort::new(
+            MockRunPlan::new(vec![MockScriptStep::complete()]),
+            connection_id,
+        )
+        .await;
+        Ok(ApiPorts {
+            store,
+            harness,
+            clock,
+            ids,
+            config: Arc::new(TestConfig::new(test_connection(connection_id))),
+            secrets: Arc::new(TestSecrets::default()),
+            cache: Arc::new(TestCache),
+            artifacts: Arc::new(TestArtifacts),
+        })
     }
 }
 
@@ -467,6 +493,21 @@ async fn wait_for_completion(
     .unwrap()
 }
 
+fn has_invalid_request_code(error: &Value) -> bool {
+    error
+        .get("code")
+        .or_else(|| error.pointer("/error/code"))
+        .and_then(Value::as_str)
+        == Some("invalid_request")
+}
+
+fn assert_invalid_request_error(error: Value) {
+    assert!(
+        has_invalid_request_code(&error),
+        "unexpected error payload: {error}"
+    );
+}
+
 #[tokio::test]
 async fn healthy_factory_gates_first_command_on_ready_api() {
     let fixture = Fixture::new().await;
@@ -492,22 +533,105 @@ async fn poisoned_store_factory_returns_serializable_startup_error() {
     let paths = AppPaths::for_test(temp.path());
     std::fs::create_dir_all(&paths.data_root).unwrap();
     std::fs::write(paths.data_root.join("yakshed.sqlite3"), b"not sqlite").unwrap();
-    let error =
-        match SqliteStore::open(paths, Arc::new(SystemClock), Arc::new(SystemIdGenerator)).await {
-            Ok(_) => panic!("poisoned store unexpectedly opened"),
-            Err(error) => error,
-        };
-    let startup = match initialize(async {
-        Err::<ApiPorts, _>(StartupError::persistence(error.to_string()))
-    })
-    .await
-    {
+    let startup = match initialize(async { Fixture::ports_from_paths(paths).await }).await {
         Ok(_) => panic!("poisoned startup unexpectedly succeeded"),
         Err(error) => error,
     };
     assert_eq!(
         serde_json::to_value(startup).unwrap()["code"],
         "persistence_error"
+    );
+}
+
+#[tokio::test]
+async fn malformed_command_ids_are_rejected_as_invalid_request() {
+    let fixture = Fixture::new().await;
+    let state = initialize(async { Ok(fixture.ports(0).await) })
+        .await
+        .unwrap();
+    let (_app, webview) = build_app(state);
+    assert_invalid_request_error(
+        invoke(
+            &webview,
+            "create_project",
+            json!({ "id": "not-a-project", "name": "bad" }),
+        )
+        .unwrap_err(),
+    );
+    assert_invalid_request_error(
+        invoke(
+            &webview,
+            "start_run",
+            json!({
+                "workItemId": fixture.work_item_id,
+                "connectionId": "not-a-connection",
+                "input": "payload"
+            }),
+        )
+        .unwrap_err(),
+    );
+    assert_invalid_request_error(
+        invoke(
+            &webview,
+            "get_pending_user_input_page",
+            json!({
+                "workItemId": fixture.work_item_id,
+                "runId": "not-a-run",
+                "after": "not-a-request",
+                "limit": 10,
+                "expectedRevision": null,
+            }),
+        )
+        .unwrap_err(),
+    );
+}
+
+#[tokio::test]
+async fn malformed_command_payloads_are_rejected_as_invalid_request() {
+    let fixture = Fixture::new().await;
+    let state = initialize(async { Ok(fixture.ports(0).await) })
+        .await
+        .unwrap();
+    let (_app, webview) = build_app(state);
+    assert_invalid_request_error(
+        invoke(
+            &webview,
+            "resolve_approval",
+            json!({ "approvalId": yakshed_domain::ApprovalRequestId::new_v7(), "decision": "undecided" }),
+        )
+        .unwrap_err(),
+    );
+    assert_invalid_request_error(
+        invoke(
+            &webview,
+            "set_connection_credential",
+            json!({
+                "connectionId": fixture.connection_id,
+                "slot": "",
+                "value": "secret",
+                "overwrite": false,
+            }),
+        )
+        .unwrap_err(),
+    );
+    assert_invalid_request_error(
+        invoke(
+            &webview,
+            "connection_put",
+            json!({
+                "expectedConfigRevision": 0,
+                "connection": {
+                    "id": fixture.connection_id,
+                    "name": "bad",
+                    "harness": "scripted",
+                    "model_provider": "mock",
+                    "provider_state": "",
+                    "credentials": [],
+                },
+                "ensureMemorySecretBackend": false,
+            }),
+        )
+        .unwrap_err(),
     );
 }
 
@@ -519,7 +643,9 @@ async fn every_registered_handler_is_invocable_against_a_real_desktop_api() {
         .unwrap();
     let (_app, webview) = build_app(state);
     let new_project = ProjectId::new_v7();
-    let second_connection = "0193f26e-7a72-7d42-bf77-0de14c4cc002".parse().unwrap();
+    let second_connection = "0193f26e-7a72-7d42-bf77-0de14c4cc002"
+        .parse::<ConnectionId>()
+        .unwrap();
     let mut invoked = BTreeSet::new();
     macro_rules! call {
         ($name:literal, $body:expr) => {{
@@ -576,7 +702,7 @@ async fn every_registered_handler_is_invocable_against_a_real_desktop_api() {
         json!({
             "expectedConfigRevision": 0,
             "connection": ConnectionInput {
-                id: second_connection,
+                id: second_connection.to_string(),
                 name: "second".to_owned(),
                 harness: "scripted".to_owned(),
                 model_provider: "mock".to_owned(),
@@ -587,9 +713,16 @@ async fn every_registered_handler_is_invocable_against_a_real_desktop_api() {
         })
     )
     .unwrap();
-    call!("connection_get", json!({ "id": second_connection })).unwrap();
+    call!(
+        "connection_get",
+        json!({ "id": second_connection.to_string() })
+    )
+    .unwrap();
     call!("list_connections", json!({})).unwrap();
-    call!("set_connection_credential", json!({ "connectionId": fixture.connection_id, "slot": CredentialSlot::new("mock.api_key").unwrap(), "value": "secret", "overwrite": false })).unwrap();
+    call!(
+        "set_connection_credential",
+        json!({ "connectionId": fixture.connection_id.to_string(), "slot": "mock.api_key", "value": "secret", "overwrite": false })
+    ).unwrap();
     call!(
         "list_artifacts",
         json!({ "workItemId": fixture.work_item_id })

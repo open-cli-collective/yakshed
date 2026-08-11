@@ -25,7 +25,7 @@ impl From<ApprovalDecisionInput> for ApprovalDecision {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionInput {
-    pub id: ConnectionId,
+    pub id: String,
     pub name: String,
     pub harness: String,
     pub model_provider: String,
@@ -35,7 +35,7 @@ pub struct ConnectionInput {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CredentialBindingInput {
-    pub slot: CredentialSlot,
+    pub slot: String,
     #[serde(flatten)]
     pub source: CredentialSourceInput,
 }
@@ -51,7 +51,10 @@ pub enum CredentialSourceInput {
 impl ConnectionInput {
     pub fn into_public(self) -> Result<PublicConnection> {
         Ok(PublicConnection {
-            id: self.id,
+            id: self
+                .id
+                .parse::<ConnectionId>()
+                .map_err(|error| invalid_input(error.to_string()))?,
             name: self.name,
             harness: self.harness,
             model_provider: self.model_provider,
@@ -62,7 +65,8 @@ impl ConnectionInput {
                 .into_iter()
                 .map(|binding| {
                     Ok(PublicCredentialBinding {
-                        slot: binding.slot,
+                        slot: CredentialSlot::new(binding.slot)
+                            .map_err(|error| invalid_input(error.to_string()))?,
                         source: match binding.source {
                             CredentialSourceInput::Delegated { authority } => {
                                 PublicCredentialSource::Delegated { authority }

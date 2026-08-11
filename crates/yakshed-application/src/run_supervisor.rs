@@ -248,7 +248,7 @@ pub enum AppEventKind {
     },
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum RunOrchestrationError {
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -279,6 +279,7 @@ struct Inner {
     events: broadcast::Sender<AppEvent>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
     startup_done: AtomicBool,
+    startup_error: Mutex<Option<RunOrchestrationError>>,
     startup_notify: Notify,
     start_lock: AsyncMutex<()>,
     state: Mutex<State>,
@@ -368,13 +369,20 @@ impl RunSupervisor {
             events,
             pump: Mutex::new(None),
             startup_done: AtomicBool::new(false),
+            startup_error: Mutex::new(None),
             startup_notify: Notify::new(),
             start_lock: AsyncMutex::new(()),
             state: Mutex::new(State::default()),
         }));
         let inner = Arc::clone(&supervisor.0);
         tokio::spawn(async move {
-            inner.reconcile_startup().await;
+            let error = inner.reconcile_startup().await.err();
+            if let Some(error) = error {
+                *inner
+                    .startup_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+            }
             inner.startup_done.store(true, Ordering::Release);
             inner.startup_notify.notify_waiters();
         });
@@ -387,8 +395,8 @@ impl RunSupervisor {
         self.0.events.subscribe()
     }
 
-    pub async fn ready(&self) {
-        self.0.await_startup().await;
+    pub async fn ready(&self) -> Result<(), RunOrchestrationError> {
+        self.0.await_startup().await
     }
 
     pub async fn start_run(
@@ -413,7 +421,7 @@ impl RunSupervisor {
         connection_id: ConnectionId,
         input: String,
     ) -> Result<RunSnapshot, RunOrchestrationError> {
-        self.0.await_startup().await;
+        self.0.await_startup().await?;
         let _start = self.0.start_lock.lock().await;
         let run_id = self.0.ids.next_run_id();
         self.0
@@ -534,7 +542,7 @@ impl RunSupervisor {
     }
 
     pub async fn steer(&self, run_id: RunId, input: String) -> Result<(), RunOrchestrationError> {
-        self.0.await_startup().await;
+        self.0.await_startup().await?;
         let (run, work_item_id) = self.0.active_run(run_id)?;
         self.0
             .call_harness(run_id, work_item_id, self.0.harness.steer(&run, input))
@@ -542,7 +550,7 @@ impl RunSupervisor {
     }
 
     pub async fn interrupt(&self, run_id: RunId) -> Result<(), RunOrchestrationError> {
-        self.0.await_startup().await;
+        self.0.await_startup().await?;
         let (run, work_item_id) = self.0.active_run(run_id)?;
         self.0
             .call_harness(run_id, work_item_id, self.0.harness.interrupt(&run))
@@ -554,7 +562,7 @@ impl RunSupervisor {
         approval_id: ApprovalRequestId,
         decision: ApprovalDecision,
     ) -> Result<(), RunOrchestrationError> {
-        self.0.await_startup().await;
+        self.0.await_startup().await?;
         let (run_id, request) = self
             .0
             .state
@@ -635,7 +643,7 @@ impl RunSupervisor {
         request_id: UserInputRequestId,
         response: String,
     ) -> Result<(), RunOrchestrationError> {
-        self.0.await_startup().await;
+        self.0.await_startup().await?;
         let (run_id, request) = self
             .0
             .state
@@ -684,7 +692,7 @@ impl RunSupervisor {
     }
 
     pub async fn reconcile_run(&self, run_id: RunId) -> Result<RunSnapshot, RunOrchestrationError> {
-        self.0.await_startup().await;
+        self.0.await_startup().await?;
         let snapshot = self.0.store.get_run(run_id).await?;
         let provider_run = match snapshot.provider_id.clone() {
             Some(provider_id) => ProviderRunRef(provider_id),
@@ -703,11 +711,16 @@ impl RunSupervisor {
 }
 
 impl Inner {
-    async fn await_startup(&self) {
+    async fn await_startup(&self) -> Result<(), RunOrchestrationError> {
         loop {
             let notified = self.startup_notify.notified();
             if self.startup_done.load(Ordering::Acquire) {
-                return;
+                return self
+                    .startup_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .map_or(Ok(()), Err);
             }
             notified.await;
         }
@@ -808,7 +821,7 @@ impl Inner {
         }
     }
 
-    async fn reconcile_startup(self: &Arc<Self>) {
+    async fn reconcile_startup(self: &Arc<Self>) -> Result<(), RunOrchestrationError> {
         let mut after = None;
         loop {
             let page = match self
@@ -817,7 +830,7 @@ impl Inner {
                 .await
             {
                 Ok(page) => page,
-                Err(_) => return,
+                Err(error) => return Err(error.into()),
             };
             for run in page.items {
                 let Some(provider_id) = run.provider_id.clone() else {
@@ -827,31 +840,19 @@ impl Inner {
                         } else {
                             RunStatus::Disconnected
                         };
-                        let _ = self.transition(run.id, run.status, target, None).await;
+                        self.transition(run.id, run.status, target, None).await?;
                     }
                     continue;
                 };
                 let provider_run = ProviderRunRef(provider_id);
-                match self.harness.reconnect(&provider_run).await {
-                    Ok(true) => {
-                        let _ = self.reattach_run(run, provider_run).await;
-                    }
-                    _ if run.status == RunStatus::Starting => {
-                        let _ = self
-                            .transition(
-                                run.id,
-                                RunStatus::Starting,
-                                RunStatus::OutcomeUnknown,
-                                None,
-                            )
-                            .await;
-                    }
-                    _ if run.status == RunStatus::Running => {
-                        let _ = self
-                            .transition(run.id, RunStatus::Running, RunStatus::Disconnected, None)
-                            .await;
-                    }
-                    _ => {}
+                if self.harness.reconnect(&provider_run).await? {
+                    self.reattach_run(run, provider_run).await?;
+                } else if run.status == RunStatus::Starting {
+                    self.transition(run.id, RunStatus::Starting, RunStatus::OutcomeUnknown, None)
+                        .await?;
+                } else if run.status == RunStatus::Running {
+                    self.transition(run.id, RunStatus::Running, RunStatus::Disconnected, None)
+                        .await?;
                 }
             }
             after = page.next_after;
@@ -859,6 +860,7 @@ impl Inner {
                 break;
             }
         }
+        Ok(())
     }
 
     async fn attach_route(
