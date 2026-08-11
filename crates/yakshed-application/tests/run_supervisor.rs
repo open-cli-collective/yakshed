@@ -45,6 +45,7 @@ struct MockPort {
     unknown_interrupt: bool,
     unknown_start: bool,
     fail_stream: AtomicBool,
+    fail_response: AtomicBool,
     stream_failure: Notify,
 }
 
@@ -83,6 +84,7 @@ impl MockPort {
             unknown_interrupt,
             unknown_start,
             fail_stream: AtomicBool::new(false),
+            fail_response: AtomicBool::new(false),
             stream_failure: Notify::new(),
         })
     }
@@ -92,11 +94,12 @@ impl MockPort {
         self.stream_failure.notify_waiters();
     }
 
+    fn fail_next_response(&self) {
+        self.fail_response.store(true, Ordering::SeqCst);
+    }
+
     fn run_ref(run: &ProviderRunHandle) -> ProviderRunRef {
-        ProviderRunRef {
-            namespace: "mock".to_owned(),
-            native_id: run.to_string(),
-        }
+        ProviderRunRef::new("mock", run.to_string()).unwrap()
     }
 
     async fn native_run(
@@ -108,7 +111,7 @@ impl MockPort {
             .await
             .get(run)
             .cloned()
-            .ok_or_else(|| HarnessPortError::NotFound(run.native_id.clone()))
+            .ok_or_else(|| HarnessPortError::NotFound(run.native_id().to_owned()))
     }
 }
 
@@ -166,6 +169,11 @@ impl RunHarness for MockPort {
         request: ProviderRequestRef,
         response: HarnessResponse,
     ) -> Result<(), HarnessPortError> {
+        if self.fail_response.swap(false, Ordering::SeqCst) {
+            return Err(HarnessPortError::OutcomeUnknown {
+                operation: "respond_approval",
+            });
+        }
         let run = self.native_run(&request.run).await?;
         let request =
             ProviderRequestHandle::new(run, request.native_id.parse().map_err(map_error)?);
@@ -190,6 +198,10 @@ impl RunHarness for MockPort {
                 Err(HarnessPortError::Closed)
             }
         }
+    }
+
+    async fn reconnect(&self, run: &ProviderRunRef) -> Result<bool, HarnessPortError> {
+        Ok(self.runs.lock().await.contains_key(run))
     }
 }
 
@@ -696,7 +708,7 @@ async fn outcome_unknown_is_distinct_and_does_not_guess_terminal_status() {
     ));
     assert_eq!(
         context.store.get_run(run_id).await.unwrap().status,
-        RunStatus::Running
+        RunStatus::OutcomeUnknown
     );
 }
 
@@ -866,6 +878,141 @@ async fn persistence_failure_terminalizes_run_as_outcome_unknown() {
     .await;
     assert_eq!(
         context.store.get_run(run_id).await.unwrap().status,
+        RunStatus::OutcomeUnknown
+    );
+}
+
+#[tokio::test]
+async fn post_start_binding_failure_retains_provider_identity_and_compensates() {
+    let context =
+        TestContext::new(MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete))
+            .await;
+    context
+        .store
+        .fail_next_transition_after_update()
+        .await
+        .unwrap();
+    let mut events = context.supervisor.subscribe();
+    assert!(matches!(
+        context
+            .supervisor
+            .start_run(context.work_item_id, connection_id(), "start".to_owned())
+            .await,
+        Err(RunOrchestrationError::Store(_))
+    ));
+    let event = next_matching(&mut events, |kind| {
+        matches!(
+            kind,
+            AppEventKind::RunOutcomeUnknown {
+                operation: "start_binding_failed",
+                ..
+            }
+        )
+    })
+    .await;
+    let AppEventKind::RunOutcomeUnknown { run_id, .. } = event.kind else {
+        unreachable!()
+    };
+    let run = context.store.get_run(run_id).await.unwrap();
+    assert!(run.provider_id.is_some());
+    assert!(matches!(
+        run.status,
+        RunStatus::OutcomeUnknown | RunStatus::Interrupted
+    ));
+}
+
+#[tokio::test]
+async fn uncertain_approval_response_recovers_after_supervisor_restart() {
+    let request = "uncertain-approval".parse::<ProviderRequestId>().unwrap();
+    let context = TestContext::new(MockRunPlan::new(vec![
+        MockScriptStep::approval(request.clone(), "approve"),
+        MockScriptStep::await_response(request),
+        MockScriptStep::complete(),
+    ]))
+    .await;
+    let mut events = context.supervisor.subscribe();
+    let run_id = context.start().await;
+    let opened = next_matching(&mut events, |kind| {
+        matches!(kind, AppEventKind::ApprovalOpened { .. })
+    })
+    .await;
+    let AppEventKind::ApprovalOpened { approval_id, .. } = opened.kind else {
+        unreachable!()
+    };
+    context.harness.fail_next_response();
+    assert!(matches!(
+        context
+            .supervisor
+            .resolve_approval(approval_id, ApprovalDecision::Approved)
+            .await,
+        Err(RunOrchestrationError::Harness(
+            HarnessPortError::OutcomeUnknown {
+                operation: "respond_approval"
+            }
+        ))
+    ));
+    assert!(matches!(
+        context
+            .store
+            .list_approvals_for_run(run_id, None, 10)
+            .await
+            .unwrap()
+            .items[0]
+            .status,
+        ApprovalStatus::Responding {
+            decision: ApprovalDecision::Approved
+        }
+    ));
+    assert_eq!(
+        context.store.get_run(run_id).await.unwrap().status,
+        RunStatus::OutcomeUnknown
+    );
+
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    restarted.reconcile_run(run_id).await.unwrap();
+    restarted
+        .resolve_approval(approval_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+    assert!(matches!(
+        context
+            .store
+            .list_approvals_for_run(run_id, None, 10)
+            .await
+            .unwrap()
+            .items[0]
+            .status,
+        ApprovalStatus::Resolved { .. }
+    ));
+}
+
+#[tokio::test]
+async fn supervisor_startup_reconciles_dangling_start_not_store_open() {
+    let context = TestContext::new(MockRunPlan::new(Vec::new())).await;
+    let dangling = context
+        .store
+        .create_run(yakshed_application::CreateRun {
+            id: SystemIdGenerator.next_run_id(),
+            connection_id: connection_id(),
+            work_item_id: context.work_item_id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    let _ = restarted.steer(dangling.id, "reconcile".to_owned()).await;
+    assert_eq!(
+        context.store.get_run(dangling.id).await.unwrap().status,
         RunStatus::OutcomeUnknown
     );
 }

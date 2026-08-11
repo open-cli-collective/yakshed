@@ -849,7 +849,7 @@ fn untrusted_component(
     path: &Path,
     check: &str,
 ) -> SecretError {
-    SecretError::LockedOrDenied {
+    SecretError::Denied {
         backend: backend.clone(),
         remediation: Some(format!("untrusted {component} {}: {check}", path.display())),
     }
@@ -869,7 +869,7 @@ fn insecure(backend: &SecretBackendId, problem: LocalFileSecurityProblem) -> Sec
         }
         LocalFileSecurityProblem::Changed => "retry after securing the replaced local secret store",
     };
-    SecretError::LockedOrDenied {
+    SecretError::Denied {
         backend: backend.clone(),
         remediation: Some(remediation.to_owned()),
     }
@@ -1001,7 +1001,7 @@ fn backend_failure(backend: &SecretBackendId, message: &'static str) -> SecretEr
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn map_io_error(backend: &SecretBackendId, message: &'static str, error: io::Error) -> SecretError {
     if error.kind() == io::ErrorKind::PermissionDenied {
-        SecretError::LockedOrDenied {
+        SecretError::Denied {
             backend: backend.clone(),
             remediation: Some("check local secret store ownership and permissions".to_owned()),
         }
@@ -1413,7 +1413,7 @@ mod tests {
 
         assert!(matches!(
             backend.probe().await,
-            Err(SecretError::LockedOrDenied { .. })
+            Err(SecretError::Denied { .. })
         ));
     }
 
@@ -1431,7 +1431,7 @@ mod tests {
 
         assert!(matches!(
             backend.probe().await,
-            Err(SecretError::LockedOrDenied { .. })
+            Err(SecretError::Denied { .. })
         ));
     }
 
@@ -1449,7 +1449,7 @@ mod tests {
 
         assert!(matches!(
             backend.probe().await,
-            Err(SecretError::LockedOrDenied { .. })
+            Err(SecretError::Denied { .. })
         ));
     }
 
@@ -1484,18 +1484,18 @@ mod tests {
         assert!(rendered.contains(&intermediate.display().to_string()));
         assert!(rendered.contains("group- or other-writable"));
         assert!(!rendered.contains(CANARY));
-        let SecretError::LockedOrDenied {
+        let SecretError::Denied {
             remediation: Some(remediation),
             ..
         } = error
         else {
-            panic!("mutable intermediate ancestor must map to LockedOrDenied")
+            panic!("mutable intermediate ancestor must map to Denied")
         };
         assert!(remediation.contains("ancestor"), "{remediation}");
     }
 
     #[tokio::test]
-    async fn permission_denied_read_maps_to_locked_or_denied_without_leaking_values() {
+    async fn permission_denied_read_maps_to_denied_without_leaking_values() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempdir().unwrap();
@@ -1515,7 +1515,7 @@ mod tests {
         let Err(error) = backend.resolve(&locator, &context()).await else {
             panic!("mode-000 store must be rejected")
         };
-        assert!(matches!(error, SecretError::LockedOrDenied { .. }));
+        assert!(matches!(error, SecretError::Denied { .. }));
         assert!(!format!("{error}").contains(CANARY));
         assert!(!format!("{error:?}").contains(CANARY));
     }
@@ -1523,12 +1523,12 @@ mod tests {
     fn assert_acl_rejected(error: SecretError, path: &Path) {
         assert!(!format!("{error}").contains(CANARY));
         assert!(!format!("{error:?}").contains(CANARY));
-        let SecretError::LockedOrDenied {
+        let SecretError::Denied {
             remediation: Some(remediation),
             ..
         } = error
         else {
-            panic!("extended ACL must map to LockedOrDenied")
+            panic!("extended ACL must map to Denied")
         };
         let path = fs::canonicalize(path).unwrap();
         assert!(remediation.contains(&path.display().to_string()));

@@ -1,14 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ConnectionId, NamespacedProviderId, RunId, RunSnapshot,
-    RunStatus, StreamCursor, TimelineItemId, WorkItemId,
+    ApprovalDecision, ApprovalRequestId, ApprovalStatus, ConnectionId, NamespacedProviderId, RunId,
+    RunSnapshot, RunStatus, StreamCursor, TimelineItemId, WorkItemId,
 };
 
 use crate::{
@@ -22,9 +25,29 @@ const ROUTE_CHANNEL_CAPACITY: usize = 64;
 const STREAM_FAILURE_OPERATION: &str = "stream_disconnected";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ProviderRunRef {
-    pub namespace: String,
-    pub native_id: String,
+pub struct ProviderRunRef(NamespacedProviderId);
+
+impl ProviderRunRef {
+    pub fn new(
+        namespace: impl Into<String>,
+        native_id: impl Into<String>,
+    ) -> Result<Self, RunOrchestrationError> {
+        NamespacedProviderId::new(namespace, native_id)
+            .map(Self)
+            .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))
+    }
+
+    pub fn namespace(&self) -> &str {
+        self.0.namespace()
+    }
+
+    pub fn native_id(&self) -> &str {
+        self.0.value()
+    }
+
+    fn provider_id(&self) -> NamespacedProviderId {
+        self.0.clone()
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -166,6 +189,11 @@ pub trait RunHarness: Send + Sync {
         response: HarnessResponse,
     ) -> Result<(), HarnessPortError>;
     async fn next_event(&self) -> Result<Option<RunHarnessEvent>, HarnessPortError>;
+
+    /// Checks whether a persisted provider run can be safely reattached after process restart.
+    async fn reconnect(&self, _run: &ProviderRunRef) -> Result<bool, HarnessPortError> {
+        Ok(false)
+    }
 }
 
 pub type UserInputRequestId = TimelineItemId;
@@ -219,8 +247,12 @@ pub enum RunOrchestrationError {
     Harness(#[from] HarnessPortError),
     #[error("run is not active: {0}")]
     RunNotActive(RunId),
+    #[error("run requires reconciliation: {0}")]
+    RunNeedsReconciliation(RunId),
     #[error("approval is not pending: {0}")]
     ApprovalNotPending(ApprovalRequestId),
+    #[error("approval decision conflicts with the in-flight response: {0}")]
+    ApprovalDecisionConflict(ApprovalRequestId),
     #[error("user input is not pending: {0}")]
     UserInputNotPending(UserInputRequestId),
     #[error("invalid provider identifier: {0}")]
@@ -237,6 +269,9 @@ struct Inner {
     ids: Arc<dyn IdGenerator>,
     events: broadcast::Sender<AppEvent>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    startup_done: AtomicBool,
+    startup_notify: Notify,
+    start_lock: AsyncMutex<()>,
     state: Mutex<State>,
 }
 
@@ -244,12 +279,29 @@ struct Inner {
 struct State {
     routes: HashMap<ProviderRunRef, mpsc::Sender<RunHarnessEvent>>,
     pending_events: HashMap<ProviderRunRef, Vec<RunHarnessEvent>>,
-    pending_overflow: HashSet<ProviderRunRef>,
+    pending_overflow: bool,
+    start_in_progress: bool,
     runs: HashMap<RunId, ProviderRunRef>,
     runs_by_provider: HashMap<ProviderRunRef, RunId>,
     work_items: HashMap<RunId, WorkItemId>,
     approvals: HashMap<ApprovalRequestId, (RunId, ProviderRequestRef)>,
     user_inputs: HashMap<UserInputRequestId, (RunId, ProviderRequestRef)>,
+    approval_responses: HashMap<ApprovalRequestId, ApprovalDecision>,
+    uncertain_runs: HashSet<RunId>,
+}
+
+impl State {
+    fn buffer_handshake_event(&mut self, run: ProviderRunRef, event: RunHarnessEvent) {
+        if !self.start_in_progress {
+            return;
+        }
+        let pending_count = self.pending_events.values().map(Vec::len).sum::<usize>();
+        if pending_count < ROUTE_CHANNEL_CAPACITY {
+            self.pending_events.entry(run).or_default().push(event);
+        } else {
+            self.pending_overflow = true;
+        }
+    }
 }
 
 impl RunSupervisor {
@@ -260,15 +312,25 @@ impl RunSupervisor {
         ids: Arc<dyn IdGenerator>,
     ) -> Self {
         let (events, _) = broadcast::channel(APP_EVENT_CAPACITY);
-        Self(Arc::new(Inner {
+        let supervisor = Self(Arc::new(Inner {
             store,
             harness,
             clock,
             ids,
             events,
             pump: Mutex::new(None),
+            startup_done: AtomicBool::new(false),
+            startup_notify: Notify::new(),
+            start_lock: AsyncMutex::new(()),
             state: Mutex::new(State::default()),
-        }))
+        }));
+        let inner = Arc::clone(&supervisor.0);
+        tokio::spawn(async move {
+            inner.reconcile_startup().await;
+            inner.startup_done.store(true, Ordering::Release);
+            inner.startup_notify.notify_waiters();
+        });
+        supervisor
     }
 
     /// Slow subscribers receive `Lagged`; the bounded channel drops oldest notifications.
@@ -283,9 +345,10 @@ impl RunSupervisor {
         connection_id: ConnectionId,
         input: String,
     ) -> Result<RunSnapshot, RunOrchestrationError> {
+        self.0.await_startup().await;
+        let _start = self.0.start_lock.lock().await;
         let run_id = self.0.ids.next_run_id();
-        let run = self
-            .0
+        self.0
             .store
             .create_run(CreateRun {
                 id: run_id,
@@ -309,9 +372,20 @@ impl RunSupervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .work_items
             .insert(run_id, work_item_id);
+        {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.start_in_progress = true;
+            state.pending_events.clear();
+            state.pending_overflow = false;
+        }
         let provider_run = match self.0.harness.start_run(connection_id, input).await {
             Ok(handle) => handle,
             Err(error @ HarnessPortError::OutcomeUnknown { operation }) => {
+                self.0.finish_start_handshake();
                 self.0.close_run(run_id).await;
                 self.0
                     .transition(run_id, RunStatus::Starting, RunStatus::OutcomeUnknown, None)
@@ -325,6 +399,7 @@ impl RunSupervisor {
                 return Err(error.into());
             }
             Err(error) => {
+                self.0.finish_start_handshake();
                 self.0.close_run(run_id).await;
                 self.0
                     .transition(run_id, RunStatus::Starting, RunStatus::Failed, None)
@@ -333,13 +408,8 @@ impl RunSupervisor {
             }
         };
         let (sender, receiver) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
-        let provider_id = NamespacedProviderId::new(
-            provider_run.namespace.clone(),
-            provider_run.native_id.clone(),
-        )
-        .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))?;
-        let _run = run;
-        let run = self
+        let provider_id = provider_run.provider_id();
+        let run = match self
             .0
             .transition(
                 run_id,
@@ -347,7 +417,16 @@ impl RunSupervisor {
                 RunStatus::Running,
                 Some(provider_id),
             )
-            .await?;
+            .await
+        {
+            Ok(run) => run,
+            Err(error) => {
+                self.0
+                    .retain_uncertain_start(run_id, work_item_id, &provider_run)
+                    .await;
+                return Err(error.into());
+            }
+        };
         let (pending_events, pending_overflow) = {
             let mut state = self
                 .0
@@ -357,13 +436,14 @@ impl RunSupervisor {
             state.runs.insert(run_id, provider_run.clone());
             state.runs_by_provider.insert(provider_run.clone(), run_id);
             state.routes.insert(provider_run.clone(), sender.clone());
-            (
-                state
-                    .pending_events
-                    .remove(&provider_run)
-                    .unwrap_or_default(),
-                state.pending_overflow.remove(&provider_run),
-            )
+            state.start_in_progress = false;
+            let pending = state
+                .pending_events
+                .remove(&provider_run)
+                .unwrap_or_default();
+            state.pending_events.clear();
+            let overflow = std::mem::take(&mut state.pending_overflow);
+            (pending, overflow)
         };
         let inner = Arc::clone(&self.0);
         tokio::spawn(async move {
@@ -386,6 +466,7 @@ impl RunSupervisor {
     }
 
     pub async fn steer(&self, run_id: RunId, input: String) -> Result<(), RunOrchestrationError> {
+        self.0.await_startup().await;
         let (run, work_item_id) = self.0.active_run(run_id)?;
         self.0
             .call_harness(run_id, work_item_id, self.0.harness.steer(&run, input))
@@ -393,6 +474,7 @@ impl RunSupervisor {
     }
 
     pub async fn interrupt(&self, run_id: RunId) -> Result<(), RunOrchestrationError> {
+        self.0.await_startup().await;
         let (run, work_item_id) = self.0.active_run(run_id)?;
         self.0
             .call_harness(run_id, work_item_id, self.0.harness.interrupt(&run))
@@ -404,6 +486,7 @@ impl RunSupervisor {
         approval_id: ApprovalRequestId,
         decision: ApprovalDecision,
     ) -> Result<(), RunOrchestrationError> {
+        self.0.await_startup().await;
         let (run_id, request) = self
             .0
             .state
@@ -414,14 +497,34 @@ impl RunSupervisor {
             .cloned()
             .ok_or(RunOrchestrationError::ApprovalNotPending(approval_id))?;
         let (_, work_item_id) = self.0.active_run(run_id)?;
-        self.0
-            .store
-            .begin_approval_response(BeginApprovalResponse {
-                approval_id,
-                decision,
-                audit_event_id: self.0.ids.next_audit_event_id(),
-            })
-            .await?;
+        let responding = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .approval_responses
+            .get(&approval_id)
+            .copied();
+        if let Some(existing) = responding {
+            if existing != decision {
+                return Err(RunOrchestrationError::ApprovalDecisionConflict(approval_id));
+            }
+        } else {
+            self.0
+                .store
+                .begin_approval_response(BeginApprovalResponse {
+                    approval_id,
+                    decision,
+                    audit_event_id: self.0.ids.next_audit_event_id(),
+                })
+                .await?;
+            self.0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .approval_responses
+                .insert(approval_id, decision);
+        }
         self.0
             .call_harness(
                 run_id,
@@ -438,12 +541,15 @@ impl RunSupervisor {
                 audit_event_id: self.0.ids.next_audit_event_id(),
             })
             .await?;
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .approvals
-            .remove(&approval_id);
+        {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.approvals.remove(&approval_id);
+            state.approval_responses.remove(&approval_id);
+        }
         self.0
             .publish(
                 work_item_id,
@@ -461,6 +567,7 @@ impl RunSupervisor {
         request_id: UserInputRequestId,
         response: String,
     ) -> Result<(), RunOrchestrationError> {
+        self.0.await_startup().await;
         let (run_id, request) = self
             .0
             .state
@@ -487,7 +594,7 @@ impl RunSupervisor {
                 vec![NewTimelineItem {
                     id: self.0.ids.next_timeline_item_id(),
                     kind: "user_input_responded".to_owned(),
-                    body: String::new(),
+                    body: request_id.to_string(),
                     provider_id: None,
                 }],
                 None,
@@ -507,9 +614,257 @@ impl RunSupervisor {
             .await;
         Ok(())
     }
+
+    pub async fn reconcile_run(&self, run_id: RunId) -> Result<RunSnapshot, RunOrchestrationError> {
+        self.0.await_startup().await;
+        let snapshot = self.0.store.get_run(run_id).await?;
+        let provider_id = snapshot
+            .provider_id
+            .clone()
+            .ok_or(RunOrchestrationError::RunNotActive(run_id))?;
+        let provider_run = ProviderRunRef(provider_id);
+        if !self.0.harness.reconnect(&provider_run).await? {
+            return Err(RunOrchestrationError::RunNeedsReconciliation(run_id));
+        }
+        let snapshot = if snapshot.status == RunStatus::Running {
+            snapshot
+        } else {
+            self.0
+                .transition(run_id, snapshot.status, RunStatus::Running, None)
+                .await?
+        };
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .uncertain_runs
+            .remove(&run_id);
+        Ok(snapshot)
+    }
 }
 
 impl Inner {
+    async fn await_startup(&self) {
+        loop {
+            let notified = self.startup_notify.notified();
+            if self.startup_done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn finish_start_handshake(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.start_in_progress = false;
+        state.pending_events.clear();
+        state.pending_overflow = false;
+    }
+
+    async fn retain_uncertain_start(
+        self: &Arc<Self>,
+        run_id: RunId,
+        work_item_id: WorkItemId,
+        provider_run: &ProviderRunRef,
+    ) {
+        let (pending, overflow) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.start_in_progress = false;
+            let pending = state
+                .pending_events
+                .remove(provider_run)
+                .unwrap_or_default();
+            state.pending_events.clear();
+            let overflow = std::mem::take(&mut state.pending_overflow);
+            (pending, overflow)
+        };
+        let _ = self.harness.interrupt(provider_run).await;
+        let _ = self
+            .transition(
+                run_id,
+                RunStatus::Starting,
+                RunStatus::OutcomeUnknown,
+                Some(provider_run.provider_id()),
+            )
+            .await;
+        self.attach_route(run_id, work_item_id, provider_run.clone())
+            .await;
+        if let Some(route) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .routes
+            .get(provider_run)
+            .cloned()
+        {
+            for event in pending {
+                if route.try_send(event).is_err() {
+                    break;
+                }
+            }
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .uncertain_runs
+            .insert(run_id);
+        self.publish(
+            work_item_id,
+            AppEventKind::RunOutcomeUnknown {
+                run_id,
+                operation: "start_binding_failed",
+            },
+        )
+        .await;
+        if overflow {
+            self.handle_route_overflow(run_id, work_item_id).await;
+        }
+    }
+
+    async fn reconcile_startup(self: &Arc<Self>) {
+        let mut after = None;
+        loop {
+            let page = match self
+                .store
+                .list_runs_needing_reconciliation(after, 200)
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => return,
+            };
+            for mut run in page.items {
+                let Some(provider_id) = run.provider_id.clone() else {
+                    if matches!(run.status, RunStatus::Starting | RunStatus::Running) {
+                        let target = if run.status == RunStatus::Starting {
+                            RunStatus::OutcomeUnknown
+                        } else {
+                            RunStatus::Disconnected
+                        };
+                        let _ = self.transition(run.id, run.status, target, None).await;
+                    }
+                    continue;
+                };
+                let provider_run = ProviderRunRef(provider_id);
+                match self.harness.reconnect(&provider_run).await {
+                    Ok(true) => {
+                        if run.status != RunStatus::Running {
+                            if let Ok(updated) = self
+                                .transition(run.id, run.status, RunStatus::Running, None)
+                                .await
+                            {
+                                run = updated;
+                            } else {
+                                continue;
+                            }
+                        }
+                        self.attach_route(run.id, run.work_item_id, provider_run.clone())
+                            .await;
+                        self.restore_requests(&run, &provider_run).await;
+                    }
+                    _ if run.status == RunStatus::Starting => {
+                        let _ = self
+                            .transition(
+                                run.id,
+                                RunStatus::Starting,
+                                RunStatus::OutcomeUnknown,
+                                None,
+                            )
+                            .await;
+                    }
+                    _ if run.status == RunStatus::Running => {
+                        let _ = self
+                            .transition(run.id, RunStatus::Running, RunStatus::Disconnected, None)
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+            after = page.next_after;
+            if after.is_none() {
+                break;
+            }
+        }
+    }
+
+    async fn attach_route(
+        self: &Arc<Self>,
+        run_id: RunId,
+        work_item_id: WorkItemId,
+        provider_run: ProviderRunRef,
+    ) {
+        let connection_id = match self.store.get_run(run_id).await {
+            Ok(run) => run.connection_id,
+            Err(_) => return,
+        };
+        let (sender, receiver) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.runs.insert(run_id, provider_run.clone());
+            state.runs_by_provider.insert(provider_run.clone(), run_id);
+            state.work_items.insert(run_id, work_item_id);
+            state.routes.insert(provider_run.clone(), sender);
+        }
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            inner
+                .consume_run(run_id, work_item_id, connection_id, provider_run, receiver)
+                .await;
+        });
+        self.ensure_event_pump();
+    }
+
+    async fn restore_requests(&self, run: &RunSnapshot, provider_run: &ProviderRunRef) {
+        let mut after = None;
+        loop {
+            let page = match self.store.list_approvals_for_run(run.id, after, 200).await {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for approval in page.items {
+                if matches!(
+                    approval.status,
+                    ApprovalStatus::Pending | ApprovalStatus::Responding { .. }
+                ) && let Some(native_id) = approval
+                    .provider_id
+                    .value()
+                    .strip_prefix(&format!("{}/", provider_run.native_id()))
+                {
+                    state.approvals.insert(
+                        approval.id,
+                        (
+                            run.id,
+                            ProviderRequestRef {
+                                run: provider_run.clone(),
+                                native_id: native_id.to_owned(),
+                            },
+                        ),
+                    );
+                    if let ApprovalStatus::Responding { decision } = approval.status {
+                        state.approval_responses.insert(approval.id, decision);
+                    }
+                }
+            }
+            drop(state);
+            after = page.next_after;
+            if after.is_none() {
+                break;
+            }
+        }
+    }
+
     fn ensure_event_pump(self: &Arc<Self>) {
         let mut handle = self
             .pump
@@ -553,12 +908,7 @@ impl Inner {
             let run_id = state.runs_by_provider.get(&run).copied();
             let work_item_id = run_id.and_then(|id| state.work_items.get(&id).copied());
             let Some(route) = state.routes.get(&run) else {
-                let queue = state.pending_events.entry(run.clone()).or_default();
-                if queue.len() < ROUTE_CHANNEL_CAPACITY {
-                    queue.push(event);
-                } else {
-                    state.pending_overflow.insert(run);
-                }
+                state.buffer_handshake_event(run, event);
                 return;
             };
             (route.try_send(event), run_id, work_item_id)
@@ -632,9 +982,12 @@ impl Inner {
             state.runs_by_provider.clear();
             state.routes.clear();
             state.pending_events.clear();
-            state.pending_overflow.clear();
+            state.pending_overflow = false;
+            state.start_in_progress = false;
             state.approvals.clear();
             state.user_inputs.clear();
+            state.approval_responses.clear();
+            state.uncertain_runs.clear();
         }
         self.pump
             .lock()
@@ -677,10 +1030,13 @@ impl Inner {
         state
             .user_inputs
             .retain(|_, (pending_run_id, _)| *pending_run_id != run_id);
-        state.pending_events.retain(|_, queue| !queue.is_empty());
+        let active_approvals: HashSet<_> = state.approvals.keys().copied().collect();
+        state
+            .approval_responses
+            .retain(|approval_id, _| active_approvals.contains(approval_id));
+        state.uncertain_runs.remove(&run_id);
         if let Some(provider) = provider {
             state.pending_events.remove(&provider);
-            state.pending_overflow.remove(&provider);
         }
     }
 
@@ -692,6 +1048,9 @@ impl Inner {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.uncertain_runs.contains(&run_id) {
+            return Err(RunOrchestrationError::RunNeedsReconciliation(run_id));
+        }
         Ok((
             state
                 .runs
@@ -714,6 +1073,19 @@ impl Inner {
         match call.await {
             Ok(value) => Ok(value),
             Err(error @ HarnessPortError::OutcomeUnknown { operation }) => {
+                if let Ok(current) = self.store.get_run(run_id).await
+                    && current.status != RunStatus::OutcomeUnknown
+                    && current.status.can_transition_to(RunStatus::OutcomeUnknown)
+                {
+                    let _ = self
+                        .transition(run_id, current.status, RunStatus::OutcomeUnknown, None)
+                        .await;
+                }
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .uncertain_runs
+                    .insert(run_id);
                 self.publish(
                     work_item_id,
                     AppEventKind::RunOutcomeUnknown { run_id, operation },
@@ -787,7 +1159,7 @@ impl Inner {
             return Ok(());
         }
         let (source_namespace, stream_id) = stream
-            .map(|run| (run.namespace.clone(), run.native_id.clone()))
+            .map(|run| (run.namespace().to_owned(), run.native_id().to_owned()))
             .unwrap_or_else(|| ("application".to_owned(), run_id.to_string()));
         let cursor = self
             .store
@@ -1066,8 +1438,8 @@ fn request_provider_id(
     request: &ProviderRequestRef,
 ) -> Result<NamespacedProviderId, RunOrchestrationError> {
     NamespacedProviderId::new(
-        request.run.namespace.clone(),
-        format!("{}/{}", request.run.native_id, request.native_id),
+        request.run.namespace().to_owned(),
+        format!("{}/{}", request.run.native_id(), request.native_id),
     )
     .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))
 }
@@ -1076,8 +1448,34 @@ fn command_provider_id(
     command: &ProviderCommandRef,
 ) -> Result<NamespacedProviderId, RunOrchestrationError> {
     NamespacedProviderId::new(
-        command.run.namespace.clone(),
-        format!("{}/{}", command.run.native_id, command.native_id),
+        command.run.namespace().to_owned(),
+        format!("{}/{}", command.run.native_id(), command.native_id),
     )
     .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_provider_runs_are_handshake_only_and_globally_bounded() {
+        let mut state = State::default();
+        for index in 0..100 {
+            let run = ProviderRunRef::new("mock", format!("unknown-{index}")).unwrap();
+            state.buffer_handshake_event(run.clone(), RunHarnessEvent::RunAccepted { run });
+        }
+        assert!(state.pending_events.is_empty());
+
+        state.start_in_progress = true;
+        for index in 0..100 {
+            let run = ProviderRunRef::new("mock", format!("unknown-{index}")).unwrap();
+            state.buffer_handshake_event(run.clone(), RunHarnessEvent::RunAccepted { run });
+        }
+        assert_eq!(
+            state.pending_events.values().map(Vec::len).sum::<usize>(),
+            ROUTE_CHANNEL_CAPACITY
+        );
+        assert!(state.pending_overflow);
+    }
 }

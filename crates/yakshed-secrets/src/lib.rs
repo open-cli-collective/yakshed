@@ -11,6 +11,7 @@ use std::{error::Error, fmt, sync::Arc};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use time::OffsetDateTime;
+use yakshed_application::SecretPortError;
 pub use yakshed_application::{
     SecretBackendAvailability, SecretBackendCapability, SecretBackendConfigurationError,
     validate_backend_configuration,
@@ -261,7 +262,11 @@ pub enum SecretError {
         backend: SecretBackendId,
         remediation: Option<String>,
     },
-    LockedOrDenied {
+    Locked {
+        backend: SecretBackendId,
+        remediation: Option<String>,
+    },
+    Denied {
         backend: SecretBackendId,
         remediation: Option<String>,
     },
@@ -301,6 +306,35 @@ pub enum SecretError {
     },
 }
 
+impl From<SecretError> for SecretPortError {
+    fn from(error: SecretError) -> Self {
+        match error {
+            SecretError::AlreadyExists { .. } => Self::AlreadyExists,
+            SecretError::BackendUnavailable { .. }
+            | SecretError::TimedOut { .. }
+            | SecretError::Cancelled { .. } => Self::BackendUnavailable,
+            SecretError::Locked { .. } => Self::Locked,
+            SecretError::Denied { .. } => Self::Denied,
+            SecretError::AuthenticationRequired { .. } => Self::AuthenticationRequired,
+            SecretError::UncertainWrite { .. } => Self::UncertainWrite,
+            SecretError::InvalidBinding {
+                reason: InvalidBindingReason::UnknownConnection,
+                ..
+            } => Self::ConnectionNotFound,
+            SecretError::InvalidBinding {
+                reason: InvalidBindingReason::UnknownSlot,
+                ..
+            } => Self::BindingNotFound,
+            SecretError::InvalidBinding { .. } => Self::NotSecretBacked,
+            SecretError::NotFound { .. }
+            | SecretError::InvalidLocator { .. }
+            | SecretError::UnsupportedOperation { .. }
+            | SecretError::ProtocolViolation { .. }
+            | SecretError::BackendFailure { .. } => Self::Failed,
+        }
+    }
+}
+
 impl fmt::Debug for SecretError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
@@ -317,20 +351,32 @@ impl fmt::Display for SecretError {
             Self::BackendUnavailable { backend, .. } => {
                 write!(formatter, "secret backend unavailable: {backend}")
             }
-            Self::LockedOrDenied {
+            Self::Locked {
+                backend,
+                remediation: Some(remediation),
+            } => {
+                write!(formatter, "secret backend locked: {backend}: {remediation}")
+            }
+            Self::Locked {
+                backend,
+                remediation: None,
+            } => {
+                write!(formatter, "secret backend locked: {backend}")
+            }
+            Self::Denied {
                 backend,
                 remediation: Some(remediation),
             } => {
                 write!(
                     formatter,
-                    "secret backend locked or denied: {backend}: {remediation}"
+                    "secret backend denied access: {backend}: {remediation}"
                 )
             }
-            Self::LockedOrDenied {
+            Self::Denied {
                 backend,
                 remediation: None,
             } => {
-                write!(formatter, "secret backend locked or denied: {backend}")
+                write!(formatter, "secret backend denied access: {backend}")
             }
             Self::AuthenticationRequired { backend, .. } => {
                 write!(

@@ -1107,12 +1107,12 @@ async fn second_open_conflicts_without_reconciling_live_run() {
         .unwrap();
     assert_eq!(
         reopened.get_run(run.id).await.unwrap().status,
-        RunStatus::Interrupted
+        RunStatus::Running
     );
 }
 
 #[tokio::test]
-async fn reopen_marks_dangling_start_as_outcome_unknown() {
+async fn reopen_preserves_dangling_start_for_application_reconciliation() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
     let ids = Arc::new(TestIds::new());
@@ -1151,7 +1151,7 @@ async fn reopen_marks_dangling_start_as_outcome_unknown() {
         .unwrap();
     assert_eq!(
         reopened.get_run(run.id).await.unwrap().status,
-        RunStatus::OutcomeUnknown
+        RunStatus::Starting
     );
 }
 
@@ -1518,7 +1518,7 @@ async fn terminal_run_allows_existing_approval_retry_but_rejects_new_approval() 
 }
 
 #[tokio::test]
-async fn reopen_interrupts_orphaned_run_and_preserves_responding_approval() {
+async fn reopen_preserves_orphaned_run_and_approval_state() {
     let temp = tempfile::tempdir().unwrap();
     let paths = AppPaths::for_test(temp.path());
     let ids = Arc::new(TestIds::new());
@@ -1584,29 +1584,24 @@ async fn reopen_interrupts_orphaned_run_and_preserves_responding_approval() {
     let reopened = SqliteStore::open(paths, Arc::new(FixedClock), ids.clone())
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         reopened
             .list_active_runs(None, 10)
             .await
             .unwrap()
             .items
-            .is_empty()
+            .len(),
+        1
     );
     let interrupted = reopened.get_run(run.id).await.unwrap();
-    assert_eq!(interrupted.status, RunStatus::Interrupted);
-    assert_eq!(
-        interrupted.ended_at,
-        Some(UtcTimestamp::from_unix_millis(1_735_689_600_123))
-    );
+    assert_eq!(interrupted.status, RunStatus::Running);
+    assert_eq!(interrupted.ended_at, None);
     let history = reopened
         .list_approvals_for_run(run.id, None, 10)
         .await
         .unwrap();
     assert_eq!(history.items[0].id, pending.id);
-    assert_eq!(
-        history.items[0].status,
-        ApprovalStatus::Voided { decision: None }
-    );
+    assert_eq!(history.items[0].status, ApprovalStatus::Pending);
     assert_eq!(history.items[1].status, responding.status);
     assert_eq!(
         reopened

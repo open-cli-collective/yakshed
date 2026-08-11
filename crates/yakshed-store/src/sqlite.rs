@@ -192,7 +192,7 @@ struct Actor {
 
 struct Worker {
     connection: Connection,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fail_transition_after_update: bool,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_next_append: bool,
@@ -208,34 +208,28 @@ impl SqliteStore {
     pub async fn open(
         paths: AppPaths,
         clock: Arc<dyn Clock>,
-        ids: Arc<dyn IdGenerator>,
+        _ids: Arc<dyn IdGenerator>,
     ) -> Result<Self, StoreError> {
         let (sender, receiver) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = oneshot::channel();
-        let worker_clock = Arc::clone(&clock);
         let thread = thread::Builder::new()
             .name("yakshed-sqlite".to_owned())
-            .spawn(move || {
-                match open_connection(&paths).and_then(|mut connection| {
-                    reconcile_running_runs(&mut connection, worker_clock.now(), ids.as_ref())?;
-                    Ok(connection)
-                }) {
-                    Ok(connection) => {
-                        let _ = ready_sender.send(Ok(()));
-                        run_worker(
-                            Worker {
-                                connection,
-                                #[cfg(test)]
-                                fail_transition_after_update: false,
-                                #[cfg(any(test, feature = "test-hooks"))]
-                                fail_next_append: false,
-                            },
-                            receiver,
-                        );
-                    }
-                    Err(error) => {
-                        let _ = ready_sender.send(Err(error));
-                    }
+            .spawn(move || match open_connection(&paths) {
+                Ok(connection) => {
+                    let _ = ready_sender.send(Ok(()));
+                    run_worker(
+                        Worker {
+                            connection,
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            fail_transition_after_update: false,
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            fail_next_append: false,
+                        },
+                        receiver,
+                    );
+                }
+                Err(error) => {
+                    let _ = ready_sender.send(Err(error));
                 }
             })
             .map_err(|error| StoreError::Open(error.to_string()))?;
@@ -320,8 +314,8 @@ impl SqliteStore {
         Ok(done_receiver)
     }
 
-    #[cfg(test)]
-    async fn fail_next_transition_after_update(&self) -> Result<(), StoreError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn fail_next_transition_after_update(&self) -> Result<(), StoreError> {
         self.call(|worker| {
             worker.fail_transition_after_update = true;
             Ok(())
@@ -852,54 +846,6 @@ fn ended_at_ms(target: RunStatus, occurred_at_ms: i64) -> Option<i64> {
     } else {
         Some(occurred_at_ms)
     }
-}
-
-fn reconcile_running_runs(
-    connection: &mut Connection,
-    occurred_at: UtcTimestamp,
-    ids: &dyn IdGenerator,
-) -> Result<(), StoreError> {
-    let transaction = connection.transaction().map_err(map_database_error)?;
-    let run_ids: Vec<(RunId, String)> = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT id, status FROM runs WHERE status IN ('starting', 'running') ORDER BY id",
-            )
-            .map_err(map_database_error)?;
-        statement
-            .query_map([], |row| {
-                Ok((parse_column::<RunId>(row, 0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(map_database_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(map_database_error)?
-    };
-    for (run_id, status) in run_ids {
-        let audit_event_id = ids.next_audit_event_id();
-        validate_app_id("audit event id", audit_event_id.is_v7())?;
-        let transition = if status == "starting" {
-            RunStatus::OutcomeUnknown
-        } else {
-            RunStatus::Interrupted
-        };
-        let expected = if status == "starting" {
-            RunStatus::Starting
-        } else {
-            RunStatus::Running
-        };
-        apply_run_transition(
-            &transaction,
-            &TransitionRun {
-                run_id,
-                expected_current: expected,
-                target: transition,
-                provider_id: None,
-                occurred_at,
-                audit_event_id,
-            },
-        )?;
-    }
-    transaction.commit().map_err(map_database_error)
 }
 
 const APPROVAL_SELECT: &str = "
@@ -1474,7 +1420,7 @@ impl AppStore for SqliteStore {
                 .transaction()
                 .map_err(map_database_error)?;
             let snapshot = apply_run_transition(&transaction, &command)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if std::mem::take(&mut worker.fail_transition_after_update) {
                 return Err(StoreError::Backend(
                     "injected failure after run transition".to_owned(),
@@ -1537,6 +1483,38 @@ impl AppStore for SqliteStore {
                 .prepare(&format!(
                     "{RUN_SELECT}
                      WHERE status IN ('starting', 'running') AND (?1 IS NULL OR id > ?1)
+                     ORDER BY id LIMIT ?2"
+                ))
+                .map_err(map_database_error)?;
+            let mut items = statement
+                .query_map(params![after, fetch_limit], run_from_row)
+                .map_err(map_database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_database_error)?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            let next_after = has_more.then(|| items.last().map(|item| item.id)).flatten();
+            Ok(RunPage { items, next_after })
+        })
+        .await
+    }
+
+    async fn list_runs_needing_reconciliation(
+        &self,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError> {
+        let limit = validate_page_size(limit)?;
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            let after = after.map(|id| id.to_string());
+            let mut statement = worker
+                .connection
+                .prepare(&format!(
+                    "{RUN_SELECT}
+                     WHERE status IN ('starting', 'running', 'disconnected', 'outcome_unknown')
+                       AND (?1 IS NULL OR id > ?1)
                      ORDER BY id LIMIT ?2"
                 ))
                 .map_err(map_database_error)?;

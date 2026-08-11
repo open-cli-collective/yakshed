@@ -742,6 +742,11 @@ pub trait AppStore: Send + Sync {
         after: Option<RunId>,
         limit: u32,
     ) -> Result<RunPage, StoreError>;
+    async fn list_runs_needing_reconciliation(
+        &self,
+        after: Option<RunId>,
+        limit: u32,
+    ) -> Result<RunPage, StoreError>;
     async fn append_timeline_batch(&self, batch: TimelineBatch)
     -> Result<StreamCursor, StoreError>;
     async fn get_stream_cursor(

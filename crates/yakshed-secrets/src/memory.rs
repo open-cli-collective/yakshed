@@ -13,7 +13,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemorySecretFault {
     NotFound,
-    LockedOrDenied,
+    Locked,
+    Denied,
     Timeout,
     FailNextWrite,
     UncertainWrite,
@@ -75,7 +76,11 @@ impl MemorySecretBackend {
             MemorySecretFault::NotFound => Err(SecretError::NotFound {
                 reference: self.summary(locator.expect("locator required for not-found fault")),
             }),
-            MemorySecretFault::LockedOrDenied => Err(SecretError::LockedOrDenied {
+            MemorySecretFault::Locked => Err(SecretError::Locked {
+                backend: self.id.clone(),
+                remediation: None,
+            }),
+            MemorySecretFault::Denied => Err(SecretError::Denied {
                 backend: self.id.clone(),
                 remediation: None,
             }),

@@ -500,7 +500,17 @@ impl RunStatus {
                     | Self::Interrupted
                     | Self::Disconnected
                     | Self::OutcomeUnknown,
-            ) | (Self::Disconnected, Self::Interrupted | Self::OutcomeUnknown)
+            ) | (
+                Self::Disconnected,
+                Self::Running | Self::Interrupted | Self::OutcomeUnknown,
+            ) | (
+                Self::OutcomeUnknown,
+                Self::Running
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Interrupted
+                    | Self::Disconnected,
+            )
         )
     }
 }
