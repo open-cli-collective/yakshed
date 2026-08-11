@@ -1,14 +1,15 @@
 use std::{future::Future, ops::Deref};
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use yakshed_desktop_api::{
     ApiPorts, ApprovalDecisionInput, ArtifactListEnvelope, ConfigRevision, ConnectionEnvelope,
     ConnectionInput, ConnectionListEnvelope, CredentialSlot, DesktopApi, DesktopErrorCode,
     FrontendEvent, FrontendRunSnapshot, OpenArtifactEnvelope, PendingUserInputPageEnvelope,
-    RunApprovalPageEnvelope, RunId, RunOrchestrationError, SecretWriteEnvelope,
-    WorkItemListEnvelope, WorkItemSnapshotEnvelope, WorkItemTimelineEnvelope,
+    RunApprovalPageEnvelope, RunId, SecretWriteEnvelope, WorkItemListEnvelope,
+    WorkItemSnapshotEnvelope, WorkItemTimelineEnvelope,
 };
+
+pub use yakshed_desktop_api::{StartupError, StartupErrorCode};
 
 pub const FRONTEND_EVENT_NAME: &str = "yakshed:frontend-event";
 
@@ -22,41 +23,10 @@ impl Deref for ShellState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct StartupError {
-    pub code: StartupErrorCode,
-    pub message: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StartupErrorCode {
-    PersistenceError,
-    InternalError,
-}
-
-impl StartupError {
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self {
-            code: StartupErrorCode::InternalError,
-            message: message.into(),
-        }
-    }
-
-    pub fn persistence(message: impl Into<String>) -> Self {
-        Self {
-            code: StartupErrorCode::PersistenceError,
-            message: message.into(),
-        }
-    }
-}
-
 pub async fn initialize(
     ports: impl Future<Output = std::result::Result<ApiPorts, StartupError>>,
 ) -> std::result::Result<ShellState, StartupError> {
-    let api = DesktopApi::new(ports.await?)
-        .await
-        .map_err(map_startup_error)?;
+    let api = DesktopApi::new(ports.await?).await?;
     Ok(ShellState(api))
 }
 
@@ -92,14 +62,6 @@ fn parse_approval_decision(value: String) -> yakshed_desktop_api::Result<Approva
         "approved" => Ok(ApprovalDecisionInput::Approved),
         "denied" => Ok(ApprovalDecisionInput::Denied),
         _ => Err(invalid_request(format!("decision: {value}"))),
-    }
-}
-
-fn map_startup_error(error: RunOrchestrationError) -> StartupError {
-    if matches!(error, RunOrchestrationError::Store(_)) {
-        StartupError::persistence(error.to_string())
-    } else {
-        StartupError::internal(error.to_string())
     }
 }
 

@@ -50,6 +50,36 @@ pub enum DesktopErrorCode {
     InternalError,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupErrorCode {
+    PersistenceError,
+    InternalError,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StartupError {
+    pub code: StartupErrorCode,
+    pub message: &'static str,
+}
+
+impl StartupError {
+    const fn new(code: StartupErrorCode, message: &'static str) -> Self {
+        Self { code, message }
+    }
+
+    pub fn persistence() -> Self {
+        Self::new(
+            StartupErrorCode::PersistenceError,
+            "persistence startup failed",
+        )
+    }
+
+    pub fn internal() -> Self {
+        Self::new(StartupErrorCode::InternalError, "desktop startup failed")
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DesktopError {
     pub code: DesktopErrorCode,
@@ -330,7 +360,7 @@ pub struct DesktopApi {
 
 impl DesktopApi {
     /// Drops oldest events on overflow; consumers recovering missed revisions must call snapshot APIs.
-    pub async fn new(ports: ApiPorts) -> std::result::Result<Self, RunOrchestrationError> {
+    pub async fn new(ports: ApiPorts) -> std::result::Result<Self, StartupError> {
         let (events, _) = broadcast::channel(APP_EVENT_CAPACITY);
         let run_supervisor = Arc::new(RunSupervisor::new(
             ports.store.clone(),
@@ -338,7 +368,10 @@ impl DesktopApi {
             ports.clock,
             ports.ids,
         ));
-        run_supervisor.ready().await?;
+        run_supervisor
+            .ready()
+            .await
+            .map_err(Self::map_startup_error)?;
         let mut source = run_supervisor.subscribe();
         let relay = events.clone();
         tokio::spawn(async move {
@@ -364,6 +397,13 @@ impl DesktopApi {
             artifacts: ports.artifacts,
             events,
         })
+    }
+
+    fn map_startup_error(error: RunOrchestrationError) -> StartupError {
+        match error {
+            RunOrchestrationError::Store(_) => StartupError::persistence(),
+            _ => StartupError::internal(),
+        }
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<FrontendEvent> {

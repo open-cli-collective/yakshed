@@ -116,7 +116,7 @@ impl Fixture {
         let store = Arc::new(
             SqliteStore::open(paths.clone(), clock.clone(), ids.clone())
                 .await
-                .map_err(|error| StartupError::persistence(error.to_string()))?,
+                .map_err(|_| StartupError::persistence())?,
         );
         let harness = MockPort::new(
             MockRunPlan::new(vec![MockScriptStep::complete()]),
@@ -537,10 +537,11 @@ async fn poisoned_store_factory_returns_serializable_startup_error() {
         Ok(_) => panic!("poisoned startup unexpectedly succeeded"),
         Err(error) => error,
     };
-    assert_eq!(
-        serde_json::to_value(startup).unwrap()["code"],
-        "persistence_error"
-    );
+    let value = serde_json::to_value(startup).unwrap();
+    assert_eq!(value["code"], "persistence_error");
+    assert_eq!(value["message"], "persistence startup failed");
+    let temp = temp.path().to_string_lossy();
+    assert!(!value["message"].as_str().unwrap().contains(temp.as_ref()));
 }
 
 #[tokio::test]

@@ -48,6 +48,7 @@ struct MockPort {
     fail_stream: AtomicBool,
     fail_response: AtomicBool,
     fail_reconnect: AtomicBool,
+    fail_reconnect_error: AtomicBool,
     fail_lookup: AtomicBool,
     block_start: AtomicBool,
     start_release: Notify,
@@ -92,6 +93,7 @@ impl MockPort {
             fail_stream: AtomicBool::new(false),
             fail_response: AtomicBool::new(false),
             fail_reconnect: AtomicBool::new(false),
+            fail_reconnect_error: AtomicBool::new(false),
             fail_lookup: AtomicBool::new(false),
             block_start: AtomicBool::new(false),
             start_release: Notify::new(),
@@ -106,6 +108,10 @@ impl MockPort {
 
     fn fail_next_response(&self) {
         self.fail_response.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_reconnect_error(&self) {
+        self.fail_reconnect_error.store(true, Ordering::SeqCst);
     }
 
     fn fail_next_reconnect(&self) {
@@ -250,6 +256,11 @@ impl RunHarness for MockPort {
     }
 
     async fn reconnect(&self, run: &ProviderRunRef) -> Result<bool, HarnessPortError> {
+        if self.fail_reconnect_error.swap(false, Ordering::SeqCst) {
+            return Err(HarnessPortError::Runtime(
+                "provider reconnect failed".to_owned(),
+            ));
+        }
         if self.fail_reconnect.swap(false, Ordering::SeqCst) {
             return Ok(false);
         }
@@ -1218,6 +1229,99 @@ async fn failed_request_restore_keeps_run_recoverable() {
         context.store.get_run(run_id).await.unwrap().status,
         RunStatus::Disconnected
     );
+}
+
+#[tokio::test]
+async fn startup_reconnect_failure_does_not_block_desktop_readiness() {
+    let context = TestContext::with_options(
+        vec![
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+        ],
+        false,
+        false,
+    )
+    .await;
+    let stale = context.start().await;
+    let healthy = context.start().await;
+    context.harness.fail_next_reconnect_error();
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    restarted.ready().await.unwrap();
+    assert_eq!(
+        context.store.get_run(stale).await.unwrap().status,
+        RunStatus::Disconnected
+    );
+    assert_eq!(
+        context.store.get_run(healthy).await.unwrap().status,
+        RunStatus::Running
+    );
+    restarted
+        .steer(healthy, "recovered".to_owned())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn startup_reconcile_stops_partial_activation_on_store_failure_and_retries_cleanly() {
+    let context = TestContext::with_options(
+        vec![
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+            MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete),
+        ],
+        false,
+        false,
+    )
+    .await;
+    let first = context.start().await;
+    let second = context.start().await;
+    context
+        .store
+        .transition_run(TransitionRun {
+            run_id: first,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Disconnected,
+            provider_id: None,
+            occurred_at: FixedClock.now(),
+            audit_event_id: SystemIdGenerator.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    context.store.fail_next_pending_input_read().await.unwrap();
+
+    let failed = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    assert!(matches!(
+        failed.ready().await,
+        Err(RunOrchestrationError::Store(_))
+    ));
+    assert_eq!(
+        context.store.get_run(first).await.unwrap().status,
+        RunStatus::Disconnected
+    );
+    assert_eq!(
+        context.store.get_run(second).await.unwrap().status,
+        RunStatus::Running
+    );
+    let retried = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    retried.ready().await.unwrap();
+    retried
+        .steer(second, "still-running".to_owned())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

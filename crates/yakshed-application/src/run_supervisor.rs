@@ -315,6 +315,14 @@ struct RestoredRequests {
     approval_responses: HashMap<ApprovalRequestId, ApprovalDecision>,
 }
 
+#[derive(Debug)]
+struct StartupRunReattach {
+    run: RunSnapshot,
+    provider_run: ProviderRunRef,
+    receiver: mpsc::Receiver<RunHarnessEvent>,
+    publish_status: bool,
+}
+
 impl State {
     fn buffer_handshake_event(&mut self, run: ProviderRunRef, event: RunHarnessEvent) {
         if self.start_in_progress.is_some() {
@@ -823,6 +831,7 @@ impl Inner {
 
     async fn reconcile_startup(self: &Arc<Self>) -> Result<(), RunOrchestrationError> {
         let mut after = None;
+        let mut prepared = Vec::<StartupRunReattach>::new();
         loop {
             let page = match self
                 .store
@@ -830,7 +839,12 @@ impl Inner {
                 .await
             {
                 Ok(page) => page,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    for plan in prepared {
+                        self.remove_route_state(plan.run.id, &plan.provider_run);
+                    }
+                    return Err(error.into());
+                }
             };
             for run in page.items {
                 let Some(provider_id) = run.provider_id.clone() else {
@@ -845,22 +859,120 @@ impl Inner {
                     continue;
                 };
                 let provider_run = ProviderRunRef(provider_id);
-                if self.harness.reconnect(&provider_run).await? {
-                    self.reattach_run(run, provider_run).await?;
-                } else if run.status == RunStatus::Starting {
-                    self.transition(run.id, RunStatus::Starting, RunStatus::OutcomeUnknown, None)
-                        .await?;
-                } else if run.status == RunStatus::Running {
-                    self.transition(run.id, RunStatus::Running, RunStatus::Disconnected, None)
-                        .await?;
+                let can_reconnect = match self.harness.reconnect(&provider_run).await {
+                    Ok(can_reconnect) => can_reconnect,
+                    Err(_) => {
+                        if matches!(run.status, RunStatus::Starting | RunStatus::Running) {
+                            let target = if run.status == RunStatus::Starting {
+                                RunStatus::OutcomeUnknown
+                            } else {
+                                RunStatus::Disconnected
+                            };
+                            if let Err(error) =
+                                self.transition(run.id, run.status, target, None).await
+                            {
+                                for plan in prepared {
+                                    self.remove_route_state(plan.run.id, &plan.provider_run);
+                                }
+                                return Err(error.into());
+                            }
+                        }
+                        false
+                    }
+                };
+                if can_reconnect {
+                    match self.prepare_startup_reattach(run, provider_run).await {
+                        Ok(plan) => prepared.push(plan),
+                        Err(error) => {
+                            for plan in prepared {
+                                self.remove_route_state(plan.run.id, &plan.provider_run);
+                            }
+                            return Err(error);
+                        }
+                    }
                 }
             }
             after = page.next_after;
             if after.is_none() {
+                for plan in prepared {
+                    self.activate_startup_reattach(plan).await;
+                }
                 break;
             }
         }
         Ok(())
+    }
+
+    async fn prepare_startup_reattach(
+        self: &Arc<Self>,
+        run: RunSnapshot,
+        provider_run: ProviderRunRef,
+    ) -> Result<StartupRunReattach, RunOrchestrationError> {
+        let restored = match self.load_requests(&run, &provider_run).await {
+            Ok(restored) => restored,
+            Err(error) => {
+                if run.status == RunStatus::Running {
+                    let _ = self
+                        .transition(run.id, RunStatus::Running, RunStatus::Disconnected, None)
+                        .await;
+                }
+                return Err(error.into());
+            }
+        };
+        let receiver = self.prepare_route(run.id, run.work_item_id, provider_run.clone(), restored);
+        let publish_status = run.status != RunStatus::Running || run.provider_id.is_none();
+        let run = if publish_status {
+            match self
+                .store
+                .transition_run(TransitionRun {
+                    run_id: run.id,
+                    expected_current: run.status,
+                    target: RunStatus::Running,
+                    provider_id: Some(provider_run.provider_id()),
+                    occurred_at: self.clock.now(),
+                    audit_event_id: self.ids.next_audit_event_id(),
+                })
+                .await
+            {
+                Ok(run) => run,
+                Err(error) => {
+                    drop(receiver);
+                    self.remove_route_state(run.id, &provider_run);
+                    return Err(error.into());
+                }
+            }
+        } else {
+            run
+        };
+        Ok(StartupRunReattach {
+            run,
+            provider_run,
+            receiver,
+            publish_status,
+        })
+    }
+
+    async fn activate_startup_reattach(self: &Arc<Self>, plan: StartupRunReattach) {
+        let run = &plan.run;
+        self.activate_route(
+            run.id,
+            run.work_item_id,
+            run.connection_id,
+            plan.provider_run.clone(),
+            plan.receiver,
+        );
+        if plan.publish_status {
+            self.publish(
+                run.work_item_id,
+                AppEventKind::RunStatusChanged {
+                    run_id: run.id,
+                    status: RunStatus::Running,
+                },
+            )
+            .await;
+        }
+        self.deliver_uncertain_start_events(run, &plan.provider_run)
+            .await;
     }
 
     async fn attach_route(
@@ -938,70 +1050,17 @@ impl Inner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .runs
             .contains_key(&run.id);
-        if !attached {
-            let restored = match self.load_requests(&run, &provider_run).await {
-                Ok(restored) => restored,
-                Err(error) => {
-                    if run.status == RunStatus::Running {
-                        let _ = self
-                            .transition(run.id, RunStatus::Running, RunStatus::Disconnected, None)
-                            .await;
-                    }
-                    return Err(error.into());
-                }
-            };
-            let receiver =
-                self.prepare_route(run.id, run.work_item_id, provider_run.clone(), restored);
-            let transitioned = run.status != RunStatus::Running || run.provider_id.is_none();
-            let run = if transitioned {
-                match self
-                    .store
-                    .transition_run(TransitionRun {
-                        run_id: run.id,
-                        expected_current: run.status,
-                        target: RunStatus::Running,
-                        provider_id: Some(provider_run.provider_id()),
-                        occurred_at: self.clock.now(),
-                        audit_event_id: self.ids.next_audit_event_id(),
-                    })
-                    .await
-                {
-                    Ok(run) => run,
-                    Err(error) => {
-                        drop(receiver);
-                        self.remove_route_state(run.id, &provider_run);
-                        return Err(error.into());
-                    }
-                }
-            } else {
-                run
-            };
-            self.activate_route(
-                run.id,
-                run.work_item_id,
-                run.connection_id,
-                provider_run.clone(),
-                receiver,
-            );
-            if transitioned {
-                self.publish(
-                    run.work_item_id,
-                    AppEventKind::RunStatusChanged {
-                        run_id: run.id,
-                        status: RunStatus::Running,
-                    },
-                )
-                .await;
-            }
-            self.deliver_uncertain_start_events(&run, &provider_run)
-                .await;
+        if attached {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .uncertain_runs
+                .remove(&run.id);
             return Ok(run);
         }
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .uncertain_runs
-            .remove(&run.id);
+        let plan = self.prepare_startup_reattach(run, provider_run).await?;
+        let run = plan.run.clone();
+        self.activate_startup_reattach(plan).await;
         Ok(run)
     }
 
@@ -1024,6 +1083,7 @@ impl Inner {
         state
             .approval_responses
             .retain(|approval_id, _| active_approvals.contains(approval_id));
+        state.uncertain_runs.remove(&run_id);
     }
 
     async fn load_requests(
