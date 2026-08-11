@@ -14,17 +14,17 @@ use yakshed_application::{
     ConfigChange, ConfigPort, ConfigPortError, ConfigRevision, CreateProject, CreateRun,
     CreateWorkItem, IdGenerator, ListTimeline, NewTimelineItem, OpenArtifactCommand,
     OpenArtifactPayload, PendingApproval, PublicConnection, PublicCredentialBinding,
-    PublicCredentialSource, PutConnectionCommand, RunSupervisor, SecretPort, SecretPortError,
+    PublicCredentialSource, PutConnectionCommand, SecretPort, SecretPortError,
     SetConnectionCredentialCommand, SystemClock, SystemIdGenerator, TimelineBatch, TransitionRun,
 };
 use yakshed_desktop_api::{
     ApiPorts, DesktopApi, DesktopErrorCode, FrontendEvent, FrontendEventKind, FrontendRunStatus,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalStatus, ArtifactId, ArtifactKind, Connection, ConnectionId,
-    CredentialBinding, CredentialBindingRecord, CredentialSlot, NamespacedProviderId,
-    ProviderStateRootId, RunId, RunStatus, SecretBackendId, SecretLocator, SecretReference,
-    StreamCursor, UtcTimestamp, WorkItemId,
+    ApprovalDecision, ArtifactId, ArtifactKind, Connection, ConnectionId, CredentialBinding,
+    CredentialBindingRecord, CredentialSlot, NamespacedProviderId, ProviderStateRootId, RunId,
+    RunStatus, SecretBackendId, SecretLocator, SecretReference, StreamCursor, UtcTimestamp,
+    WorkItemId,
 };
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessError, HarnessEvent, HarnessInput,
@@ -49,7 +49,7 @@ async fn work_item_create_snapshot_round_trip() {
         .await
         .unwrap();
     let fetched = api
-        .get_work_item_snapshot(created.work_item.id)
+        .get_work_item_snapshot(created.work_item.id.parse().unwrap())
         .await
         .unwrap();
     let listed = api
@@ -67,7 +67,7 @@ async fn work_item_create_snapshot_round_trip() {
 }
 
 #[tokio::test]
-async fn recovery_snapshot_pages_all_runs_and_approvals() {
+async fn recovery_snapshot_exposes_bounded_cursors_for_all_runs_and_approvals() {
     let fixture = TestFixture::new().await;
     let mut runs = Vec::new();
     for _ in 0..201 {
@@ -111,12 +111,61 @@ async fn recovery_snapshot_pages_all_runs_and_approvals() {
     }
     let api = fixture.api_no_run();
     api.reconcile_run(approval_run.id).await.unwrap();
-    let snapshot = api
-        .get_work_item_snapshot(fixture.work_item_id)
+    let mut run_after = None;
+    let mut run_count = 0;
+    let mut pinned_revision = None;
+    loop {
+        let snapshot = api
+            .get_work_item_snapshot_page(fixture.work_item_id, run_after, 50, pinned_revision)
+            .await
+            .unwrap();
+        pinned_revision = Some(snapshot.revision);
+        assert!(snapshot.runs.len() <= 50);
+        run_count += snapshot.runs.len();
+        run_after = snapshot.next_run_after.map(|id| id.parse().unwrap());
+        if run_after.is_none() {
+            break;
+        }
+    }
+    let mut approval_after = None;
+    let mut approval_count = 0;
+    loop {
+        let page = api
+            .get_run_approval_page(
+                fixture.work_item_id,
+                approval_run.id,
+                approval_after,
+                50,
+                pinned_revision,
+            )
+            .await
+            .unwrap();
+        assert!(page.approvals.len() <= 50);
+        approval_count += page.approvals.len();
+        approval_after = page.next_after.map(|id| id.parse().unwrap());
+        if approval_after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(run_count, 201);
+    assert_eq!(approval_count, 205);
+    fixture
+        .store
+        .create_run(CreateRun {
+            id: fixture.ids.next_run_id(),
+            connection_id: fixture.connection_id,
+            work_item_id: fixture.work_item_id,
+            provider_run: None,
+        })
         .await
         .unwrap();
-    assert_eq!(snapshot.runs.len(), 201);
-    assert_eq!(snapshot.pending_approvals.len(), 205);
+    assert_eq!(
+        api.get_work_item_snapshot_page(fixture.work_item_id, None, 50, pinned_revision,)
+            .await
+            .unwrap_err()
+            .code,
+        DesktopErrorCode::Conflict
+    );
 }
 
 #[tokio::test]
@@ -180,12 +229,12 @@ async fn recovery_matches_user_input_responses_by_request_id() {
         .unwrap();
     let api = fixture.api_no_run();
     api.reconcile_run(run.id).await.unwrap();
-    let snapshot = api
-        .get_work_item_snapshot(fixture.work_item_id)
+    let timeline = api
+        .get_work_item_timeline_page(fixture.work_item_id, run.id, None, 50)
         .await
         .unwrap();
-    assert_eq!(snapshot.pending_user_inputs.len(), 1);
-    assert_eq!(snapshot.pending_user_inputs[0].request_id, first);
+    assert_eq!(timeline.items[0].id, first.to_string());
+    assert_eq!(timeline.items[2].body, second.to_string());
 }
 
 #[tokio::test]
@@ -235,16 +284,12 @@ async fn recovery_snapshot_exposes_uncertain_approval_response() {
         .unwrap();
     let api = fixture.api_no_run();
     api.reconcile_run(run.id).await.unwrap();
-    let snapshot = api
-        .get_work_item_snapshot(fixture.work_item_id)
+    let approvals = api
+        .get_run_approval_page(fixture.work_item_id, run.id, None, 50, None)
         .await
         .unwrap();
-    assert!(matches!(
-        snapshot.pending_approvals[0].status,
-        ApprovalStatus::Responding {
-            decision: ApprovalDecision::Approved
-        }
-    ));
+    assert_eq!(approvals.approvals[0].status, "responding");
+    assert_eq!(approvals.approvals[0].decision.as_deref(), Some("approved"));
 }
 
 #[tokio::test]
@@ -290,7 +335,7 @@ async fn full_run_lifecycle_batches_chunked_deltas() {
 }
 
 #[tokio::test]
-async fn frontend_snapshots_omit_provider_identifiers() {
+async fn frontend_snapshots_round_trip_without_provider_identifiers() {
     let fixture = TestFixture::new().await;
     let api = fixture
         .api_for_plan(MockRunPlan::new(vec![
@@ -311,7 +356,13 @@ async fn frontend_snapshots_omit_provider_identifiers() {
         .get_work_item_timeline_page(fixture.work_item_id, run_id, None, 50)
         .await
         .unwrap();
-    assert!(!format!("{snapshot:?}{timeline:?}").contains("provider_id"));
+    let snapshot_json = serde_json::to_value(&snapshot).unwrap();
+    let timeline_json = serde_json::to_value(&timeline).unwrap();
+    let _: yakshed_desktop_api::WorkItemSnapshotEnvelope =
+        serde_json::from_value(snapshot_json.clone()).unwrap();
+    let _: yakshed_desktop_api::WorkItemTimelineEnvelope =
+        serde_json::from_value(timeline_json.clone()).unwrap();
+    assert!(!format!("{snapshot_json}{timeline_json}").contains("provider"));
 }
 
 #[tokio::test]
@@ -334,7 +385,7 @@ async fn approval_opened_resolved_continues_run() {
     let approval_opened = wait_for_matching(
         &mut events,
         |event| {
-            event.work_item_id == fixture.work_item_id
+            event.work_item_id == fixture.work_item_id.to_string()
                 && matches!(event.kind, FrontendEventKind::ApprovalOpened { .. })
         },
         Duration::from_secs(3),
@@ -347,16 +398,19 @@ async fn approval_opened_resolved_continues_run() {
     else {
         unreachable!()
     };
-    assert_eq!(opened_run_id, run_id);
-    api.resolve_approval(approval_id, yakshed_domain::ApprovalDecision::Approved)
-        .await
-        .unwrap();
+    assert_eq!(opened_run_id, run_id.to_string());
+    api.resolve_approval(
+        approval_id.parse().unwrap(),
+        yakshed_domain::ApprovalDecision::Approved,
+    )
+    .await
+    .unwrap();
     let completed =
         wait_for_frontend_status(&mut events, fixture.work_item_id, RunStatus::Completed).await;
     assert_eq!(
         completed.kind,
         FrontendEventKind::RunStatusChanged {
-            run_id,
+            run_id: run_id.to_string(),
             status: FrontendRunStatus::Completed,
         }
     );
@@ -381,7 +435,7 @@ async fn user_input_round_trip_and_run_continues() {
     let opened = wait_for_matching(
         &mut events,
         |event| {
-            event.work_item_id == fixture.work_item_id
+            event.work_item_id == fixture.work_item_id.to_string()
                 && matches!(event.kind, FrontendEventKind::UserInputOpened { .. })
         },
         Duration::from_secs(3),
@@ -395,8 +449,8 @@ async fn user_input_round_trip_and_run_continues() {
     else {
         unreachable!()
     };
-    assert_eq!(opened_run_id, run_id);
-    api.respond_user_input(request_id, "response")
+    assert_eq!(opened_run_id, run_id.to_string());
+    api.respond_user_input(request_id.parse().unwrap(), "response")
         .await
         .unwrap();
     let completed =
@@ -404,7 +458,7 @@ async fn user_input_round_trip_and_run_continues() {
     assert_eq!(
         completed.kind,
         FrontendEventKind::RunStatusChanged {
-            run_id,
+            run_id: run_id.to_string(),
             status: FrontendRunStatus::Completed,
         }
     );
@@ -427,7 +481,7 @@ async fn interrupt_stops_run() {
     assert_eq!(
         interrupted.kind,
         FrontendEventKind::RunStatusChanged {
-            run_id,
+            run_id: run_id.to_string(),
             status: FrontendRunStatus::Interrupted,
         }
     );
@@ -451,7 +505,7 @@ async fn crash_maps_to_failed_status_in_snapshot() {
     assert_eq!(
         failed.kind,
         FrontendEventKind::RunStatusChanged {
-            run_id,
+            run_id: run_id.to_string(),
             status: FrontendRunStatus::Failed,
         }
     );
@@ -474,7 +528,7 @@ async fn outcome_unknown_is_distinct_and_evented() {
     let outcome = wait_for_matching(
         &mut events,
         |event| {
-            event.work_item_id == fixture.work_item_id
+            event.work_item_id == fixture.work_item_id.to_string()
                 && matches!(event.kind, FrontendEventKind::RunOutcomeUnknown { .. })
         },
         Duration::from_secs(2),
@@ -487,7 +541,7 @@ async fn outcome_unknown_is_distinct_and_evented() {
     else {
         unreachable!()
     };
-    assert_eq!(outcome_run_id, run_id);
+    assert_eq!(outcome_run_id, run_id.to_string());
 }
 
 #[tokio::test]
@@ -518,11 +572,9 @@ async fn event_revisions_are_monotonic_and_overflow_recovers_via_snapshot() {
                 .get_work_item_snapshot(fixture.work_item_id)
                 .await
                 .unwrap();
-            if snapshot
-                .runs
-                .iter()
-                .any(|run| run.id == run_id && run.status == RunStatus::Completed)
-            {
+            if snapshot.runs.iter().any(|run| {
+                run.id == run_id.to_string() && run.status == FrontendRunStatus::Completed
+            }) {
                 break snapshot;
             }
             tokio::task::yield_now().await;
@@ -539,8 +591,6 @@ async fn event_revisions_are_monotonic_and_overflow_recovers_via_snapshot() {
     ));
     assert!(snapshot.work_item.revision > baseline);
     assert_eq!(snapshot.runs.len(), 1);
-    assert!(snapshot.pending_approvals.is_empty());
-    assert!(snapshot.pending_user_inputs.is_empty());
     let timeline = api
         .get_work_item_timeline_page(fixture.work_item_id, run_id, None, 50)
         .await
@@ -627,13 +677,13 @@ async fn artifact_list_and_open_round_trip() {
     let listed = api.list_artifacts(fixture.work_item_id).await.unwrap();
     assert_eq!(listed.artifacts.len(), 1);
     let first = &listed.artifacts[0];
-    assert_eq!(first.id, artifact.id);
+    assert_eq!(first.id, artifact.id.to_string());
     let opened = api
         .open_artifact(fixture.work_item_id, artifact.id, bytes.len() as u64)
         .await
         .unwrap();
     assert_eq!(opened.bytes, bytes);
-    assert_eq!(opened.artifact.id, artifact.id);
+    assert_eq!(opened.artifact.id, artifact.id.to_string());
 }
 
 #[tokio::test]
@@ -676,7 +726,7 @@ async fn event_revisions_are_contiguous_without_gap() {
     assert_eq!(
         completed.kind,
         FrontendEventKind::RunStatusChanged {
-            run_id,
+            run_id: run_id.to_string(),
             status: FrontendRunStatus::Completed,
         }
     );
@@ -693,8 +743,8 @@ async fn event_revisions_are_contiguous_without_gap() {
         snapshot
             .runs
             .iter()
-            .find(|run| run.id == run_id)
-            .is_some_and(|run| run.status == RunStatus::Completed)
+            .find(|run| run.id == run_id.to_string())
+            .is_some_and(|run| run.status == FrontendRunStatus::Completed)
     );
     let timeline = api
         .get_work_item_timeline_page(fixture.work_item_id, run_id, None, 50)
@@ -824,12 +874,9 @@ impl TestFixture {
     fn api_with_secret_port(&self, secrets: Arc<dyn SecretPort>) -> DesktopApi {
         DesktopApi::new(ApiPorts {
             store: self.store.clone(),
-            run_supervisor: Arc::new(RunSupervisor::new(
-                self.store.clone(),
-                Arc::new(NoopRunHarness),
-                self.clock.clone(),
-                self.ids.clone(),
-            )),
+            harness: Arc::new(NoopRunHarness),
+            clock: self.clock.clone(),
+            ids: self.ids.clone(),
             config: self.config_port.clone(),
             secrets,
             cache: self.cache_port.clone(),
@@ -842,12 +889,9 @@ impl TestFixture {
             MockPort::new(self.config_store.clone(), plan, self.connection_id, false).await;
         DesktopApi::new(ApiPorts {
             store: self.store.clone(),
-            run_supervisor: Arc::new(RunSupervisor::new(
-                self.store.clone(),
-                harness,
-                self.clock.clone(),
-                self.ids.clone(),
-            )),
+            harness,
+            clock: self.clock.clone(),
+            ids: self.ids.clone(),
             config: self.config_port.clone(),
             secrets: self.secret_port.clone(),
             cache: self.cache_port.clone(),
@@ -869,12 +913,9 @@ impl TestFixture {
         .await;
         DesktopApi::new(ApiPorts {
             store: self.store.clone(),
-            run_supervisor: Arc::new(RunSupervisor::new(
-                self.store.clone(),
-                harness,
-                self.clock.clone(),
-                self.ids.clone(),
-            )),
+            harness,
+            clock: self.clock.clone(),
+            ids: self.ids.clone(),
             config: self.config_port.clone(),
             secrets: self.secret_port.clone(),
             cache: self.cache_port.clone(),
@@ -1210,6 +1251,7 @@ impl yakshed_application::RunHarness for NoopRunHarness {
     async fn start_run(
         &self,
         _connection_id: ConnectionId,
+        _correlation_id: RunId,
         _input: String,
     ) -> Result<yakshed_application::ProviderRunRef, yakshed_application::HarnessPortError> {
         Err(yakshed_application::HarnessPortError::Unsupported(
@@ -1321,6 +1363,7 @@ impl yakshed_application::RunHarness for MockPort {
     async fn start_run(
         &self,
         connection_id: ConnectionId,
+        _correlation_id: RunId,
         input: String,
     ) -> Result<yakshed_application::ProviderRunRef, yakshed_application::HarnessPortError> {
         let run = self
@@ -1531,7 +1574,7 @@ async fn wait_for_frontend_status(
     wait_for_matching(
         events,
         |event| {
-            event.work_item_id == work_item_id
+            event.work_item_id == work_item_id.to_string()
                 && matches!(
                     event.kind,
                     FrontendEventKind::RunStatusChanged {
@@ -1562,7 +1605,7 @@ async fn wait_for_frontend_status_with_revisions(
     loop {
         let event = wait_for_matching(
             events,
-            |event| event.work_item_id == work_item_id,
+            |event| event.work_item_id == work_item_id.to_string(),
             Duration::from_secs(4),
         )
         .await;

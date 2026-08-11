@@ -975,6 +975,7 @@ dependencies = [
  "async-trait",
  "provider-mock",
  "secrecy",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

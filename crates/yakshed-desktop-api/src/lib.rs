@@ -1,28 +1,31 @@
 //! Frontend-safe command facade over application use-cases and infrastructure ports.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
-    ConfigPort, ConfigPortError, ConfigRevision, CreateProject, CreateWorkItem, ListWorkItems,
-    OpenArtifactCommand, OpenArtifactPayload, PublicConnection, PublicCredentialBinding,
-    PublicCredentialSource, PutConnectionCommand, RunOrchestrationError, RunSupervisor, SecretPort,
-    SecretPortError, SetConnectionCredentialCommand, StoreError,
+    Clock, ConfigPort, ConfigPortError, ConfigRevision, CreateProject, CreateWorkItem, IdGenerator,
+    ListWorkItems, OpenArtifactCommand, OpenArtifactPayload, PublicConnection,
+    PublicCredentialBinding, PublicCredentialSource, PutConnectionCommand, RunHarness,
+    RunOrchestrationError, RunSupervisor, SecretPort, SecretPortError,
+    SetConnectionCredentialCommand, StoreError,
 };
 use yakshed_domain::{
     ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId, ArtifactKind, Connection,
     ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot, ProjectId, RunId,
-    RunSnapshot, RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemId,
-    TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
+    RunSnapshot, RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemSnapshot,
+    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
 pub const APP_EVENT_CAPACITY: usize = 32;
 const MAX_OPEN_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_RETRIES: usize = 256;
+const RECOVERY_PAGE_SIZE: u32 = 50;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DesktopErrorCode {
     InvalidRequest,
     Conflict,
@@ -34,7 +37,7 @@ pub enum DesktopErrorCode {
     InternalError,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DesktopError {
     pub code: DesktopErrorCode,
     pub message: &'static str,
@@ -77,7 +80,8 @@ impl DesktopError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FrontendRunStatus {
     Starting,
     Running,
@@ -88,154 +92,186 @@ pub enum FrontendRunStatus {
     OutcomeUnknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendEventKind {
     WorkItemPatched,
     TimelineBatchAppended {
-        run_id: RunId,
+        run_id: String,
         item_count: usize,
     },
     ApprovalOpened {
-        run_id: RunId,
-        approval_id: ApprovalRequestId,
+        run_id: String,
+        approval_id: String,
     },
     ApprovalResolved {
-        run_id: RunId,
-        approval_id: ApprovalRequestId,
+        run_id: String,
+        approval_id: String,
     },
     UserInputOpened {
-        run_id: RunId,
-        request_id: yakshed_application::UserInputRequestId,
+        run_id: String,
+        request_id: String,
         prompt: String,
     },
     UserInputResponded {
-        run_id: RunId,
-        request_id: yakshed_application::UserInputRequestId,
+        run_id: String,
+        request_id: String,
     },
     RunStatusChanged {
-        run_id: RunId,
+        run_id: String,
         status: FrontendRunStatus,
     },
     RunOutcomeUnknown {
-        run_id: RunId,
+        run_id: String,
         operation: String,
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FrontendEvent {
     /// Work-item id used by frontend for per-item state reconciliation.
-    pub work_item_id: WorkItemId,
+    pub work_item_id: String,
     /// Monotonic per-work-item revision published by the application.
     pub revision: u64,
     pub kind: FrontendEventKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkItemSnapshotEnvelope {
     /// Durable revision of this work item used for event-gap recovery.
     pub revision: u64,
-    pub work_item: WorkItemSnapshot,
+    pub work_item: FrontendWorkItemSnapshot,
     pub runs: Vec<FrontendRunSnapshot>,
-    pub pending_approvals: Vec<FrontendApprovalSnapshot>,
-    pub pending_user_inputs: Vec<WorkItemPendingUserInput>,
+    pub next_run_after: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FrontendWorkItemSnapshot {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub status: String,
+    pub parent_id: Option<String>,
+    pub revision: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FrontendRunSnapshot {
-    pub id: RunId,
-    pub connection_id: ConnectionId,
-    pub work_item_id: WorkItemId,
-    pub status: RunStatus,
-    pub created_at: UtcTimestamp,
-    pub ended_at: Option<UtcTimestamp>,
+    pub id: String,
+    pub connection_id: String,
+    pub work_item_id: String,
+    pub status: FrontendRunStatus,
+    pub created_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FrontendApprovalSnapshot {
-    pub id: ApprovalRequestId,
-    pub connection_id: ConnectionId,
-    pub run_id: RunId,
+    pub id: String,
+    pub connection_id: String,
+    pub run_id: String,
     pub kind: String,
     pub summary: String,
-    pub status: ApprovalStatus,
-    pub requested_at: UtcTimestamp,
-    pub response_started_at: Option<UtcTimestamp>,
-    pub resolved_at: Option<UtcTimestamp>,
-    pub voided_at: Option<UtcTimestamp>,
+    pub status: String,
+    pub decision: Option<String>,
+    pub requested_at_ms: i64,
+    pub response_started_at_ms: Option<i64>,
+    pub resolved_at_ms: Option<i64>,
+    pub voided_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkItemPendingUserInput {
-    pub run_id: RunId,
-    pub request_id: TimelineItemId,
-    pub prompt: String,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunApprovalPageEnvelope {
+    pub work_item_revision: u64,
+    pub approvals: Vec<FrontendApprovalSnapshot>,
+    pub next_after: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkItemListItem {
-    pub work_item: WorkItemSnapshot,
+    pub work_item: FrontendWorkItemSnapshot,
     pub revision: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkItemListEnvelope {
     pub items: Vec<WorkItemListItem>,
-    pub next_after: Option<WorkItemId>,
+    pub next_after: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkItemTimelineEnvelope {
-    pub run_id: RunId,
+    pub run_id: String,
     pub work_item_revision: u64,
     pub items: Vec<FrontendTimelineItemSnapshot>,
-    pub next_after: Option<TimelineRevision>,
+    pub next_after: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FrontendTimelineItemSnapshot {
-    pub id: TimelineItemId,
-    pub connection_id: ConnectionId,
-    pub run_id: RunId,
-    pub revision: TimelineRevision,
+    pub id: String,
+    pub connection_id: String,
+    pub run_id: String,
+    pub revision: u64,
     pub kind: String,
     pub body: String,
-    pub created_at: UtcTimestamp,
+    pub created_at_ms: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FrontendCredentialBinding {
+    pub slot: String,
+    pub source: String,
+    pub authority: Option<String>,
+    pub backend: Option<String>,
+    pub locator: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FrontendConnection {
+    pub id: String,
+    pub name: String,
+    pub harness: String,
+    pub model_provider: String,
+    pub provider_state: String,
+    pub credentials: Vec<FrontendCredentialBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionEnvelope {
-    pub config_revision: ConfigRevision,
-    pub connection: PublicConnection,
+    pub config_revision: u64,
+    pub connection: FrontendConnection,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionListEnvelope {
-    pub config_revision: ConfigRevision,
-    pub connections: Vec<PublicConnection>,
+    pub config_revision: u64,
+    pub connections: Vec<FrontendConnection>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SecretWriteEnvelope {
     pub overwritten: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactListItem {
-    pub id: ArtifactId,
-    pub kind: ArtifactKind,
+    pub id: String,
+    pub kind: String,
     pub byte_len: u64,
-    pub work_item_id: WorkItemId,
+    pub work_item_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactListEnvelope {
     /// Snapshot revision for the owning work item to support event-gap recovery.
     pub revision: u64,
     pub artifacts: Vec<ArtifactListItem>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OpenArtifactEnvelope {
     pub artifact: ArtifactListItem,
     pub bytes: Vec<u8>,
@@ -245,7 +281,9 @@ pub struct OpenArtifactEnvelope {
 #[derive(Clone)]
 pub struct ApiPorts {
     pub store: Arc<dyn AppStore>,
-    pub run_supervisor: Arc<RunSupervisor>,
+    pub harness: Arc<dyn RunHarness>,
+    pub clock: Arc<dyn Clock>,
+    pub ids: Arc<dyn IdGenerator>,
     pub config: Arc<dyn ConfigPort>,
     pub secrets: Arc<dyn SecretPort>,
     pub cache: Arc<dyn CachePort>,
@@ -267,7 +305,13 @@ impl DesktopApi {
     /// Drops oldest events on overflow; consumers recovering missed revisions must call snapshot APIs.
     pub fn new(ports: ApiPorts) -> Self {
         let (events, _) = broadcast::channel(APP_EVENT_CAPACITY);
-        let mut source = ports.run_supervisor.subscribe();
+        let run_supervisor = Arc::new(RunSupervisor::new(
+            ports.store.clone(),
+            ports.harness,
+            ports.clock,
+            ports.ids,
+        ));
+        let mut source = run_supervisor.subscribe();
         let relay = events.clone();
         tokio::spawn(async move {
             loop {
@@ -285,7 +329,7 @@ impl DesktopApi {
 
         Self {
             store: ports.store,
-            run_supervisor: ports.run_supervisor,
+            run_supervisor,
             config: ports.config,
             secrets: ports.secrets,
             cache: ports.cache,
@@ -326,6 +370,17 @@ impl DesktopApi {
     }
 
     pub async fn get_work_item_snapshot(&self, id: WorkItemId) -> Result<WorkItemSnapshotEnvelope> {
+        self.get_work_item_snapshot_page(id, None, RECOVERY_PAGE_SIZE, None)
+            .await
+    }
+
+    pub async fn get_work_item_snapshot_page(
+        &self,
+        id: WorkItemId,
+        after: Option<RunId>,
+        limit: u32,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItemSnapshotEnvelope> {
         for _ in 0..SNAPSHOT_RETRIES {
             let work_item = self
                 .store
@@ -333,82 +388,14 @@ impl DesktopApi {
                 .await
                 .map_err(map_store_error)?;
             let revision = work_item.revision.get();
-            let mut runs = Vec::new();
-            let mut after = None;
-            loop {
-                let page = self
-                    .store
-                    .list_runs_for_work_item(id, after, 200)
-                    .await
-                    .map_err(map_store_error)?;
-                runs.extend(page.items);
-                after = page.next_after;
-                if after.is_none() {
-                    break;
-                }
+            if expected_revision.is_some_and(|expected| expected != revision) {
+                return Err(DesktopError::conflict("work item revision changed"));
             }
-            let mut pending_approvals = Vec::new();
-            let mut pending_user_inputs = Vec::new();
-            for run in &runs {
-                let mut approval_after = None;
-                loop {
-                    let page = self
-                        .store
-                        .list_approvals_for_run(run.id, approval_after, 200)
-                        .await
-                        .map_err(map_store_error)?;
-                    pending_approvals.extend(page.items.into_iter().filter(|approval| {
-                        matches!(
-                            approval.status,
-                            ApprovalStatus::Pending | ApprovalStatus::Responding { .. }
-                        )
-                    }));
-                    approval_after = page.next_after;
-                    if approval_after.is_none() {
-                        break;
-                    }
-                }
-
-                let mut timeline_after = None;
-                let mut requested: VecDeque<(TimelineItemId, String)> = VecDeque::new();
-                loop {
-                    let page = self
-                        .store
-                        .list_timeline_page(yakshed_application::ListTimeline {
-                            run_id: run.id,
-                            after: timeline_after,
-                            limit: 200,
-                        })
-                        .await
-                        .map_err(map_store_error)?;
-                    for item in page.items {
-                        match item.kind.as_str() {
-                            "user_input_requested" => requested.push_back((item.id, item.body)),
-                            "user_input_responded" => {
-                                if let Ok(request_id) = item.body.parse()
-                                    && let Some(index) = requested
-                                        .iter()
-                                        .position(|(pending_id, _)| *pending_id == request_id)
-                                {
-                                    requested.remove(index);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    timeline_after = page.next_after;
-                    if timeline_after.is_none() {
-                        break;
-                    }
-                }
-                pending_user_inputs.extend(requested.into_iter().map(|(request_id, prompt)| {
-                    WorkItemPendingUserInput {
-                        run_id: run.id,
-                        request_id,
-                        prompt,
-                    }
-                }));
-            }
+            let runs = self
+                .store
+                .list_runs_for_work_item(id, after, limit.min(RECOVERY_PAGE_SIZE))
+                .await
+                .map_err(map_store_error)?;
             let current = self
                 .store
                 .get_work_item(id)
@@ -417,13 +404,55 @@ impl DesktopApi {
             if current.revision.get() == revision {
                 return Ok(WorkItemSnapshotEnvelope {
                     revision,
-                    work_item,
-                    runs: runs.into_iter().map(frontend_run).collect(),
-                    pending_approvals: pending_approvals
-                        .into_iter()
-                        .map(frontend_approval)
-                        .collect(),
-                    pending_user_inputs,
+                    work_item: frontend_work_item(work_item),
+                    runs: runs.items.into_iter().map(frontend_run).collect(),
+                    next_run_after: runs.next_after.map(|id| id.to_string()),
+                });
+            }
+        }
+        Err(DesktopError::conflict("work item changed during snapshot"))
+    }
+
+    pub async fn get_run_approval_page(
+        &self,
+        work_item_id: WorkItemId,
+        run_id: RunId,
+        after: Option<ApprovalRequestId>,
+        limit: u32,
+        expected_revision: Option<u64>,
+    ) -> Result<RunApprovalPageEnvelope> {
+        let run = self.store.get_run(run_id).await.map_err(map_store_error)?;
+        if run.work_item_id != work_item_id {
+            return Err(DesktopError::invalid_request(
+                "run does not belong to work item",
+            ));
+        }
+        for _ in 0..SNAPSHOT_RETRIES {
+            let revision = self
+                .store
+                .get_work_item(work_item_id)
+                .await
+                .map_err(map_store_error)?
+                .revision
+                .get();
+            if expected_revision.is_some_and(|expected| expected != revision) {
+                return Err(DesktopError::conflict("work item revision changed"));
+            }
+            let page = self
+                .store
+                .list_approvals_for_run(run_id, after, limit.min(RECOVERY_PAGE_SIZE))
+                .await
+                .map_err(map_store_error)?;
+            let current = self
+                .store
+                .get_work_item(work_item_id)
+                .await
+                .map_err(map_store_error)?;
+            if current.revision.get() == revision {
+                return Ok(RunApprovalPageEnvelope {
+                    work_item_revision: revision,
+                    approvals: page.items.into_iter().map(frontend_approval).collect(),
+                    next_after: page.next_after.map(|id| id.to_string()),
                 });
             }
         }
@@ -453,12 +482,12 @@ impl DesktopApi {
                 .map(|work_item| {
                     let revision = work_item.revision.get();
                     WorkItemListItem {
-                        work_item,
+                        work_item: frontend_work_item(work_item),
                         revision,
                     }
                 })
                 .collect(),
-            next_after: page.next_after,
+            next_after: page.next_after.map(|id| id.to_string()),
         })
     }
 
@@ -493,8 +522,8 @@ impl DesktopApi {
                 .ok_or_else(|| DesktopError::invalid_request("stored connection missing"))?,
         );
         Ok(ConnectionEnvelope {
-            config_revision: snapshot.revision,
-            connection,
+            config_revision: snapshot.revision.get(),
+            connection: frontend_connection(connection),
         })
     }
 
@@ -505,8 +534,8 @@ impl DesktopApi {
             .await
             .map_err(map_config_error)?;
         Ok(ConnectionEnvelope {
-            config_revision: snapshot.config_revision,
-            connection: snapshot.connection,
+            config_revision: snapshot.config_revision.get(),
+            connection: frontend_connection(snapshot.connection),
         })
     }
 
@@ -517,8 +546,12 @@ impl DesktopApi {
             .await
             .map_err(map_config_error)?;
         Ok(ConnectionListEnvelope {
-            config_revision: list.config_revision,
-            connections: list.connections,
+            config_revision: list.config_revision.get(),
+            connections: list
+                .connections
+                .into_iter()
+                .map(frontend_connection)
+                .collect(),
         })
     }
 
@@ -624,10 +657,10 @@ impl DesktopApi {
             artifacts: artifacts
                 .into_iter()
                 .map(|artifact| ArtifactListItem {
-                    id: artifact.id,
-                    kind: artifact.kind,
+                    id: artifact.id.to_string(),
+                    kind: artifact_kind(artifact.kind),
                     byte_len: artifact.byte_len,
-                    work_item_id: artifact.work_item_id,
+                    work_item_id: artifact.work_item_id.to_string(),
                 })
                 .collect(),
         })
@@ -661,10 +694,10 @@ impl DesktopApi {
             media_type: artifact.media_type,
             bytes,
             artifact: ArtifactListItem {
-                id: artifact.id,
-                kind: artifact.kind,
+                id: artifact.id.to_string(),
+                kind: artifact_kind(artifact.kind),
                 byte_len: artifact.byte_len,
-                work_item_id: artifact.work_item_id,
+                work_item_id: artifact.work_item_id.to_string(),
             },
         })
     }
@@ -675,6 +708,18 @@ impl DesktopApi {
         run_id: RunId,
         after: Option<TimelineRevision>,
         limit: u32,
+    ) -> Result<WorkItemTimelineEnvelope> {
+        self.get_work_item_timeline_page_at_revision(work_item_id, run_id, after, limit, None)
+            .await
+    }
+
+    pub async fn get_work_item_timeline_page_at_revision(
+        &self,
+        work_item_id: WorkItemId,
+        run_id: RunId,
+        after: Option<TimelineRevision>,
+        limit: u32,
+        expected_revision: Option<u64>,
     ) -> Result<WorkItemTimelineEnvelope> {
         let run = self.store.get_run(run_id).await.map_err(map_store_error)?;
         if run.work_item_id != work_item_id {
@@ -690,6 +735,9 @@ impl DesktopApi {
                 .map_err(map_store_error)?
                 .revision
                 .get();
+            if expected_revision.is_some_and(|expected| expected != work_item_revision) {
+                return Err(DesktopError::conflict("work item revision changed"));
+            }
             let page = self
                 .store
                 .list_timeline_page(yakshed_application::ListTimeline {
@@ -708,10 +756,10 @@ impl DesktopApi {
                 .get();
             if current_revision == work_item_revision {
                 return Ok(WorkItemTimelineEnvelope {
-                    run_id,
+                    run_id: run_id.to_string(),
                     work_item_revision,
                     items: page.items.into_iter().map(frontend_timeline_item).collect(),
-                    next_after: page.next_after,
+                    next_after: page.next_after.map(TimelineRevision::get),
                 });
             }
         }
@@ -721,86 +769,173 @@ impl DesktopApi {
 
 fn frontend_run(run: RunSnapshot) -> FrontendRunSnapshot {
     FrontendRunSnapshot {
-        id: run.id,
-        connection_id: run.connection_id,
-        work_item_id: run.work_item_id,
-        status: run.status,
-        created_at: run.created_at,
-        ended_at: run.ended_at,
+        id: run.id.to_string(),
+        connection_id: run.connection_id.to_string(),
+        work_item_id: run.work_item_id.to_string(),
+        status: map_run_status(run.status),
+        created_at_ms: run.created_at.unix_millis(),
+        ended_at_ms: run.ended_at.map(UtcTimestamp::unix_millis),
     }
 }
 
 fn frontend_approval(approval: ApprovalSnapshot) -> FrontendApprovalSnapshot {
+    let (status, decision) = match approval.status {
+        ApprovalStatus::Pending => ("pending", None),
+        ApprovalStatus::Responding { decision } => {
+            ("responding", Some(approval_decision(decision)))
+        }
+        ApprovalStatus::Resolved { decision } => ("resolved", Some(approval_decision(decision))),
+        ApprovalStatus::Voided { decision } => ("voided", decision.map(approval_decision)),
+    };
     FrontendApprovalSnapshot {
-        id: approval.id,
-        connection_id: approval.connection_id,
-        run_id: approval.run_id,
+        id: approval.id.to_string(),
+        connection_id: approval.connection_id.to_string(),
+        run_id: approval.run_id.to_string(),
         kind: approval.kind,
         summary: approval.summary,
-        status: approval.status,
-        requested_at: approval.requested_at,
-        response_started_at: approval.response_started_at,
-        resolved_at: approval.resolved_at,
-        voided_at: approval.voided_at,
+        status: status.to_owned(),
+        decision: decision.map(str::to_owned),
+        requested_at_ms: approval.requested_at.unix_millis(),
+        response_started_at_ms: approval.response_started_at.map(UtcTimestamp::unix_millis),
+        resolved_at_ms: approval.resolved_at.map(UtcTimestamp::unix_millis),
+        voided_at_ms: approval.voided_at.map(UtcTimestamp::unix_millis),
     }
 }
 
 fn frontend_timeline_item(item: TimelineItemSnapshot) -> FrontendTimelineItemSnapshot {
     FrontendTimelineItemSnapshot {
-        id: item.id,
-        connection_id: item.connection_id,
-        run_id: item.run_id,
-        revision: item.revision,
+        id: item.id.to_string(),
+        connection_id: item.connection_id.to_string(),
+        run_id: item.run_id.to_string(),
+        revision: item.revision.get(),
         kind: item.kind,
         body: item.body,
-        created_at: item.created_at,
+        created_at_ms: item.created_at.unix_millis(),
     }
+}
+
+fn frontend_work_item(item: WorkItemSnapshot) -> FrontendWorkItemSnapshot {
+    FrontendWorkItemSnapshot {
+        id: item.id.to_string(),
+        project_id: item.project_id.to_string(),
+        title: item.title,
+        status: match item.status {
+            yakshed_domain::WorkItemStatus::Ready => "ready",
+            yakshed_domain::WorkItemStatus::Archived => "archived",
+        }
+        .to_owned(),
+        parent_id: item.parent_id.map(|id| id.to_string()),
+        revision: item.revision.get(),
+        created_at_ms: item.created_at.unix_millis(),
+        updated_at_ms: item.updated_at.unix_millis(),
+    }
+}
+
+fn frontend_connection(connection: PublicConnection) -> FrontendConnection {
+    FrontendConnection {
+        id: connection.id.to_string(),
+        name: connection.name,
+        harness: connection.harness,
+        model_provider: connection.model_provider,
+        provider_state: connection.provider_state.to_string(),
+        credentials: connection
+            .credentials
+            .into_iter()
+            .map(|binding| {
+                let (source, authority, backend, locator) = match binding.source {
+                    PublicCredentialSource::Delegated { authority } => {
+                        ("delegated", Some(authority), None, None)
+                    }
+                    PublicCredentialSource::Secret { backend, locator } => (
+                        "secret",
+                        None,
+                        Some(backend.to_string()),
+                        Some(locator.to_string()),
+                    ),
+                    PublicCredentialSource::Disabled => ("disabled", None, None, None),
+                };
+                FrontendCredentialBinding {
+                    slot: binding.slot.to_string(),
+                    source: source.to_owned(),
+                    authority,
+                    backend,
+                    locator,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn approval_decision(decision: yakshed_domain::ApprovalDecision) -> &'static str {
+    match decision {
+        yakshed_domain::ApprovalDecision::Approved => "approved",
+        yakshed_domain::ApprovalDecision::Denied => "denied",
+    }
+}
+
+fn artifact_kind(kind: ArtifactKind) -> String {
+    match kind {
+        ArtifactKind::Plan => "plan",
+        ArtifactKind::Diff => "diff",
+        ArtifactKind::File => "file",
+        ArtifactKind::Image => "image",
+        ArtifactKind::CommandLog => "command_log",
+        ArtifactKind::BrowserCapture => "browser_capture",
+        ArtifactKind::ProviderPayload => "provider_payload",
+    }
+    .to_owned()
 }
 
 fn map_frontend_event(event: AppEvent) -> FrontendEvent {
     FrontendEvent {
-        work_item_id: event.work_item_id,
+        work_item_id: event.work_item_id.to_string(),
         revision: event.revision,
         kind: match event.kind {
             AppEventKind::WorkItemPatched => FrontendEventKind::WorkItemPatched,
             AppEventKind::TimelineBatchAppended { run_id, item_count } => {
-                FrontendEventKind::TimelineBatchAppended { run_id, item_count }
+                FrontendEventKind::TimelineBatchAppended {
+                    run_id: run_id.to_string(),
+                    item_count,
+                }
             }
             AppEventKind::ApprovalOpened {
                 run_id,
                 approval_id,
             } => FrontendEventKind::ApprovalOpened {
-                run_id,
-                approval_id,
+                run_id: run_id.to_string(),
+                approval_id: approval_id.to_string(),
             },
             AppEventKind::ApprovalResolved {
                 run_id,
                 approval_id,
             } => FrontendEventKind::ApprovalResolved {
-                run_id,
-                approval_id,
+                run_id: run_id.to_string(),
+                approval_id: approval_id.to_string(),
             },
             AppEventKind::UserInputOpened {
                 run_id,
                 request_id,
                 prompt,
             } => FrontendEventKind::UserInputOpened {
-                run_id,
-                request_id,
+                run_id: run_id.to_string(),
+                request_id: request_id.to_string(),
                 prompt,
             },
             AppEventKind::UserInputResponded { run_id, request_id } => {
-                FrontendEventKind::UserInputResponded { run_id, request_id }
+                FrontendEventKind::UserInputResponded {
+                    run_id: run_id.to_string(),
+                    request_id: request_id.to_string(),
+                }
             }
             AppEventKind::RunStatusChanged { run_id, status } => {
                 FrontendEventKind::RunStatusChanged {
-                    run_id,
+                    run_id: run_id.to_string(),
                     status: map_run_status(status),
                 }
             }
             AppEventKind::RunOutcomeUnknown { run_id, operation } => {
                 FrontendEventKind::RunOutcomeUnknown {
-                    run_id,
+                    run_id: run_id.to_string(),
                     operation: operation.to_string(),
                 }
             }
