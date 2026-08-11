@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 include!("src/roster.rs");
 
 #[cfg(target_os = "macos")]
