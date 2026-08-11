@@ -355,6 +355,33 @@ impl TestContext {
         .await
         .unwrap();
     }
+
+    async fn wait_for_status_via_events(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        run_id: RunId,
+        expected: RunStatus,
+    ) -> Vec<u64> {
+        let mut revisions = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                revisions.push(event.revision);
+                if let AppEventKind::RunStatusChanged {
+                    run_id: changed_run_id,
+                    status,
+                } = event.kind
+                {
+                    if changed_run_id == run_id && status == expected {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        revisions
+    }
 }
 
 fn connection_id() -> ConnectionId {
@@ -590,11 +617,9 @@ async fn application_event_revisions_are_monotonic_per_work_item() {
     .await;
     let mut events = context.supervisor.subscribe();
     let run_id = context.start().await;
-    context.wait_for_status(run_id, RunStatus::Completed).await;
-    let mut revisions = Vec::new();
-    while let Ok(event) = events.try_recv() {
-        revisions.push(event.revision);
-    }
+    let revisions = context
+        .wait_for_status_via_events(&mut events, run_id, RunStatus::Completed)
+        .await;
     assert!(revisions.len() >= 4);
     assert!(revisions.windows(2).all(|pair| pair[1] == pair[0] + 1));
     assert_eq!(revisions[0], 1);
