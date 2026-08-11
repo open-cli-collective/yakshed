@@ -246,6 +246,59 @@ async fn scripted_events_keep_the_declared_legal_order() {
 }
 
 #[tokio::test]
+async fn duplicate_command_texts_get_distinct_command_handles() {
+    let mock = mock(
+        HarnessCapabilities::default(),
+        vec![MockRunPlan::new(vec![
+            MockScriptStep::command_output("repeat", "first"),
+            MockScriptStep::command_output("repeat", "second"),
+            MockScriptStep::complete(),
+        ])],
+        None,
+    );
+    let mut stream = mock.subscribe().unwrap();
+    let session = session(&mock).await;
+    let run = mock
+        .start_run(
+            &session,
+            HarnessInput::new("repeat").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    let first = match next(&mut stream).await {
+        HarnessEvent::CommandOutputCompleted {
+            command,
+            command_text,
+            ..
+        } => {
+            assert_eq!(command_text, "repeat");
+            command
+        }
+        event => panic!("expected command output, got {event:?}"),
+    };
+    let second = match next(&mut stream).await {
+        HarnessEvent::CommandOutputCompleted {
+            command,
+            command_text,
+            ..
+        } => {
+            assert_eq!(command_text, "repeat");
+            command
+        }
+        event => panic!("expected second command output, got {event:?}"),
+    };
+    assert_ne!(first, second);
+    assert_eq!(first.run(), &run);
+    assert_eq!(second.run(), &run);
+}
+
+#[tokio::test]
 async fn a_run_fault_plan_is_scoped_and_consumed_once() {
     let mock = mock(
         HarnessCapabilities::default(),

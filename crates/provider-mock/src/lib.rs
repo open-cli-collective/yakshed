@@ -78,6 +78,7 @@ pub enum MockScriptStep {
         native: String,
     },
     CommandOutput {
+        command_id: Option<String>,
         command: String,
         chunk: String,
         native: String,
@@ -148,6 +149,7 @@ impl MockScriptStep {
         let command = command.into();
         let chunk = chunk.into();
         Self::CommandOutput {
+            command_id: None,
             native: format!(
                 r#"{{"type":"command.output","command":{command:?},"chunk":{chunk:?}}}"#
             ),
@@ -180,6 +182,7 @@ impl MockScriptStep {
 struct RunRecord {
     active: bool,
     delayed: bool,
+    next_command_id: u64,
     steps: VecDeque<MockScriptStep>,
     fault: Option<MockHarnessFault>,
     pending: Option<PendingDelivery>,
@@ -768,12 +771,22 @@ impl MockHarness {
                 MockScriptStep::CommandOutput {
                     command,
                     chunk,
+                    command_id,
                     native,
                 } => PendingDelivery {
                     event: {
                         let command_text = command.clone();
+                        let command_id = command_id
+                            .clone()
+                            .or_else(|| {
+                                let record = state.runs.get_mut(run_handle).expect("run exists");
+                                let id = format!("command-{:04}", record.next_command_id);
+                                record.next_command_id += 1;
+                                Some(id)
+                            })
+                            .expect("command id");
                         let command_id =
-                            ProviderCommandId::new(command).expect("invalid command id");
+                            ProviderCommandId::new(command_id).expect("invalid command id");
                         let command = ProviderCommandHandle::new(run_handle.clone(), command_id);
                         HarnessEvent::CommandOutputCompleted {
                             run: run_handle.clone(),
@@ -1063,6 +1076,7 @@ impl HarnessAdapter for MockHarness {
                 RunRecord {
                     active: true,
                     delayed: false,
+                    next_command_id: 1,
                     steps: plan.steps,
                     fault,
                     pending,

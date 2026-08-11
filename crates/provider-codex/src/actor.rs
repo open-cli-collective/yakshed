@@ -224,7 +224,8 @@ async fn run_actor(
     ));
     let stderr = child.take_stderr().expect("spawned child has stderr");
     let stderr_task = tokio::spawn(read_stderr(stderr, inbound_tx));
-    let expected_home = normalize_codex_home(&spec.key.codex_home.to_string_lossy());
+    let expected_home = normalize_codex_home(&spec.key.codex_home.to_string_lossy())
+        .expect("configured codex home is absolute");
 
     let initialize = json!({
         "id": 1,
@@ -472,13 +473,10 @@ fn valid_initialize_response(value: &Value, expected_home: &str) -> bool {
     let Some(result) = value.as_object() else {
         return false;
     };
-    result
-        .get("codexHome")
-        .and_then(Value::as_str)
-        .is_some_and(|path| {
-            let normalized = normalize_codex_home(path);
-            !normalized.is_empty() && Path::new(path).is_absolute() && normalized == expected_home
-        })
+    let Some(codex_home) = result.get("codexHome").and_then(Value::as_str) else {
+        return false;
+    };
+    normalize_path_matches(expected_home, codex_home)
         && result
             .get("platformFamily")
             .and_then(Value::as_str)
@@ -487,34 +485,105 @@ fn valid_initialize_response(value: &Value, expected_home: &str) -> bool {
         && result.get("userAgent").and_then(Value::as_str).is_some()
 }
 
-fn is_root(path: &str) -> bool {
-    if cfg!(windows) {
-        path.len() == 3 && path.as_bytes()[1] == b':' && matches!(path.as_bytes()[2], b'/' | b'\\')
+fn normalize_codex_home(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let path = Path::new(raw);
+    let separator = std::path::MAIN_SEPARATOR;
+    use std::path::Component;
+    let mut normalized = String::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                if !normalized.is_empty() && !normalized.ends_with(separator) {
+                    normalized.push(separator);
+                }
+                normalized.push_str(&prefix.as_os_str().to_string_lossy());
+            }
+            Component::RootDir => {
+                if normalized.is_empty() {
+                    normalized.push(separator);
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.ends_with(separator) {
+                    normalized.push(separator);
+                }
+                normalized.push_str("..");
+            }
+            Component::Normal(value) => {
+                if !normalized.is_empty() && !normalized.ends_with(separator) {
+                    normalized.push(separator);
+                }
+                normalized.push_str(&value.to_string_lossy());
+            }
+        }
+    }
+
+    if normalized.is_empty() {
+        None
+    } else if cfg!(windows) {
+        Some(normalized.to_ascii_lowercase())
     } else {
-        path == "/"
+        Some(normalized)
     }
 }
 
-fn normalize_codex_home(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
+fn normalize_path_matches(expected: &str, reported: &str) -> bool {
+    match (
+        normalize_codex_home(expected),
+        normalize_codex_home(reported),
+    ) {
+        (Some(expected), Some(reported)) => expected == reported,
+        _ => false,
     }
-    let normalized = if is_root(trimmed) {
-        trimmed
-    } else {
-        trimmed.trim_end_matches(['/', '\\'].as_ref())
-    };
-    if is_root(trimmed) {
-        if cfg!(windows) {
-            return normalized.to_ascii_lowercase();
-        }
-        return normalized.to_owned();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_codex_home;
+    use super::normalize_path_matches;
+
+    #[test]
+    fn compare_home_without_trimming_whitespace() {
+        let expected = "/var/tmp/codex home";
+        let with_space = "/var/tmp/codex home ";
+        let with_space_other = "/var/tmp/codex home";
+        assert_ne!(
+            normalize_codex_home(with_space),
+            normalize_codex_home(with_space_other)
+        );
+        assert!(normalize_path_matches(expected, with_space_other));
+        assert!(!normalize_path_matches(expected, with_space));
     }
-    if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized.to_owned()
+
+    #[test]
+    fn whitespace_path_is_compared_literally() {
+        assert!(normalize_path_matches(
+            "/var/tmp/codex home",
+            "/var/tmp/codex home"
+        ));
+        assert!(!normalize_path_matches(
+            "/var/tmp/codex home",
+            "/var/tmp/codex home "
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_unix_backslash_is_significant() {
+        assert_ne!(
+            normalize_codex_home("/state/codex"),
+            normalize_codex_home("/state/codex\\")
+        );
     }
 }
 

@@ -148,21 +148,150 @@ fn reducer_scopes_colliding_item_ids_to_their_runs() {
             }
         }
     });
-    reducer.reduce(completed.to_string(), &completed, Some(run_a.clone()), None);
-    assert_eq!(
-        command_text_for(&mut reducer, &run_a, "command-1"),
-        Some(String::new())
-    );
+    let completed_events =
+        reducer.reduce(completed.to_string(), &completed, Some(run_a.clone()), None);
+    assert!(matches!(
+        completed_events.first(),
+        Some(HarnessEvent::CommandOutputCompleted {
+            command_text, ..
+        }) if command_text == "command a"
+    ));
+    assert!(matches!(
+        reducer
+            .reduce(
+                serde_json::json!({
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {"itemId":"command-1","delta":"late"}
+                })
+                .to_string(),
+                &serde_json::json!({
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {"itemId":"command-1","delta":"late"}
+                }),
+                Some(run_a.clone()),
+                None
+            )
+            .as_slice(),
+        [HarnessEvent::MalformedNativePayload { .. }]
+    ));
 
     let terminal = serde_json::json!({
         "method": "turn/completed",
         "params": {"turn": {"status": "completed"}}
     });
     reducer.reduce(terminal.to_string(), &terminal, Some(run_b.clone()), None);
-    assert_eq!(
-        command_text_for(&mut reducer, &run_b, "command-1"),
-        Some(String::new())
+    assert!(
+        reducer
+            .reduce(
+                serde_json::json!({
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "aggregatedOutput": "again",
+                        }
+                    }
+                })
+                .to_string(),
+                &serde_json::json!({
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "aggregatedOutput": "again",
+                        }
+                    }
+                }),
+                Some(run_b.clone()),
+                None,
+            )
+            .into_iter()
+            .all(|event| matches!(event, HarnessEvent::MalformedNativePayload { .. }))
     );
+}
+
+#[test]
+fn command_delta_without_registered_command_is_malformed() {
+    let mut reducer = Reducer::default();
+    let run = run();
+    let delta = serde_json::json!({
+        "method": "item/commandExecution/outputDelta",
+        "params": {"itemId": "command-1", "delta": "output"}
+    });
+    assert!(matches!(
+        reducer
+            .reduce(delta.to_string(), &delta, Some(run), None)
+            .as_slice(),
+        [HarnessEvent::MalformedNativePayload { .. }]
+    ));
+}
+
+#[test]
+fn command_completion_without_cached_and_native_command_is_malformed() {
+    let mut reducer = Reducer::default();
+    let run = run();
+    let value = serde_json::json!({
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "id": "command-1",
+                "type": "commandExecution",
+                "aggregatedOutput": "oops",
+            }
+        }
+    });
+    assert!(matches!(
+        reducer
+            .reduce(value.to_string(), &value, Some(run), None)
+            .as_slice(),
+        [HarnessEvent::MalformedNativePayload { .. }]
+    ));
+}
+
+#[test]
+fn command_completion_disagreeing_with_start_is_malformed() {
+    let mut reducer = Reducer::default();
+    let run = run();
+    let start = serde_json::json!({
+        "method": "item/started",
+        "params": {
+            "item": {
+                "id": "command-1",
+                "type": "commandExecution",
+                "command": "cargo test"
+            }
+        }
+    });
+    assert!(
+        reducer
+            .reduce(start.to_string(), &start, Some(run.clone()), None)
+            .is_empty()
+    );
+    let completion = serde_json::json!({
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "id": "command-1",
+                "type": "commandExecution",
+                "command": "other command",
+                "aggregatedOutput": "oops",
+            }
+        }
+    });
+    assert!(matches!(
+        reducer
+            .reduce(completion.to_string(), &completion, Some(run.clone()), None)
+            .as_slice(),
+        [HarnessEvent::MalformedNativePayload { .. }]
+    ));
+    assert!(matches!(
+        reducer
+            .reduce(completion.to_string(), &completion, Some(run), None)
+            .as_slice(),
+        [HarnessEvent::MalformedNativePayload { .. }]
+    ));
 }
 
 #[test]
@@ -245,26 +374,6 @@ fn run_named(turn: &str) -> ProviderRunHandle {
         ProviderSessionId::new("thread-golden").unwrap(),
         ProviderRunId::new(turn).unwrap(),
     )
-}
-
-fn command_text_for(
-    reducer: &mut Reducer,
-    run: &ProviderRunHandle,
-    item_id: &str,
-) -> Option<String> {
-    let value = serde_json::json!({
-        "method": "item/commandExecution/outputDelta",
-        "params": {"itemId": item_id, "delta": "output"}
-    });
-    match reducer
-        .reduce(value.to_string(), &value, Some(run.clone()), None)
-        .into_iter()
-        .next()
-        .unwrap()
-    {
-        HarnessEvent::CommandOutputDelta { command_text, .. } => Some(command_text),
-        event => panic!("expected command output, got {event:?}"),
-    }
 }
 
 fn snapshot(event: HarnessEvent) -> String {

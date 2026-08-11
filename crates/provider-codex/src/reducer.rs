@@ -76,16 +76,14 @@ impl Reducer {
                 let event_run = require!(run.clone());
                 let item_id = require!(string(params, "itemId"));
                 let chunk = require!(string(params, "delta"));
-                let command = match ProviderCommandId::new(item_id) {
+                let command_id = match ProviderCommandId::new(item_id) {
                     Ok(id) => id,
                     Err(_) => return vec![malformed(Some(event_run), method, native)],
                 };
-                let command_handle = ProviderCommandHandle::new(event_run.clone(), command);
-                let command_text = self
-                    .commands
-                    .get(&command_handle)
-                    .cloned()
-                    .unwrap_or_default();
+                let command_handle = ProviderCommandHandle::new(event_run.clone(), command_id);
+                let Some(command_text) = self.commands.get(&command_handle).cloned() else {
+                    return vec![malformed(Some(event_run), method, native)];
+                };
                 vec![HarnessEvent::CommandOutputDelta {
                     command: command_handle,
                     command_text,
@@ -235,10 +233,14 @@ impl Reducer {
                     Err(_) => return vec![malformed(Some(event_run), method, native)],
                 };
                 let command = ProviderCommandHandle::new(event_run.clone(), command_id);
-                let command_text = self
-                    .commands
-                    .remove(&command)
-                    .unwrap_or_else(|| string(item, "command").unwrap_or_default());
+                let command_text = self.commands.remove(&command);
+                if command_text.is_none() {
+                    return vec![malformed(Some(event_run), method, native)];
+                }
+                let command_text = command_text.expect("command exists");
+                if string(item, "command") != Some(command_text.clone()) {
+                    return vec![malformed(Some(event_run), method, native)];
+                }
                 let output = string(item, "aggregatedOutput").unwrap_or_default();
                 vec![HarnessEvent::CommandOutputCompleted {
                     run: event_run,
