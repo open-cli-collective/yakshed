@@ -4,7 +4,8 @@ use provider_codex::{CodexAdapter, CodexRuntimeKey, CodexRuntimeSpec};
 use yakshed_domain::ApprovalDecision;
 use yakshed_harness::{
     HarnessAdapter, HarnessCredentialDelivery, HarnessError, HarnessEvent, HarnessInput,
-    HarnessRunTerminal, ProviderResponse, RunOptions, RuntimeHandle, RuntimePath, StartSessionSpec,
+    HarnessRunTerminal, ProviderResponse, RunOptions, RuntimeHandle, RuntimePath, SessionQuery,
+    StartSessionSpec,
 };
 
 struct TestAdapter {
@@ -153,7 +154,7 @@ async fn stderr_flood_is_continuously_drained_into_a_bounded_buffer() {
 
 #[tokio::test]
 async fn oversized_frame_is_bounded_preserved_and_does_not_stop_the_stream() {
-    let test = adapter("oversized", 256, None);
+    let test = adapter("oversized", 1024, None);
     let mut stream = test.adapter.subscribe().unwrap();
     let session = session(&test).await;
     test.adapter
@@ -173,7 +174,7 @@ async fn oversized_frame_is_bounded_preserved_and_does_not_stop_the_stream() {
             item_type, native, ..
         } => {
             assert_eq!(item_type, "codex.oversized-frame");
-            assert_eq!(native.sanitized_raw().len(), 256);
+            assert_eq!(native.sanitized_raw().len(), 1024);
         }
         event => panic!("expected oversized-frame event, got {event:?}"),
     }
@@ -298,7 +299,7 @@ async fn structurally_malformed_notification_is_visible_before_terminal() {
 }
 
 #[tokio::test]
-async fn failed_provider_response_is_uncertain_and_never_resent() {
+async fn failed_provider_response_write_is_fatal_after_uncertain_reply() {
     let test = adapter("response_disconnect", 1024 * 1024, None);
     let mut stream = test.adapter.subscribe().unwrap();
     let session = session(&test).await;
@@ -328,10 +329,210 @@ async fn failed_provider_response_is_uncertain_and_never_resent() {
         })
     ));
     assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal {
+            state: HarnessRunTerminal::Crashed { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        test.adapter.capabilities(&test.runtime).await,
+        Err(HarnessError::Disconnected)
+    ));
+    assert!(matches!(
         test.adapter.respond_to_request(request, response).await,
-        Err(HarnessError::OutcomeUnknown {
-            operation: "provider/request/respond"
+        Err(HarnessError::NotFound {
+            entity: "provider request",
+            ..
         })
+    ));
+}
+
+#[tokio::test]
+async fn failed_client_request_write_settles_pending_work_and_disconnects() {
+    let test = adapter("client_write_failure", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    let run = test
+        .adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+
+    let listing = test.adapter.list_sessions(
+        &test.runtime,
+        SessionQuery {
+            after: None,
+            limit: 10,
+        },
+    );
+    tokio::pin!(listing);
+    loop {
+        tokio::select! {
+            result = &mut listing => panic!("listing unexpectedly settled: {result:?}"),
+            event = next(&mut stream) => {
+                if matches!(event, HarnessEvent::Unknown { ref item_type, .. } if item_type == "test/clientRequestPending") {
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(matches!(
+        test.adapter
+            .steer(&run, HarnessInput::new("steer").unwrap())
+            .await,
+        Err(HarnessError::OutcomeUnknown {
+            operation: "turn/steer"
+        })
+    ));
+    assert!(matches!(listing.await, Err(HarnessError::Disconnected)));
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal {
+            state: HarnessRunTerminal::Crashed { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        test.adapter.capabilities(&test.runtime).await,
+        Err(HarnessError::Disconnected)
+    ));
+}
+
+#[tokio::test]
+async fn pinned_file_change_approval_without_started_at_reaches_the_client() {
+    let test = adapter("file_approval", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    test.adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    let request = match next(&mut stream).await {
+        HarnessEvent::ApprovalRequested { request, .. } => request,
+        event => panic!("expected file approval, got {event:?}"),
+    };
+    test.adapter
+        .respond_to_request(
+            request,
+            ProviderResponse::Approval(ApprovalDecision::Denied),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal {
+            state: HarnessRunTerminal::Completed,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn malformed_mutation_ack_is_uncertain_without_a_phantom_run() {
+    let test = adapter("malformed_turn_ack", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    assert!(matches!(
+        test.adapter
+            .start_run(
+                &session,
+                HarnessInput::new("run").unwrap(),
+                RunOptions::default(),
+            )
+            .await,
+        Err(HarnessError::OutcomeUnknown {
+            operation: "turn/start"
+        })
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), stream.recv())
+            .await
+            .is_err()
+    );
+    test.adapter.capabilities(&test.runtime).await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_steer_ack_is_outcome_unknown() {
+    let test = adapter("malformed_steer_ack", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    let run = test
+        .adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    assert!(matches!(
+        test.adapter
+            .steer(&run, HarnessInput::new("steer").unwrap())
+            .await,
+        Err(HarnessError::OutcomeUnknown {
+            operation: "turn/steer"
+        })
+    ));
+    test.adapter.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_terminal_emits_visibility_and_terminal_before_retirement() {
+    let test = adapter("malformed_terminal", 1024 * 1024, None);
+    let mut stream = test.adapter.subscribe().unwrap();
+    let session = session(&test).await;
+    let run = test
+        .adapter
+        .start_run(
+            &session,
+            HarnessInput::new("run").unwrap(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunAccepted { .. }
+    ));
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::MalformedNativePayload { .. }
+    ));
+    assert!(matches!(
+        next(&mut stream).await,
+        HarnessEvent::RunTerminal {
+            state: HarnessRunTerminal::Crashed { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        test.adapter
+            .steer(&run, HarnessInput::new("too late").unwrap())
+            .await,
+        Err(HarnessError::NotFound { entity: "run", .. })
     ));
     test.adapter.shutdown().await.unwrap();
 }

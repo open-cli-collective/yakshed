@@ -26,9 +26,11 @@ const ACTOR_CAPACITY: usize = 64;
 const DIAGNOSTIC_CAPACITY: usize = 32;
 
 pub enum RequestKind {
-    Read,
+    EmptyObject,
+    ThreadList,
     Session,
     StartRun { session_id: ProviderSessionId },
+    TurnSteer,
 }
 
 enum CommandMessage {
@@ -269,11 +271,20 @@ async fn run_actor(
     let mut diagnostics = VecDeque::<String>::new();
     let mut reducer = Reducer::default();
 
-    loop {
+    'actor: loop {
         tokio::select! {
             command = commands.recv() => {
                 match command {
                     Some(CommandMessage::Request { method, params, mutation, kind, reply }) => {
+                        if let Some((thread, turn)) = operation_run_identity(method, &params)
+                            && !runs.contains_key(&(thread.to_owned(), turn.to_owned()))
+                        {
+                            let _ = reply.send(Err(HarnessError::NotFound {
+                                entity: "run",
+                                id: format!("{thread}/{turn}"),
+                            }));
+                            continue 'actor;
+                        }
                         let id = next_id;
                         next_id += 1;
                         let frame = json!({"id": id, "method": method, "params": params});
@@ -284,18 +295,47 @@ async fn run_actor(
                                 HarnessError::Disconnected
                             };
                             let _ = reply.send(Err(error));
+                            child.kill_and_reap().await;
+                            settle_runtime(
+                                &mut pending,
+                                &mut server_requests,
+                                &mut runs,
+                                &mut reducer,
+                                &events,
+                                &sanitizer,
+                                Settlement::Crashed,
+                            ).await;
+                            break 'actor;
                         } else {
                             pending.insert(id, PendingClient { method, mutation, kind, reply });
                         }
                     }
                     Some(CommandMessage::Respond { request, response, reply }) => {
-                        let result = respond_to_server_request(
+                        let outcome = respond_to_server_request(
                             &mut stdin,
                             &mut server_requests,
                             &request,
                             response,
                         ).await;
-                        let _ = reply.send(result);
+                        match outcome {
+                            ServerResponseOutcome::Complete(result) => {
+                                let _ = reply.send(result);
+                            }
+                            ServerResponseOutcome::TransportFailed(error) => {
+                                let _ = reply.send(Err(error));
+                                child.kill_and_reap().await;
+                                settle_runtime(
+                                    &mut pending,
+                                    &mut server_requests,
+                                    &mut runs,
+                                    &mut reducer,
+                                    &events,
+                                    &sanitizer,
+                                    Settlement::Crashed,
+                                ).await;
+                                break 'actor;
+                            }
+                        }
                     }
                     Some(CommandMessage::Diagnostics(reply)) => {
                         let _ = reply.send(diagnostics.iter().cloned().collect());
@@ -427,14 +467,27 @@ async fn handle_frame(
         let Some(pending_request) = pending.remove(&id) else {
             return Ok(());
         };
-        if let Some(error) = value.get("error") {
+        if let Some(error) = value.get("error")
+            && value.get("result").is_none()
+        {
             let _ = pending_request
                 .reply
                 .send(Err(classify_protocol_error(error, sanitizer)));
             return Ok(());
         }
-        let mut result = value.get("result").cloned().unwrap_or_else(|| json!({}));
+        let Some(mut result) = value.get("result").cloned() else {
+            push_diagnostic(diagnostics, sanitizer.sanitize(raw));
+            let error = malformed_ack_error(&pending_request);
+            let _ = pending_request.reply.send(Err(error));
+            return Ok(());
+        };
         sanitizer.sanitize_value(&mut result);
+        if value.get("error").is_some() || !valid_response_result(&pending_request.kind, &result) {
+            push_diagnostic(diagnostics, sanitizer.sanitize(raw));
+            let error = malformed_ack_error(&pending_request);
+            let _ = pending_request.reply.send(Err(error));
+            return Ok(());
+        }
         match &pending_request.kind {
             RequestKind::Session => {
                 if let Some(thread_id) = result
@@ -466,7 +519,7 @@ async fn handle_frame(
                         .await;
                 }
             }
-            RequestKind::Read => {}
+            RequestKind::EmptyObject | RequestKind::ThreadList | RequestKind::TurnSteer => {}
         }
         let _ = pending_request.reply.send(Ok(result));
         return Ok(());
@@ -530,20 +583,174 @@ async fn handle_frame(
     };
     let completes_run = method == "turn/completed";
     if let Some(event) = reducer.reduce(sanitized, &safe_value, run.clone(), request) {
-        let terminal = matches!(event, HarnessEvent::RunTerminal { .. });
-        let _ = events.send(event).await;
-        if (terminal || completes_run)
-            && let Some(run) = run
-        {
-            runs.remove(&(
-                run.session_id().as_str().to_owned(),
-                run.native_id().as_str().to_owned(),
-            ));
-            server_requests.retain(|request, _| request.run() != &run);
-            reducer.retire_run(&run);
+        match event {
+            HarnessEvent::RunTerminal { run, state, native } => {
+                emit_terminal_and_retire(
+                    run,
+                    state,
+                    native,
+                    events,
+                    server_requests,
+                    runs,
+                    reducer,
+                )
+                .await;
+            }
+            malformed @ HarnessEvent::MalformedNativePayload { .. } if completes_run => {
+                let _ = events.send(malformed).await;
+                if let Some(run) = run {
+                    emit_terminal_and_retire(
+                        run,
+                        HarnessRunTerminal::Crashed {
+                            diagnostic: SanitizedDiagnostic::sanitized(
+                                "Codex emitted a malformed terminal frame",
+                            ),
+                        },
+                        NativePayload::sanitized("{\"event\":\"malformed-terminal-frame\"}"),
+                        events,
+                        server_requests,
+                        runs,
+                        reducer,
+                    )
+                    .await;
+                }
+            }
+            event => {
+                let _ = events.send(event).await;
+            }
         }
     }
     Ok(())
+}
+
+fn malformed_ack_error(pending: &PendingClient) -> HarnessError {
+    if pending.mutation {
+        HarnessError::OutcomeUnknown {
+            operation: pending.method,
+        }
+    } else {
+        HarnessError::Protocol {
+            diagnostic: SanitizedDiagnostic::sanitized(
+                "Codex response did not match the pinned schema",
+            ),
+        }
+    }
+}
+
+fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
+    let Some(object) = result.as_object() else {
+        return false;
+    };
+    match kind {
+        RequestKind::EmptyObject => true,
+        RequestKind::ThreadList => {
+            object
+                .get("data")
+                .and_then(Value::as_array)
+                .is_some_and(|threads| threads.iter().all(valid_thread))
+                && object
+                    .get("nextCursor")
+                    .is_none_or(|cursor| cursor.is_null() || cursor.is_string())
+        }
+        RequestKind::Session => {
+            has_fields(
+                object,
+                &[
+                    "approvalPolicy",
+                    "approvalsReviewer",
+                    "cwd",
+                    "model",
+                    "modelProvider",
+                    "sandbox",
+                    "thread",
+                ],
+            ) && object.get("cwd").and_then(Value::as_str).is_some()
+                && object.get("model").and_then(Value::as_str).is_some()
+                && object
+                    .get("modelProvider")
+                    .and_then(Value::as_str)
+                    .is_some()
+                && object.get("sandbox").and_then(Value::as_object).is_some()
+                && object.get("thread").is_some_and(valid_thread)
+        }
+        RequestKind::StartRun { .. } => object.get("turn").is_some_and(valid_turn),
+        RequestKind::TurnSteer => object.get("turnId").and_then(Value::as_str).is_some(),
+    }
+}
+
+fn valid_thread(value: &Value) -> bool {
+    let Some(thread) = value.as_object() else {
+        return false;
+    };
+    has_fields(
+        thread,
+        &[
+            "cliVersion",
+            "createdAt",
+            "cwd",
+            "ephemeral",
+            "id",
+            "modelProvider",
+            "preview",
+            "sessionId",
+            "source",
+            "status",
+            "turns",
+            "updatedAt",
+        ],
+    ) && thread.get("cliVersion").and_then(Value::as_str).is_some()
+        && thread.get("createdAt").and_then(Value::as_i64).is_some()
+        && thread.get("cwd").and_then(Value::as_str).is_some()
+        && thread.get("ephemeral").and_then(Value::as_bool).is_some()
+        && thread
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| ProviderSessionId::new(id).is_ok())
+        && thread
+            .get("modelProvider")
+            .and_then(Value::as_str)
+            .is_some()
+        && thread.get("preview").and_then(Value::as_str).is_some()
+        && thread.get("sessionId").and_then(Value::as_str).is_some()
+        && thread.get("source").is_some_and(|source| {
+            source.is_string() || source.as_object().is_some_and(|source| !source.is_empty())
+        })
+        && thread
+            .get("status")
+            .and_then(Value::as_object)
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "notLoaded" | "idle" | "systemError" | "active"))
+        && thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .is_some_and(|turns| turns.iter().all(valid_turn))
+        && thread.get("updatedAt").and_then(Value::as_i64).is_some()
+}
+
+fn valid_turn(value: &Value) -> bool {
+    let Some(turn) = value.as_object() else {
+        return false;
+    };
+    has_fields(turn, &["id", "items", "status"])
+        && turn
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| ProviderRunId::new(id).is_ok())
+        && turn.get("items").and_then(Value::as_array).is_some()
+        && turn
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    "completed" | "interrupted" | "failed" | "inProgress"
+                )
+            })
+}
+
+fn has_fields(object: &serde_json::Map<String, Value>, fields: &[&str]) -> bool {
+    fields.iter().all(|field| object.contains_key(*field))
 }
 
 struct ServerRequestRejection {
@@ -564,8 +771,12 @@ fn validate_server_request(
             message: "invalid request",
         })?;
     let kind = match method {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            validate_approval_params(value)?;
+        "item/commandExecution/requestApproval" => {
+            validate_command_approval_params(value)?;
+            ServerRequestKind::Approval
+        }
+        "item/fileChange/requestApproval" => {
+            validate_file_approval_params(value)?;
             ServerRequestKind::Approval
         }
         "item/tool/requestUserInput" => ServerRequestKind::UserInput {
@@ -615,11 +826,20 @@ fn validate_server_request(
     ))
 }
 
-fn validate_approval_params(value: &Value) -> Result<(), ServerRequestRejection> {
+fn validate_command_approval_params(value: &Value) -> Result<(), ServerRequestRejection> {
     let params = request_params(value)?;
     let valid = params.get("itemId").and_then(Value::as_str).is_some()
         && params.get("startedAtMs").and_then(Value::as_i64).is_some();
     if valid { Ok(()) } else { Err(invalid_params()) }
+}
+
+fn validate_file_approval_params(value: &Value) -> Result<(), ServerRequestRejection> {
+    let params = request_params(value)?;
+    params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .map(|_| ())
+        .ok_or_else(invalid_params)
 }
 
 fn validate_user_input_params(value: &Value) -> Result<Vec<String>, ServerRequestRejection> {
@@ -687,22 +907,27 @@ async fn write_protocol_error(
     .await
 }
 
+enum ServerResponseOutcome {
+    Complete(Result<(), HarnessError>),
+    TransportFailed(HarnessError),
+}
+
 async fn respond_to_server_request(
     stdin: &mut ChildStdin,
     requests: &mut HashMap<ProviderRequestHandle, PendingServer>,
     request: &ProviderRequestHandle,
     response: ProviderResponse,
-) -> Result<(), HarnessError> {
-    let pending = requests
-        .get_mut(request)
-        .ok_or_else(|| HarnessError::NotFound {
+) -> ServerResponseOutcome {
+    let Some(pending) = requests.get_mut(request) else {
+        return ServerResponseOutcome::Complete(Err(HarnessError::NotFound {
             entity: "provider request",
             id: request.to_string(),
-        })?;
+        }));
+    };
     if pending.uncertain {
-        return Err(HarnessError::OutcomeUnknown {
+        return ServerResponseOutcome::Complete(Err(HarnessError::OutcomeUnknown {
             operation: "provider/request/respond",
-        });
+        }));
     }
     let result = match (&pending.kind, response) {
         (ServerRequestKind::Approval, ProviderResponse::Approval(decision)) => json!({
@@ -719,9 +944,9 @@ async fn respond_to_server_request(
             json!({"answers": answers})
         }
         _ => {
-            return Err(HarnessError::InvalidInput(
+            return ServerResponseOutcome::Complete(Err(HarnessError::InvalidInput(
                 "provider response does not match request kind".to_owned(),
-            ));
+            )));
         }
     };
     if write_frame(stdin, &json!({"id": pending.rpc_id, "result": result}))
@@ -729,12 +954,22 @@ async fn respond_to_server_request(
         .is_err()
     {
         pending.uncertain = true;
-        return Err(HarnessError::OutcomeUnknown {
+        return ServerResponseOutcome::TransportFailed(HarnessError::OutcomeUnknown {
             operation: "provider/request/respond",
         });
     }
     requests.remove(request);
-    Ok(())
+    ServerResponseOutcome::Complete(Ok(()))
+}
+
+fn operation_run_identity<'a>(method: &str, params: &'a Value) -> Option<(&'a str, &'a str)> {
+    let thread = params.get("threadId")?.as_str()?;
+    let turn = match method {
+        "turn/steer" => params.get("expectedTurnId")?.as_str()?,
+        "turn/interrupt" => params.get("turnId")?.as_str()?,
+        _ => return None,
+    };
+    Some((thread, turn))
 }
 
 fn run_for_message(
@@ -758,6 +993,30 @@ fn message_has_run_identity(value: &Value) -> bool {
             params.contains_key("threadId")
                 && (params.contains_key("turnId") || params.contains_key("turn"))
         })
+}
+
+async fn emit_terminal_and_retire(
+    run: ProviderRunHandle,
+    state: HarnessRunTerminal,
+    native: NativePayload,
+    events: &HarnessEventSender,
+    server_requests: &mut HashMap<ProviderRequestHandle, PendingServer>,
+    runs: &mut HashMap<(String, String), ProviderRunHandle>,
+    reducer: &mut Reducer,
+) {
+    let _ = events
+        .send(HarnessEvent::RunTerminal {
+            run: run.clone(),
+            state,
+            native,
+        })
+        .await;
+    runs.remove(&(
+        run.session_id().as_str().to_owned(),
+        run.native_id().as_str().to_owned(),
+    ));
+    server_requests.retain(|request, _| request.run() != &run);
+    reducer.retire_run(&run);
 }
 
 #[derive(Clone, Copy)]
@@ -786,8 +1045,8 @@ async fn settle_runtime(
         let _ = pending.reply.send(Err(error));
     }
     server_requests.clear();
-    for (_, run) in runs.drain() {
-        reducer.retire_run(&run);
+    let active_runs = runs.values().cloned().collect::<Vec<_>>();
+    for run in active_runs {
         let (state, native) = match settlement {
             Settlement::Shutdown => (
                 HarnessRunTerminal::Interrupted,
@@ -802,9 +1061,7 @@ async fn settle_runtime(
                 NativePayload::sanitized("{\"event\":\"process-exited\"}"),
             ),
         };
-        let _ = events
-            .send(HarnessEvent::RunTerminal { run, state, native })
-            .await;
+        emit_terminal_and_retire(run, state, native, events, server_requests, runs, reducer).await;
     }
 }
 

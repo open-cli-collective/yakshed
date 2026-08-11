@@ -83,12 +83,11 @@ impl Reducer {
             }
             "item/fileChange/outputDelta" => {
                 let event_run = require!(run.clone());
-                let path = require!(string(params, "itemId"));
-                let summary = require!(string(params, "delta"));
-                Some(HarnessEvent::FileMutation {
-                    run: event_run,
-                    path,
-                    summary,
+                require!(string(params, "itemId"));
+                require!(string(params, "delta"));
+                Some(HarnessEvent::Unknown {
+                    run: Some(event_run),
+                    item_type: method,
                     native,
                 })
             }

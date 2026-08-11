@@ -240,7 +240,7 @@ impl HarnessAdapter for CodexAdapter {
                 "thread/list",
                 json!({"cursor": query.after.map(|value| value.to_string()), "limit": query.limit, "sortDirection": "asc"}),
                 false,
-                RequestKind::Read,
+                RequestKind::ThreadList,
             )
             .await?;
         let data = result
@@ -294,7 +294,7 @@ impl HarnessAdapter for CodexAdapter {
                 "thread/name/set",
                 json!({"threadId": session.id.as_str(), "name": spec.title}),
                 true,
-                RequestKind::Read,
+                RequestKind::EmptyObject,
             )
             .await?;
         session.title = spec.title;
@@ -373,7 +373,7 @@ impl HarnessAdapter for CodexAdapter {
                     "input": [{"type": "text", "text": input.as_str()}],
                 }),
                 true,
-                RequestKind::Read,
+                RequestKind::TurnSteer,
             )
             .await?;
         Ok(())
@@ -386,7 +386,7 @@ impl HarnessAdapter for CodexAdapter {
                 "turn/interrupt",
                 json!({"threadId": run.session_id().as_str(), "turnId": run.native_id().as_str()}),
                 true,
-                RequestKind::Read,
+                RequestKind::EmptyObject,
             )
             .await?;
         Ok(())

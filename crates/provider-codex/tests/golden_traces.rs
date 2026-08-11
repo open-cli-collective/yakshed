@@ -177,6 +177,39 @@ fn structurally_invalid_known_item_is_visible_and_recovery_continues() {
     ));
 }
 
+#[test]
+fn file_delta_never_fabricates_an_item_id_as_a_path() {
+    let mut reducer = Reducer::default();
+    let run = run();
+    let delta = serde_json::json!({
+        "method": "item/fileChange/outputDelta",
+        "params": {"itemId": "file-1", "delta": "provider detail"}
+    });
+    let completed = serde_json::json!({
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "id": "file-1",
+                "type": "fileChange",
+                "changes": [{"path": "src/lib.rs", "diff": "changed"}]
+            }
+        }
+    });
+    let events = [delta, completed]
+        .into_iter()
+        .filter_map(|value| reducer.reduce(value.to_string(), &value, Some(run.clone()), None))
+        .collect::<Vec<_>>();
+
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        HarnessEvent::FileMutation { path, .. } if path == "file-1"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        HarnessEvent::FileMutation { path, .. } if path == "src/lib.rs"
+    )));
+}
+
 fn run() -> ProviderRunHandle {
     run_named("turn-golden")
 }

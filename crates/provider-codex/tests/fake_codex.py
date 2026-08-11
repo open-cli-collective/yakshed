@@ -42,10 +42,31 @@ def emit_batch(values):
 
 def thread(thread_id, cwd, name=None):
     return {
+        "cliVersion": "0.147.0",
+        "createdAt": 1,
+        "ephemeral": False,
         "id": thread_id,
         "cwd": cwd,
+        "modelProvider": "fake",
         "name": name,
         "preview": name or "Codex thread",
+        "sessionId": f"session-{thread_id}",
+        "source": "appServer",
+        "status": {"type": "idle"},
+        "turns": [],
+        "updatedAt": 1,
+    }
+
+
+def session_response(value):
+    return {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": None,
+        "cwd": value["cwd"],
+        "model": "fake-model",
+        "modelProvider": "fake",
+        "sandbox": {"type": "dangerFullAccess"},
+        "thread": value,
     }
 
 
@@ -143,6 +164,18 @@ def run_events():
                 },
             ]
         )
+    elif SCENARIO == "file_approval":
+        fixture_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "test-data",
+            "golden",
+            "approval-declined.jsonl",
+        )
+        with open(fixture_path, encoding="utf-8") as fixture:
+            request = json.loads(next(fixture))
+        request["params"].update(common)
+        emit(request)
     elif SCENARIO == "response_disconnect":
         emit(
             {
@@ -201,6 +234,16 @@ def run_events():
             }
         )
         terminal()
+    elif SCENARIO == "malformed_terminal":
+        emit(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "items": []},
+                },
+            }
+        )
     elif SCENARIO == "user_input":
         emit(
             {
@@ -308,13 +351,25 @@ for line in sys.stdin:
             thread_id = f"thread-{len(threads) + 1}"
             value = thread(thread_id, message["params"]["cwd"])
             threads.append(value)
-            emit({"id": request_id, "result": {"thread": value}}, split=SCENARIO == "transport_split_batch")
+            emit(
+                {"id": request_id, "result": session_response(value)},
+                split=SCENARIO == "transport_split_batch",
+            )
         elif method == "thread/name/set":
             selected = next(item for item in threads if item["id"] == message["params"]["threadId"])
             selected["name"] = message["params"]["name"]
             selected["preview"] = selected["name"]
             emit({"id": request_id, "result": {}})
         elif method == "thread/list":
+            if SCENARIO == "client_write_failure":
+                emit(
+                    {
+                        "method": "test/clientRequestPending",
+                        "params": {"threadId": active[0], "turnId": active[1]},
+                    }
+                )
+                os.close(0)
+                threading.Event().wait()
             start = int(message["params"].get("cursor") or 0)
             limit = message["params"]["limit"]
             page = threads[start : start + limit]
@@ -322,7 +377,7 @@ for line in sys.stdin:
             emit({"id": request_id, "result": {"data": page, "nextCursor": next_cursor}})
         elif method == "thread/resume":
             selected = next(item for item in threads if item["id"] == message["params"]["threadId"])
-            emit({"id": request_id, "result": {"thread": selected}})
+            emit({"id": request_id, "result": session_response(selected)})
         elif method == "turn/start":
             if SCENARIO == "shutdown_settlement" and active is not None:
                 emit(
@@ -335,6 +390,9 @@ for line in sys.stdin:
             active = (message["params"]["threadId"], "turn-1")
             if SCENARIO == "early_before_ack":
                 sys.exit(0)
+            if SCENARIO == "malformed_turn_ack":
+                emit({"id": request_id, "result": {}})
+                continue
             emit(
                 {"id": request_id, "result": {"turn": {"id": active[1], "status": "inProgress", "items": []}}},
                 split=SCENARIO == "transport_split_batch",
@@ -343,7 +401,10 @@ for line in sys.stdin:
                 sys.exit(7)
             run_events()
         elif method == "turn/steer":
-            emit({"id": request_id, "result": {}})
+            if SCENARIO == "malformed_steer_ack":
+                emit({"id": request_id, "result": {}})
+                continue
+            emit({"id": request_id, "result": {"turnId": active[1]}})
             emit(
                 {
                     "method": "item/agentMessage/delta",
@@ -388,6 +449,9 @@ for line in sys.stdin:
                 terminal()
         elif SCENARIO == "uncorrelated_identity" and request_id == "uncorrelated-approval":
             assert message["error"]["code"] == -32602
+            terminal()
+        elif SCENARIO == "file_approval" and request_id == "approval-declined":
+            assert message["result"]["decision"] == "decline"
             terminal()
         else:
             emit({"id": request_id, "error": {"code": -32601, "message": "unknown method"}})
