@@ -51,12 +51,12 @@ def main(argv: list[str]) -> int:
         print(f"MISMATCH: lock={expected} actual={actual} files={file_count}", file=sys.stderr)
         print(
             "The committed schema tree does not match the lock record. Regenerate the "
-            "schema from the pinned binary and update codex-lock.json in the same commit.",
+            "schema from the last-validated binary and update codex-lock.json in the same commit.",
             file=sys.stderr,
         )
         return 1
 
-    print(f"ok: schema pin verified ({file_count} files, sha256 {actual})")
+    print(f"ok: committed schema verified ({file_count} files, sha256 {actual})")
     return 0
 
 

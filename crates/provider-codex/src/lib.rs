@@ -1,4 +1,4 @@
-//! Codex App Server adapter over its pinned JSONL stdio protocol.
+//! Codex App Server adapter over its last-validated JSONL stdio protocol.
 
 mod actor;
 pub mod reducer;
@@ -22,7 +22,8 @@ use yakshed_harness::{
     SessionPageCursor, SessionQuery, StartSessionSpec, event_channel,
 };
 
-const CODEX_VERSION: &str = "0.147.0";
+// Metadata only; runtime compatibility is intentionally not gated. See pins/codex-lock.json.
+const LAST_VALIDATED_CODEX_VERSION: &str = "0.147.0";
 const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 /// Local runtime identity. Each distinct key owns one App Server process.
@@ -209,7 +210,7 @@ impl HarnessAdapter for CodexAdapter {
         HarnessDescriptor {
             id: "codex".to_owned(),
             name: "Codex App Server".to_owned(),
-            version: CODEX_VERSION.to_owned(),
+            version: LAST_VALIDATED_CODEX_VERSION.to_owned(),
         }
     }
 

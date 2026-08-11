@@ -1,1 +1,1 @@
-{"method":"item/completed","params":{"threadId":"thread-golden","turnId":"turn-golden","completedAtMs":1,"item":{"id":"file-1","type":"fileChange","status":"completed","changes":[{"path":"src/main.rs","kind":"update","diff":"changed"}]}}}
+{"method":"item/completed","params":{"threadId":"thread-golden","turnId":"turn-golden","completedAtMs":2,"item":{"id":"file-1","type":"fileChange","status":"completed","changes":[{"path":"src/main.rs","kind":"update","diff":"updated"}]}}}

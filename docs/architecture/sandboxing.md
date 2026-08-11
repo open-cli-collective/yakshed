@@ -138,7 +138,7 @@ current boundary             │
            authoritative completion event
 ```
 
-App Server accepts sandbox policy and related settings on operations such as `turn/start`; generated schemas from the pinned binary should be treated as the exact wire contract.[^codex-app-server-policy]
+App Server accepts sandbox policy and related settings on operations such as `turn/start`; the last-validated generated schema is the review baseline, while the scheduled drift check detects upstream changes.[^codex-app-server-policy]
 
 The final provider completion event—not merely the approval response—should finalize YakShed’s command or file-change item.
 
@@ -410,7 +410,7 @@ Permissions
 
 ### 8.4 Some App Server process APIs are intentionally unsandboxed
 
-App Server exposes `thread/shellCommand` as a user-initiated command path that the pinned 0.147.0 schema explicitly documents as running unsandboxed with full access.[^codex-unsandboxed] Earlier documentation described a `process/spawn` method; it does not exist in 0.147.0 (see `pins/phase0-verification.md`). Two adjacent surfaces need their own classifications rather than inheriting that one:
+App Server exposes `thread/shellCommand` as a user-initiated command path that the last-validated 0.147.0 schema explicitly documents as running unsandboxed with full access.[^codex-unsandboxed] Earlier documentation described a `process/spawn` method; it does not exist in that schema (see `pins/phase0-verification.md`). Two adjacent surfaces need their own classifications rather than inheriting that one:
 
 - The `command/exec` family (`command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`) runs standalone commands **in the server sandbox**, accepting a per-request `sandboxPolicy` or `permissionProfile` and defaulting to the configured policy. It is sandboxed execution whose effective risk follows the supplied or default policy — which still means a permissive default policy makes it dangerous, and it bypasses thread/turn approval semantics.
 - The `fs/*` RPCs (`fs/readFile`, `fs/writeFile`, `fs/remove`, and related) are direct host filesystem operations and are classified host-privileged.
@@ -742,7 +742,7 @@ enum PermissionPreset {
 - connection policy may prohibit it;
 - scoped to the session unless the user deliberately changes a broader setting.
 
-Start with the stable policy mechanism supported by the pinned Codex version. Put newer permission-profile capabilities behind version gates and contract tests.
+Start with the stable policy mechanism in the last-validated Codex schema. Review newer permission-profile capabilities through schema drift and contract tests; do not reject newer runtimes by version.
 
 ---
 
