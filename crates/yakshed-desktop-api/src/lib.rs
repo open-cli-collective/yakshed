@@ -6,18 +6,24 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
-    Clock, ConfigPort, ConfigPortError, ConfigRevision, CreateProject, CreateWorkItem, IdGenerator,
-    ListWorkItems, OpenArtifactCommand, OpenArtifactPayload, PublicConnection,
-    PublicCredentialBinding, PublicCredentialSource, PutConnectionCommand, RunHarness,
-    RunOrchestrationError, RunSupervisor, SecretPort, SecretPortError,
-    SetConnectionCredentialCommand, StoreError,
+    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem, IdGenerator, ListWorkItems,
+    OpenArtifactCommand, OpenArtifactPayload, PublicCredentialBinding, PublicCredentialSource,
+    PutConnectionCommand, RunHarness, RunOrchestrationError, RunSupervisor, SecretPort,
+    SecretPortError, SetConnectionCredentialCommand, StoreError,
+};
+pub use yakshed_application::{ConfigRevision, PublicConnection, UserInputRequestId};
+pub use yakshed_domain::{
+    ApprovalRequestId, ArtifactId, ConnectionId, CredentialSlot, ProjectId, RunId, TimelineItemId,
+    TimelineRevision, WorkItemId,
 };
 use yakshed_domain::{
-    ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId, ArtifactKind, Connection,
-    ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot, ProjectId, RunId,
-    RunSnapshot, RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemId,
-    TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
+    ApprovalSnapshot, ApprovalStatus, ArtifactKind, Connection, CredentialBinding,
+    CredentialBindingRecord, RunSnapshot, RunStatus, SecretBackendId, SecretLocator,
+    SecretReference, TimelineItemSnapshot, UtcTimestamp, WorkItemSnapshot,
 };
+
+mod ipc;
+pub use ipc::{ApprovalDecisionInput, ConnectionInput};
 
 pub const APP_EVENT_CAPACITY: usize = 32;
 const MAX_OPEN_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;

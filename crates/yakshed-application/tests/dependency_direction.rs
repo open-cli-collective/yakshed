@@ -13,6 +13,7 @@ enum Layer {
     Infra,
     Provider,
     DesktopApi,
+    Tauri,
     Tools,
 }
 
@@ -191,6 +192,27 @@ impl Graph {
                     self.display_path(&path)
                 ));
             }
+
+            if source != Layer::Tauri
+                && let Some(path) = self.find_path(id, |_, target| target.name == "tauri")
+            {
+                violations.push(format!(
+                    "pre-existing package reaches Tauri: {}",
+                    self.display_path(&path)
+                ));
+            }
+
+            if source == Layer::Tauri {
+                for dependency in &package.dependencies {
+                    let target = &self.packages[dependency];
+                    if target.layer.is_some() && target.layer != Some(Layer::DesktopApi) {
+                        violations.push(format!(
+                            "Tauri shell directly depends on workspace package: {} -> {}",
+                            package.name, target.name
+                        ));
+                    }
+                }
+            }
         }
 
         violations
@@ -204,6 +226,7 @@ fn classify(name: &str, manifest_path: &Path) -> Layer {
         "yakshed-store" | "yakshed-secrets" | "yakshed-harness" => Layer::Infra,
         name if name.starts_with("provider-") => Layer::Provider,
         "yakshed-desktop-api" => Layer::DesktopApi,
+        "yakshed-tauri" => Layer::Tauri,
         _ if manifest_path.starts_with("tools") => Layer::Tools,
         _ => panic!("unclassified workspace package: {name}"),
     }
@@ -216,6 +239,10 @@ fn allows_reachable_layer(source: Layer, target: Layer) -> bool {
         Layer::Infra => matches!(target, Layer::Domain | Layer::Application),
         Layer::Provider => matches!(target, Layer::Domain | Layer::Application | Layer::Infra),
         Layer::DesktopApi => matches!(target, Layer::Domain | Layer::Application),
+        Layer::Tauri => matches!(
+            target,
+            Layer::DesktopApi | Layer::Application | Layer::Domain
+        ),
         Layer::Tools => target != Layer::Tools,
     }
 }
@@ -312,5 +339,31 @@ mod mutation_checks {
         assert!(graph.violations().iter().any(|violation| {
             violation.contains("provider-claude -> some-adapter -> yakshed-store")
         }));
+    }
+
+    #[test]
+    fn catches_tauri_leaking_into_any_pre_existing_crate() {
+        let graph = graph(&[
+            ("yakshed-desktop-api", Some(Layer::DesktopApi), &["tauri"]),
+            ("tauri", None, &[]),
+        ]);
+
+        assert!(
+            graph
+                .violations()
+                .iter()
+                .any(|violation| violation.contains("yakshed-desktop-api -> tauri"))
+        );
+    }
+
+    #[test]
+    fn catches_tauri_shell_direct_workspace_dependency_bypass() {
+        let graph = graph(&[
+            ("yakshed-tauri", Some(Layer::Tauri), &["yakshed-store"]),
+            ("yakshed-store", Some(Layer::Infra), &[]),
+        ]);
+
+        assert!(graph.violations().iter().any(|violation| violation
+            .contains("Tauri shell directly depends on workspace package: yakshed-tauri -> yakshed-store")));
     }
 }
