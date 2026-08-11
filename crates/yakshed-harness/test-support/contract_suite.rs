@@ -176,7 +176,8 @@ pub async fn run_lifecycle_streams_chunked_file_and_command_events<F: HarnessCon
                 assert_eq!(Some(&run), accepted_run.as_ref());
                 saw_file = true;
             }
-            HarnessEvent::CommandOutput { run, .. } => {
+            HarnessEvent::CommandOutputDelta { run, .. }
+            | HarnessEvent::CommandOutputCompleted { run, .. } => {
                 assert_eq!(Some(&run), accepted_run.as_ref());
                 saw_command = true;
             }

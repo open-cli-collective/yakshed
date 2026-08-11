@@ -125,7 +125,12 @@ macro_rules! contract_test {
     ($name:ident) => {
         #[tokio::test]
         async fn $name() {
-            contract_suite::$name::<CodexFixture>().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                contract_suite::$name::<CodexFixture>(),
+            )
+            .await
+            .expect(concat!(stringify!($name), " timed out"));
         }
     };
 }

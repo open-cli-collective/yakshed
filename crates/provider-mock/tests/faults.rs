@@ -229,7 +229,7 @@ async fn scripted_events_keep_the_declared_legal_order() {
     ));
     assert!(matches!(
         next(&mut stream).await,
-        HarnessEvent::CommandOutput { .. }
+        HarnessEvent::CommandOutputCompleted { .. }
     ));
     assert!(matches!(
         next(&mut stream).await,

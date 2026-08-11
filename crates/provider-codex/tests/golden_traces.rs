@@ -13,7 +13,10 @@ const TRACES: &[(&str, &str, &[&str])] = &[
     (
         "command-execution",
         include_str!("../test-data/golden/command-execution.jsonl"),
-        &["command:cargo test:ok"],
+        &[
+            "command_delta:cargo test:ok",
+            "command_completed:cargo test:ok",
+        ],
     ),
     (
         "file-change",
@@ -64,7 +67,7 @@ fn golden_traces_reduce_to_normalized_snapshots() {
         let run = run();
         let mut actual = Vec::new();
         for line in trace.lines() {
-            let event = match serde_json::from_str::<serde_json::Value>(line) {
+            let events = match serde_json::from_str::<serde_json::Value>(line) {
                 Ok(value) => {
                     let request = value.get("id").map(|id| {
                         ProviderRequestHandle::new(
@@ -74,13 +77,13 @@ fn golden_traces_reduce_to_normalized_snapshots() {
                     });
                     reducer.reduce(line.to_owned(), &value, Some(run.clone()), request)
                 }
-                Err(_) => Some(HarnessEvent::MalformedNativePayload {
+                Err(_) => vec![HarnessEvent::MalformedNativePayload {
                     run: Some(run.clone()),
                     item_type: "codex.malformed-frame".to_owned(),
                     native: NativePayload::sanitized(line),
-                }),
+                }],
             };
-            if let Some(event) = event {
+            for event in events {
                 assert_eq!(event.native_payload().sanitized_raw(), line, "{name}");
                 actual.push(snapshot(event));
             }
@@ -104,7 +107,7 @@ fn reducer_scopes_colliding_item_ids_to_their_runs() {
         assert!(
             reducer
                 .reduce(value.to_string(), &value, Some(run.clone()), None)
-                .is_none()
+                .is_empty()
         );
     }
 
@@ -115,9 +118,11 @@ fn reducer_scopes_colliding_item_ids_to_their_runs() {
         });
         match reducer
             .reduce(value.to_string(), &value, Some(run.clone()), None)
+            .into_iter()
+            .next()
             .unwrap()
         {
-            HarnessEvent::CommandOutput {
+            HarnessEvent::CommandOutputDelta {
                 run: actual,
                 command,
                 ..
@@ -160,8 +165,10 @@ fn structurally_invalid_known_item_is_visible_and_recovery_continues() {
         "params": {"itemId": "message-1"}
     });
     assert!(matches!(
-        reducer.reduce(malformed.to_string(), &malformed, Some(run.clone()), None),
-        Some(HarnessEvent::MalformedNativePayload { .. })
+        reducer
+            .reduce(malformed.to_string(), &malformed, Some(run.clone()), None)
+            .as_slice(),
+        [HarnessEvent::MalformedNativePayload { .. }]
     ));
 
     let terminal = serde_json::json!({
@@ -169,16 +176,18 @@ fn structurally_invalid_known_item_is_visible_and_recovery_continues() {
         "params": {"turn": {"status": "completed"}}
     });
     assert!(matches!(
-        reducer.reduce(terminal.to_string(), &terminal, Some(run), None),
-        Some(HarnessEvent::RunTerminal {
+        reducer
+            .reduce(terminal.to_string(), &terminal, Some(run), None)
+            .as_slice(),
+        [HarnessEvent::RunTerminal {
             state: HarnessRunTerminal::Completed,
             ..
-        })
+        }]
     ));
 }
 
 #[test]
-fn file_delta_never_fabricates_an_item_id_as_a_path() {
+fn file_delta_stays_native_and_completion_emits_all_paths_in_order() {
     let mut reducer = Reducer::default();
     let run = run();
     let delta = serde_json::json!({
@@ -191,23 +200,30 @@ fn file_delta_never_fabricates_an_item_id_as_a_path() {
             "item": {
                 "id": "file-1",
                 "type": "fileChange",
-                "changes": [{"path": "src/lib.rs", "diff": "changed"}]
+                "changes": [
+                    {"path": "src/lib.rs", "diff": "changed"},
+                    {"path": "src/main.rs", "diff": "added"}
+                ]
             }
         }
     });
     let events = [delta, completed]
         .into_iter()
-        .filter_map(|value| reducer.reduce(value.to_string(), &value, Some(run.clone()), None))
+        .flat_map(|value| reducer.reduce(value.to_string(), &value, Some(run.clone()), None))
         .collect::<Vec<_>>();
 
     assert!(!events.iter().any(|event| matches!(
         event,
         HarnessEvent::FileMutation { path, .. } if path == "file-1"
     )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        HarnessEvent::FileMutation { path, .. } if path == "src/lib.rs"
-    )));
+    let paths = events
+        .iter()
+        .filter_map(|event| match event {
+            HarnessEvent::FileMutation { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["src/lib.rs", "src/main.rs"]);
 }
 
 fn run() -> ProviderRunHandle {
@@ -229,9 +245,11 @@ fn command_for(reducer: &mut Reducer, run: &ProviderRunHandle, item_id: &str) ->
     });
     match reducer
         .reduce(value.to_string(), &value, Some(run.clone()), None)
+        .into_iter()
+        .next()
         .unwrap()
     {
-        HarnessEvent::CommandOutput { command, .. } => command,
+        HarnessEvent::CommandOutputDelta { command, .. } => command,
         event => panic!("expected command output, got {event:?}"),
     }
 }
@@ -240,8 +258,13 @@ fn snapshot(event: HarnessEvent) -> String {
     match event {
         HarnessEvent::MessageDelta { chunk, .. } => format!("delta:{chunk}"),
         HarnessEvent::MessageCompleted { text, .. } => format!("message:{text}"),
-        HarnessEvent::CommandOutput { command, chunk, .. } => {
-            format!("command:{command}:{chunk}")
+        HarnessEvent::CommandOutputDelta { command, chunk, .. } => {
+            format!("command_delta:{command}:{chunk}")
+        }
+        HarnessEvent::CommandOutputCompleted {
+            command, output, ..
+        } => {
+            format!("command_completed:{command}:{output}")
         }
         HarnessEvent::FileMutation { path, summary, .. } => format!("file:{path}:{summary}"),
         HarnessEvent::ApprovalRequested { summary, .. } => format!("approval:{summary}"),

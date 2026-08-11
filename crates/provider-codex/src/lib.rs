@@ -289,14 +289,18 @@ impl HarnessAdapter for CodexAdapter {
             )
             .await?;
         let mut session = self.parse_session(&result, &spec.title)?;
-        client
+        if let Err(error) = client
             .request(
                 "thread/name/set",
                 json!({"threadId": session.id.as_str(), "name": spec.title}),
                 true,
                 RequestKind::EmptyObject,
             )
-            .await?;
+            .await
+        {
+            client.record_diagnostic(error.to_string()).await;
+            return Ok(session);
+        }
         session.title = spec.title;
         Ok(session)
     }
@@ -373,7 +377,9 @@ impl HarnessAdapter for CodexAdapter {
                     "input": [{"type": "text", "text": input.as_str()}],
                 }),
                 true,
-                RequestKind::TurnSteer,
+                RequestKind::TurnSteer {
+                    expected_turn_id: run.native_id().clone(),
+                },
             )
             .await?;
         Ok(())

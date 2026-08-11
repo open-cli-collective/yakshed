@@ -136,6 +136,19 @@ def run_events():
                     "params": {**common, "itemId": "command-1", "delta": "ok"},
                 },
                 {
+                    "method": "item/completed",
+                    "params": {
+                        **common,
+                        "completedAtMs": 4,
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "command": "cargo test",
+                            "aggregatedOutput": "ok",
+                        },
+                    },
+                },
+                {
                     "method": "turn/completed",
                     "params": {
                         "threadId": thread_id,
@@ -177,6 +190,7 @@ def run_events():
         request["params"].update(common)
         emit(request)
     elif SCENARIO == "response_disconnect":
+        os.close(sys.stdin.fileno())
         emit(
             {
                 "id": "request-0001",
@@ -189,7 +203,6 @@ def run_events():
                 },
             }
         )
-        os.close(0)
         threading.Event().wait()
     elif SCENARIO == "request_boundary":
         emit_batch(
@@ -331,6 +344,9 @@ for line in sys.stdin:
                 }
             )
             continue
+        if SCENARIO == "malformed_initialize":
+            emit({"id": request_id, "result": {}})
+            continue
         emit(
             {
                 "id": request_id,
@@ -359,16 +375,19 @@ for line in sys.stdin:
             selected = next(item for item in threads if item["id"] == message["params"]["threadId"])
             selected["name"] = message["params"]["name"]
             selected["preview"] = selected["name"]
-            emit({"id": request_id, "result": {}})
+            if SCENARIO == "malformed_name_ack":
+                emit({"id": request_id, "result": {"unexpected": True}})
+            else:
+                emit({"id": request_id, "result": {}})
         elif method == "thread/list":
             if SCENARIO == "client_write_failure":
+                os.close(sys.stdin.fileno())
                 emit(
                     {
                         "method": "test/clientRequestPending",
                         "params": {"threadId": active[0], "turnId": active[1]},
                     }
                 )
-                os.close(0)
                 threading.Event().wait()
             start = int(message["params"].get("cursor") or 0)
             limit = message["params"]["limit"]
@@ -404,6 +423,9 @@ for line in sys.stdin:
             if SCENARIO == "malformed_steer_ack":
                 emit({"id": request_id, "result": {}})
                 continue
+            if SCENARIO == "mismatched_steer_ack":
+                emit({"id": request_id, "result": {"turnId": "turn-other"}})
+                continue
             emit({"id": request_id, "result": {"turnId": active[1]}})
             emit(
                 {
@@ -417,6 +439,9 @@ for line in sys.stdin:
                 }
             )
         elif method == "turn/interrupt":
+            if SCENARIO == "malformed_interrupt_ack":
+                emit({"id": request_id, "result": {"unexpected": True}})
+                continue
             emit({"id": request_id, "result": {}})
             terminal("interrupted")
         elif request_id == "request-0001":

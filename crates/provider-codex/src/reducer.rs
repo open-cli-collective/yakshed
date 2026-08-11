@@ -20,10 +20,10 @@ impl Reducer {
         message: &Value,
         run: Option<ProviderRunHandle>,
         request: Option<ProviderRequestHandle>,
-    ) -> Option<HarnessEvent> {
+    ) -> Vec<HarnessEvent> {
         let method = match message.get("method").and_then(Value::as_str) {
             Some(method) => method.to_owned(),
-            None if message.get("id").is_some() => return None,
+            None if message.get("id").is_some() => return Vec::new(),
             None => "codex.missing-method".to_owned(),
         };
         let params = message.get("params").unwrap_or(&Value::Null);
@@ -32,7 +32,7 @@ impl Reducer {
             ($value:expr) => {
                 match $value {
                     Some(value) => value,
-                    None => return Some(malformed(run, method, native)),
+                    None => return vec![malformed(run, method, native)],
                 }
             };
         }
@@ -46,31 +46,31 @@ impl Reducer {
                     let command = require!(item.get("command").and_then(Value::as_str));
                     self.commands
                         .insert((event_run, id.to_owned()), command.to_owned());
-                    None
+                    Vec::new()
                 } else if matches!(item_type, "agentMessage" | "fileChange") {
-                    None
+                    Vec::new()
                 } else {
-                    Some(HarnessEvent::Unknown {
+                    vec![HarnessEvent::Unknown {
                         run: Some(event_run),
                         item_type: item_type.to_owned(),
                         native,
-                    })
+                    }]
                 }
             }
             "item/agentMessage/delta" => {
                 let event_run = require!(run.clone());
                 let chunk = require!(string(params, "delta"));
-                Some(HarnessEvent::MessageDelta {
+                vec![HarnessEvent::MessageDelta {
                     run: event_run,
                     chunk,
                     native,
-                })
+                }]
             }
             "item/commandExecution/outputDelta" => {
                 let event_run = require!(run.clone());
                 let item_id = require!(string(params, "itemId"));
                 let chunk = require!(string(params, "delta"));
-                Some(HarnessEvent::CommandOutput {
+                vec![HarnessEvent::CommandOutputDelta {
                     command: self
                         .commands
                         .get(&(event_run.clone(), item_id))
@@ -79,22 +79,22 @@ impl Reducer {
                     run: event_run,
                     chunk,
                     native,
-                })
+                }]
             }
             "item/fileChange/outputDelta" => {
                 let event_run = require!(run.clone());
                 require!(string(params, "itemId"));
                 require!(string(params, "delta"));
-                Some(HarnessEvent::Unknown {
+                vec![HarnessEvent::Unknown {
                     run: Some(event_run),
                     item_type: method,
                     native,
-                })
+                }]
             }
             "item/completed" => self.completed_item(params, run, native, method),
             "item/commandExecution/requestApproval" => {
                 let request = require!(request);
-                Some(HarnessEvent::ApprovalRequested {
+                vec![HarnessEvent::ApprovalRequested {
                     request,
                     summary: params
                         .get("reason")
@@ -103,11 +103,11 @@ impl Reducer {
                         .unwrap_or("Codex requests command approval")
                         .to_owned(),
                     native,
-                })
+                }]
             }
             "item/fileChange/requestApproval" => {
                 let request = require!(request);
-                Some(HarnessEvent::ApprovalRequested {
+                vec![HarnessEvent::ApprovalRequested {
                     request,
                     summary: params
                         .get("reason")
@@ -115,7 +115,7 @@ impl Reducer {
                         .unwrap_or("Codex requests file-change approval")
                         .to_owned(),
                     native,
-                })
+                }]
             }
             "item/tool/requestUserInput" => {
                 let request = require!(request);
@@ -126,13 +126,13 @@ impl Reducer {
                     .collect::<Option<Vec<_>>>();
                 let prompt = require!(prompts).join("\n");
                 if prompt.is_empty() {
-                    return Some(malformed(run, method, native));
+                    return vec![malformed(run, method, native)];
                 }
-                Some(HarnessEvent::UserInputRequested {
+                vec![HarnessEvent::UserInputRequested {
                     request,
                     prompt,
                     native,
-                })
+                }]
             }
             "turn/completed" => {
                 let event_run = require!(run.clone());
@@ -147,19 +147,19 @@ impl Reducer {
                     Some("failed") => HarnessRunTerminal::Failed {
                         diagnostic: SanitizedDiagnostic::sanitized("Codex turn failed"),
                     },
-                    _ => return Some(malformed(run, method, native)),
+                    _ => return vec![malformed(run, method, native)],
                 };
-                Some(HarnessEvent::RunTerminal {
+                vec![HarnessEvent::RunTerminal {
                     run: event_run,
                     state,
                     native,
-                })
+                }]
             }
-            _ => Some(HarnessEvent::Unknown {
+            _ => vec![HarnessEvent::Unknown {
                 run,
                 item_type: method,
                 native,
-            }),
+            }],
         }
     }
 
@@ -169,69 +169,73 @@ impl Reducer {
         run: Option<ProviderRunHandle>,
         native: NativePayload,
         method: String,
-    ) -> Option<HarnessEvent> {
+    ) -> Vec<HarnessEvent> {
         let Some(event_run) = run.clone() else {
-            return Some(malformed(run, method, native));
+            return vec![malformed(run, method, native)];
         };
         let Some(item) = params.get("item") else {
-            return Some(malformed(run, method, native));
+            return vec![malformed(run, method, native)];
         };
         let Some(item_id) = item.get("id").and_then(Value::as_str) else {
-            return Some(malformed(run, method, native));
+            return vec![malformed(run, method, native)];
         };
         match item.get("type").and_then(Value::as_str) {
             Some("agentMessage") => match string(item, "text") {
-                Some(text) => Some(HarnessEvent::MessageCompleted {
+                Some(text) => vec![HarnessEvent::MessageCompleted {
                     run: event_run,
                     text,
                     native,
-                }),
-                None => Some(malformed(run, method, native)),
+                }],
+                None => vec![malformed(run, method, native)],
             },
             Some("fileChange") => {
-                let Some(first) = item
-                    .get("changes")
-                    .and_then(Value::as_array)
-                    .and_then(|changes| changes.first())
-                else {
-                    return Some(malformed(run, method, native));
+                let Some(changes) = item.get("changes").and_then(Value::as_array) else {
+                    return vec![malformed(run, method, native)];
                 };
-                let Some(path) = string(first, "path") else {
-                    return Some(malformed(run, method, native));
-                };
-                Some(HarnessEvent::FileMutation {
-                    run: event_run,
-                    path,
-                    summary: first
-                        .get("diff")
-                        .and_then(Value::as_str)
-                        .unwrap_or("file changed")
-                        .to_owned(),
-                    native,
-                })
+                if changes
+                    .iter()
+                    .any(|change| change.get("path").and_then(Value::as_str).is_none())
+                {
+                    return vec![malformed(run, method, native)];
+                }
+                changes
+                    .iter()
+                    .map(|change| HarnessEvent::FileMutation {
+                        run: event_run.clone(),
+                        path: change
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .expect("validated path")
+                            .to_owned(),
+                        summary: change
+                            .get("diff")
+                            .and_then(Value::as_str)
+                            .unwrap_or("file changed")
+                            .to_owned(),
+                        native: native.clone(),
+                    })
+                    .collect()
             }
             Some("commandExecution") => {
                 self.commands
                     .remove(&(event_run.clone(), item_id.to_owned()));
                 let Some(command) = string(item, "command") else {
-                    return Some(malformed(run, method, native));
+                    return vec![malformed(run, method, native)];
                 };
-                let Some(chunk) = string(item, "aggregatedOutput") else {
-                    return Some(malformed(run, method, native));
-                };
-                Some(HarnessEvent::CommandOutput {
+                let output = string(item, "aggregatedOutput").unwrap_or_default();
+                vec![HarnessEvent::CommandOutputCompleted {
                     run: event_run,
                     command,
-                    chunk,
+                    output,
                     native,
-                })
+                }]
             }
-            Some(item_type) => Some(HarnessEvent::Unknown {
+            Some(item_type) => vec![HarnessEvent::Unknown {
                 run,
                 item_type: item_type.to_owned(),
                 native,
-            }),
-            None => Some(malformed(run, method, native)),
+            }],
+            None => vec![malformed(run, method, native)],
         }
     }
 

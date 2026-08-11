@@ -30,7 +30,7 @@ pub enum RequestKind {
     ThreadList,
     Session,
     StartRun { session_id: ProviderSessionId },
-    TurnSteer,
+    TurnSteer { expected_turn_id: ProviderRunId },
 }
 
 enum CommandMessage {
@@ -47,6 +47,7 @@ enum CommandMessage {
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     Diagnostics(oneshot::Sender<Vec<String>>),
+    RecordDiagnostic(String),
     Health(oneshot::Sender<()>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -103,6 +104,13 @@ impl RuntimeClient {
             .await
             .map_err(|_| HarnessError::Disconnected)?;
         result.await.map_err(|_| HarnessError::Disconnected)
+    }
+
+    pub async fn record_diagnostic(&self, diagnostic: String) {
+        let _ = self
+            .commands
+            .send(CommandMessage::RecordDiagnostic(diagnostic))
+            .await;
     }
 
     pub async fn health(&self) -> Result<(), HarnessError> {
@@ -232,6 +240,13 @@ async fn run_actor(
                     if let Some(error) = value.get("error") {
                         return Err(classify_protocol_error(error, &sanitizer));
                     }
+                    if !value.get("result").is_some_and(valid_initialize_response) {
+                        return Err(HarnessError::Protocol {
+                            diagnostic: SanitizedDiagnostic::sanitized(
+                                "Codex initialize response did not match the pinned schema",
+                            ),
+                        });
+                    }
                     write_frame(&mut stdin, &json!({"method": "initialized"})).await?;
                     return Ok(());
                 }
@@ -340,6 +355,9 @@ async fn run_actor(
                     Some(CommandMessage::Diagnostics(reply)) => {
                         let _ = reply.send(diagnostics.iter().cloned().collect());
                     }
+                    Some(CommandMessage::RecordDiagnostic(diagnostic)) => {
+                        push_diagnostic(&mut diagnostics, diagnostic);
+                    }
                     Some(CommandMessage::Health(reply)) => {
                         let _ = reply.send(());
                     }
@@ -445,6 +463,22 @@ async fn run_actor(
     stderr_task.abort();
 }
 
+fn valid_initialize_response(value: &Value) -> bool {
+    let Some(result) = value.as_object() else {
+        return false;
+    };
+    result
+        .get("codexHome")
+        .and_then(Value::as_str)
+        .is_some_and(|path| std::path::Path::new(path).is_absolute())
+        && result
+            .get("platformFamily")
+            .and_then(Value::as_str)
+            .is_some()
+        && result.get("platformOs").and_then(Value::as_str).is_some()
+        && result.get("userAgent").and_then(Value::as_str).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     raw: String,
@@ -470,9 +504,9 @@ async fn handle_frame(
         if let Some(error) = value.get("error")
             && value.get("result").is_none()
         {
-            let _ = pending_request
-                .reply
-                .send(Err(classify_protocol_error(error, sanitizer)));
+            let error = classify_protocol_error(error, sanitizer);
+            push_diagnostic(diagnostics, error.to_string());
+            let _ = pending_request.reply.send(Err(error));
             return Ok(());
         }
         let Some(mut result) = value.get("result").cloned() else {
@@ -519,7 +553,7 @@ async fn handle_frame(
                         .await;
                 }
             }
-            RequestKind::EmptyObject | RequestKind::ThreadList | RequestKind::TurnSteer => {}
+            RequestKind::EmptyObject | RequestKind::ThreadList | RequestKind::TurnSteer { .. } => {}
         }
         let _ = pending_request.reply.send(Ok(result));
         return Ok(());
@@ -582,7 +616,7 @@ async fn handle_frame(
         None
     };
     let completes_run = method == "turn/completed";
-    if let Some(event) = reducer.reduce(sanitized, &safe_value, run.clone(), request) {
+    for event in reducer.reduce(sanitized, &safe_value, run.clone(), request) {
         match event {
             HarnessEvent::RunTerminal { run, state, native } => {
                 emit_terminal_and_retire(
@@ -598,7 +632,7 @@ async fn handle_frame(
             }
             malformed @ HarnessEvent::MalformedNativePayload { .. } if completes_run => {
                 let _ = events.send(malformed).await;
-                if let Some(run) = run {
+                if let Some(run) = run.clone() {
                     emit_terminal_and_retire(
                         run,
                         HarnessRunTerminal::Crashed {
@@ -642,7 +676,7 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
         return false;
     };
     match kind {
-        RequestKind::EmptyObject => true,
+        RequestKind::EmptyObject => object.is_empty(),
         RequestKind::ThreadList => {
             object
                 .get("data")
@@ -674,7 +708,10 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
                 && object.get("thread").is_some_and(valid_thread)
         }
         RequestKind::StartRun { .. } => object.get("turn").is_some_and(valid_turn),
-        RequestKind::TurnSteer => object.get("turnId").and_then(Value::as_str).is_some(),
+        RequestKind::TurnSteer { expected_turn_id } => object
+            .get("turnId")
+            .and_then(Value::as_str)
+            .is_some_and(|turn_id| turn_id == expected_turn_id.as_str()),
     }
 }
 

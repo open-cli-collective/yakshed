@@ -377,10 +377,18 @@ pub enum HarnessEvent {
         summary: String,
         native: NativePayload,
     },
-    CommandOutput {
+    /// Transient command output chunk; consumers append but do not finalize from this event.
+    CommandOutputDelta {
         run: ProviderRunHandle,
         command: String,
         chunk: String,
+        native: NativePayload,
+    },
+    /// Authoritative completed command output; consumers replace/finalize from this event.
+    CommandOutputCompleted {
+        run: ProviderRunHandle,
+        command: String,
+        output: String,
         native: NativePayload,
     },
     RunTerminal {
@@ -409,7 +417,8 @@ impl HarnessEvent {
             | Self::ApprovalRequested { native, .. }
             | Self::UserInputRequested { native, .. }
             | Self::FileMutation { native, .. }
-            | Self::CommandOutput { native, .. }
+            | Self::CommandOutputDelta { native, .. }
+            | Self::CommandOutputCompleted { native, .. }
             | Self::RunTerminal { native, .. }
             | Self::Unknown { native, .. }
             | Self::MalformedNativePayload { native, .. } => native,
@@ -424,7 +433,8 @@ impl HarnessEvent {
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::UserInputRequested { .. } => "user_input_requested",
             Self::FileMutation { .. } => "file_mutation",
-            Self::CommandOutput { .. } => "command_output",
+            Self::CommandOutputDelta { .. } => "command_output_delta",
+            Self::CommandOutputCompleted { .. } => "command_output_completed",
             Self::RunTerminal { .. } => "run_terminal",
             Self::Unknown { .. } => "unknown",
             Self::MalformedNativePayload { .. } => "malformed_native_payload",

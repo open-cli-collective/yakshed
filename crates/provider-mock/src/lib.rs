@@ -769,10 +769,10 @@ impl MockHarness {
                     chunk,
                     native,
                 } => PendingDelivery {
-                    event: HarnessEvent::CommandOutput {
+                    event: HarnessEvent::CommandOutputCompleted {
                         run: run_handle.clone(),
                         command,
-                        chunk,
+                        output: chunk,
                         native: self.native(native),
                     },
                     commit: DeliveryCommit::Step {
