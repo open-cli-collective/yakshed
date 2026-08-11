@@ -1,13 +1,8 @@
 #[cfg(target_os = "macos")]
 include!("src/roster.rs");
 
-fn main() {
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").ok();
-    if target_os.as_deref() != Some("macos") {
-        return;
-    }
-
-    #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
+fn run_tauri_build() {
     macro_rules! build {
         ($($command:ident),+ $(,)?) => {
             tauri_build::try_build(
@@ -18,6 +13,14 @@ fn main() {
             .expect("Tauri build configuration should be valid");
         };
     }
-    #[cfg(target_os = "macos")]
     command_roster!(build);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_tauri_build() {}
+
+fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        run_tauri_build();
+    }
 }
