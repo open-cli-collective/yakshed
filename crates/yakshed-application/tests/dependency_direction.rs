@@ -42,15 +42,21 @@ impl Graph {
             .iter()
             .map(|node| {
                 let id = node["id"].as_str().expect("resolved package ID");
-                let dependencies: Vec<String> = node["deps"]
+                let dependencies: Vec<(String, String)> = node["deps"]
                     .as_array()
                     .expect("resolved dependencies")
                     .iter()
                     .map(|dependency| {
-                        dependency["pkg"]
-                            .as_str()
-                            .expect("resolved dependency ID")
-                            .to_owned()
+                        (
+                            dependency["name"]
+                                .as_str()
+                                .expect("resolved dependency name")
+                                .to_owned(),
+                            dependency["pkg"]
+                                .as_str()
+                                .expect("resolved dependency ID")
+                                .to_owned(),
+                        )
                     })
                     .collect();
                 (id, dependencies)
@@ -64,6 +70,18 @@ impl Graph {
             .map(|package| {
                 let id = package["id"].as_str().expect("package ID");
                 let name = package["name"].as_str().expect("package name");
+                let production_dependency_names: HashSet<_> = package["dependencies"]
+                    .as_array()
+                    .expect("package dependencies")
+                    .iter()
+                    .filter(|dependency| dependency["kind"].as_str() != Some("dev"))
+                    .map(|dependency| {
+                        dependency["rename"]
+                            .as_str()
+                            .or_else(|| dependency["name"].as_str())
+                            .expect("dependency name")
+                    })
+                    .collect();
                 let layer = workspace_members.contains(id).then(|| {
                     classify(
                         name,
@@ -84,7 +102,10 @@ impl Graph {
                         dependencies: resolved_dependencies
                             .get(id)
                             .expect("package in resolve graph")
-                            .clone(),
+                            .iter()
+                            .filter(|(name, _)| production_dependency_names.contains(name.as_str()))
+                            .map(|(_, id)| id.clone())
+                            .collect(),
                     },
                 )
             })

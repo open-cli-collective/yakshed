@@ -938,10 +938,15 @@ name = "yakshed-application"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "provider-mock",
  "serde_json",
+ "tempfile",
  "thiserror",
  "time",
+ "tokio",
  "yakshed-domain",
+ "yakshed-harness",
+ "yakshed-store",
 ]
 
 [[package]]

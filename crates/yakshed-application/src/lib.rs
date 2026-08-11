@@ -13,6 +13,10 @@ use yakshed_domain::{
     WorkItemId, WorkItemSnapshot,
 };
 
+mod run_supervisor;
+
+pub use run_supervisor::*;
+
 /// Canonical non-secret application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AppConfig {
