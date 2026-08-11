@@ -29,7 +29,7 @@ use yakshed_domain::{
 use crate::AppPaths;
 
 const DATABASE_FILE: &str = "yakshed.sqlite3";
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_PAGE_SIZE: u32 = 200;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 
@@ -72,7 +72,7 @@ CREATE TABLE runs (
     created_at_ms INTEGER NOT NULL,
     ended_at_ms INTEGER,
     CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
-    CHECK ((status IN ('starting', 'running')) = (ended_at_ms IS NULL)),
+    CHECK ((status IN ('completed', 'failed', 'interrupted')) = (ended_at_ms IS NOT NULL)),
     UNIQUE (connection_id, id),
     UNIQUE (connection_id, provider_namespace, provider_run_id)
 );
@@ -176,6 +176,41 @@ SELECT
 FROM runs;
 DROP TABLE runs;
 ALTER TABLE runs_v2 RENAME TO runs;
+"#;
+
+const MIGRATE_V2_TO_V3: &str = r#"
+DROP TABLE IF EXISTS runs_v3;
+CREATE TABLE runs_v3 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (
+        status IN ('starting', 'running', 'completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown')
+    ),
+    provider_namespace TEXT,
+    provider_run_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    ended_at_ms INTEGER,
+    CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
+    CHECK ((status IN ('completed', 'failed', 'interrupted')) = (ended_at_ms IS NOT NULL)),
+    UNIQUE (connection_id, id),
+    UNIQUE (connection_id, provider_namespace, provider_run_id)
+);
+INSERT INTO runs_v3 (
+    id, connection_id, work_item_id, status, provider_namespace, provider_run_id, created_at_ms, ended_at_ms
+)
+SELECT
+    id,
+    connection_id,
+    work_item_id,
+    status,
+    provider_namespace,
+    provider_run_id,
+    created_at_ms,
+    CASE WHEN status IN ('completed', 'failed', 'interrupted') THEN ended_at_ms ELSE NULL END
+FROM runs;
+DROP TABLE runs;
+ALTER TABLE runs_v3 RENAME TO runs;
 "#;
 
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
@@ -397,6 +432,7 @@ fn migrations() -> Migrations<'static> {
         M::up(INITIAL_SCHEMA).comment("initial durable work state"),
         M::up(MIGRATE_V1_TO_V2)
             .comment("expand run lifecycle statuses and start/reconnect transitions"),
+        M::up(MIGRATE_V2_TO_V3).comment("keep recoverable runs and approvals active"),
     ])
 }
 
@@ -798,17 +834,21 @@ fn apply_run_transition(
             },
         });
     }
-    let voided = transaction
-        .execute(
-            "UPDATE approval_requests
-             SET status = 'voided', voided_at_ms = ?2
-             WHERE run_id = ?1 AND status = 'pending'",
-            params![
-                command.run_id.to_string(),
-                command.occurred_at.unix_millis()
-            ],
-        )
-        .map_err(map_database_error)?;
+    let voided = if is_terminal(command.target) {
+        transaction
+            .execute(
+                "UPDATE approval_requests
+                 SET status = 'voided', voided_at_ms = ?2
+                 WHERE run_id = ?1 AND status = 'pending'",
+                params![
+                    command.run_id.to_string(),
+                    command.occurred_at.unix_millis()
+                ],
+            )
+            .map_err(map_database_error)?
+    } else {
+        0
+    };
     transaction
         .execute(
             "INSERT INTO audit_events
@@ -841,11 +881,14 @@ fn apply_run_transition(
 }
 
 fn ended_at_ms(target: RunStatus, occurred_at_ms: i64) -> Option<i64> {
-    if matches!(target, RunStatus::Starting | RunStatus::Running) {
-        None
-    } else {
-        Some(occurred_at_ms)
-    }
+    is_terminal(target).then_some(occurred_at_ms)
+}
+
+fn is_terminal(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
+    )
 }
 
 const APPROVAL_SELECT: &str = "

@@ -14,7 +14,7 @@ use yakshed_application::{
     AppEvent, AppEventKind, AppStore, Clock, CreateProject, CreateWorkItem, HarnessPortError,
     HarnessResponse, IdGenerator, ListTimeline, ProviderCommandRef, ProviderRequestRef,
     ProviderRunRef, RunHarness, RunHarnessEvent, RunOrchestrationError, RunSupervisor, RunTerminal,
-    SystemIdGenerator,
+    SystemIdGenerator, TransitionRun,
 };
 use yakshed_domain::{
     ApprovalDecision, ApprovalStatus, ConnectionId, RunId, RunStatus, UtcTimestamp, WorkItemId,
@@ -42,10 +42,13 @@ struct MockPort {
     session: ProviderSession,
     stream: Mutex<ProviderEventStream>,
     runs: Mutex<HashMap<ProviderRunRef, ProviderRunHandle>>,
+    correlations: Mutex<HashMap<RunId, ProviderRunRef>>,
     unknown_interrupt: bool,
     unknown_start: bool,
     fail_stream: AtomicBool,
     fail_response: AtomicBool,
+    fail_reconnect: AtomicBool,
+    fail_lookup: AtomicBool,
     stream_failure: Notify,
 }
 
@@ -81,10 +84,13 @@ impl MockPort {
             session,
             stream: Mutex::new(stream),
             runs: Mutex::new(HashMap::new()),
+            correlations: Mutex::new(HashMap::new()),
             unknown_interrupt,
             unknown_start,
             fail_stream: AtomicBool::new(false),
             fail_response: AtomicBool::new(false),
+            fail_reconnect: AtomicBool::new(false),
+            fail_lookup: AtomicBool::new(false),
             stream_failure: Notify::new(),
         })
     }
@@ -96,6 +102,14 @@ impl MockPort {
 
     fn fail_next_response(&self) {
         self.fail_response.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_reconnect(&self) {
+        self.fail_reconnect.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_lookup(&self) {
+        self.fail_lookup.store(true, Ordering::SeqCst);
     }
 
     fn run_ref(run: &ProviderRunHandle) -> ProviderRunRef {
@@ -120,12 +134,11 @@ impl RunHarness for MockPort {
     async fn start_run(
         &self,
         connection_id: ConnectionId,
+        correlation_id: RunId,
         input: String,
     ) -> Result<ProviderRunRef, HarnessPortError> {
-        if self.unknown_start {
-            return Err(HarnessPortError::OutcomeUnknown {
-                operation: "start_run",
-            });
+        if let Some(run) = self.correlations.lock().await.get(&correlation_id).cloned() {
+            return Ok(run);
         }
         assert_eq!(connection_id, self.session.connection_id);
         let run = self
@@ -139,7 +152,28 @@ impl RunHarness for MockPort {
             .map_err(map_error)?;
         let run_ref = Self::run_ref(&run);
         self.runs.lock().await.insert(run_ref.clone(), run);
+        self.correlations
+            .lock()
+            .await
+            .insert(correlation_id, run_ref.clone());
+        if self.unknown_start {
+            return Err(HarnessPortError::OutcomeUnknown {
+                operation: "start_run",
+            });
+        }
         Ok(run_ref)
+    }
+
+    async fn lookup_run(
+        &self,
+        connection_id: ConnectionId,
+        correlation_id: RunId,
+    ) -> Result<Option<ProviderRunRef>, HarnessPortError> {
+        assert_eq!(connection_id, self.session.connection_id);
+        if self.fail_lookup.swap(false, Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(self.correlations.lock().await.get(&correlation_id).cloned())
     }
 
     async fn steer(&self, run: &ProviderRunRef, input: String) -> Result<(), HarnessPortError> {
@@ -201,6 +235,9 @@ impl RunHarness for MockPort {
     }
 
     async fn reconnect(&self, run: &ProviderRunRef) -> Result<bool, HarnessPortError> {
+        if self.fail_reconnect.swap(false, Ordering::SeqCst) {
+            return Ok(false);
+        }
         Ok(self.runs.lock().await.contains_key(run))
     }
 }
@@ -779,8 +816,13 @@ async fn event_stream_failure_terminalizes_routes_and_next_run_restarts_pump() {
 }
 
 #[tokio::test]
-async fn start_outcome_unknown_is_durable_without_provider_mapping() {
-    let context = TestContext::with_options(vec![MockRunPlan::new(Vec::new())], false, true).await;
+async fn uncertain_start_reconciles_by_correlation_without_duplicate_run() {
+    let context = TestContext::with_options(
+        vec![MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete)],
+        false,
+        true,
+    )
+    .await;
     let mut events = context.supervisor.subscribe();
     assert!(matches!(
         context
@@ -809,6 +851,20 @@ async fn start_outcome_unknown_is_durable_without_provider_mapping() {
     let run = context.store.get_run(run_id).await.unwrap();
     assert_eq!(run.status, RunStatus::OutcomeUnknown);
     assert!(run.provider_id.is_none());
+    context.harness.fail_next_lookup();
+    assert!(matches!(
+        context.supervisor.reconcile_run(run_id).await,
+        Err(RunOrchestrationError::RunNeedsReconciliation(id)) if id == run_id
+    ));
+    let reconciled = context.supervisor.reconcile_run(run_id).await.unwrap();
+    assert_eq!(reconciled.status, RunStatus::Running);
+    assert!(reconciled.provider_id.is_some());
+    context
+        .supervisor
+        .steer(run_id, "after reconcile".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(context.harness.correlations.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -989,6 +1045,69 @@ async fn uncertain_approval_response_recovers_after_supervisor_restart() {
             .status,
         ApprovalStatus::Resolved { .. }
     ));
+}
+
+#[tokio::test]
+async fn manual_reconcile_after_failed_startup_reconnect_restores_controls() {
+    let context =
+        TestContext::new(MockRunPlan::new(Vec::new()).with_fault(MockHarnessFault::NeverComplete))
+            .await;
+    let run_id = context.start().await;
+    context
+        .store
+        .transition_run(TransitionRun {
+            run_id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Disconnected,
+            provider_id: None,
+            occurred_at: FixedClock.now(),
+            audit_event_id: SystemIdGenerator.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    context.harness.fail_next_reconnect();
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    restarted.reconcile_run(run_id).await.unwrap();
+    restarted
+        .steer(run_id, "reattached".to_owned())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn user_input_is_answerable_after_supervisor_restart() {
+    let request = "restart-input".parse::<ProviderRequestId>().unwrap();
+    let context = TestContext::new(MockRunPlan::new(vec![
+        MockScriptStep::user_input(request.clone(), "answer?"),
+        MockScriptStep::await_response(request),
+        MockScriptStep::complete(),
+    ]))
+    .await;
+    let mut events = context.supervisor.subscribe();
+    let run_id = context.start().await;
+    let opened = next_matching(&mut events, |kind| {
+        matches!(kind, AppEventKind::UserInputOpened { .. })
+    })
+    .await;
+    let AppEventKind::UserInputOpened { request_id, .. } = opened.kind else {
+        unreachable!()
+    };
+    let restarted = RunSupervisor::new(
+        context.store.clone(),
+        context.harness.clone(),
+        Arc::new(FixedClock),
+        Arc::new(SystemIdGenerator),
+    );
+    restarted.reconcile_run(run_id).await.unwrap();
+    restarted
+        .respond_user_input(request_id, "yes".to_owned())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

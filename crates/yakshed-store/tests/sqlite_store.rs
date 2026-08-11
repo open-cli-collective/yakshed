@@ -130,7 +130,7 @@ async fn accept_run(store: &SqliteStore, ids: &TestIds, run: RunSnapshot) -> Run
 }
 
 #[tokio::test]
-async fn empty_database_migrates_to_v2_before_ready() {
+async fn empty_database_migrates_to_v3_before_ready() {
     let context = Context::open().await;
     let database = context.paths.data_root.join("yakshed.sqlite3");
     context.store.shutdown().await.unwrap();
@@ -149,7 +149,7 @@ async fn empty_database_migrates_to_v2_before_ready() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        2
+        3
     );
     for table in [
         "projects",
@@ -332,7 +332,7 @@ async fn newer_schema_is_rejected_without_modification() {
         SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::UnsupportedNewerSchema {
             found: 99,
-            supported: 2
+            supported: 3
         })
     ));
     assert_eq!(fs::read(database).unwrap(), before);
@@ -1264,6 +1264,99 @@ async fn approval_response_transitions_are_application_shaped() {
             .await,
         Err(StoreError::Conflict(_))
     ));
+}
+
+#[tokio::test]
+async fn recoverable_run_states_keep_pending_approval_and_no_end_time() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "recoverable run".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    let run = accept_run(&context.store, &context.ids, run).await;
+    let approval = context
+        .store
+        .record_pending_approval(PendingApproval {
+            id: context.ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "recoverable-approval").unwrap(),
+            kind: "command".into(),
+            summary: "keep me".into(),
+        })
+        .await
+        .unwrap();
+
+    let disconnected = context
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Running,
+            target: RunStatus::Disconnected,
+            provider_id: None,
+            occurred_at: UtcTimestamp::from_unix_millis(50),
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(disconnected.ended_at, None);
+    let uncertain = context
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Disconnected,
+            target: RunStatus::OutcomeUnknown,
+            provider_id: None,
+            occurred_at: UtcTimestamp::from_unix_millis(51),
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(uncertain.ended_at, None);
+    context
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::OutcomeUnknown,
+            target: RunStatus::Running,
+            provider_id: None,
+            occurred_at: UtcTimestamp::from_unix_millis(52),
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    let approvals = context
+        .store
+        .list_approvals_for_run(run.id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(approvals.items[0].id, approval.id);
+    assert_eq!(approvals.items[0].status, ApprovalStatus::Pending);
+    context
+        .store
+        .begin_approval_response(BeginApprovalResponse {
+            approval_id: approval.id,
+            decision: ApprovalDecision::Approved,
+            audit_event_id: context.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

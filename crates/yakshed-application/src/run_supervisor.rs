@@ -16,7 +16,7 @@ use yakshed_domain::{
 
 use crate::{
     AppStore, BeginApprovalResponse, Clock, ConfirmApprovalResponse, CreateRun, IdGenerator,
-    NewTimelineItem, PendingApproval, StoreError, TimelineBatch, TransitionRun,
+    ListTimeline, NewTimelineItem, PendingApproval, StoreError, TimelineBatch, TransitionRun,
 };
 
 pub const APP_EVENT_CAPACITY: usize = 128;
@@ -179,8 +179,16 @@ pub trait RunHarness: Send + Sync {
     async fn start_run(
         &self,
         connection_id: ConnectionId,
+        correlation_id: RunId,
         input: String,
     ) -> Result<ProviderRunRef, HarnessPortError>;
+    async fn lookup_run(
+        &self,
+        _connection_id: ConnectionId,
+        _correlation_id: RunId,
+    ) -> Result<Option<ProviderRunRef>, HarnessPortError> {
+        Ok(None)
+    }
     async fn steer(&self, run: &ProviderRunRef, input: String) -> Result<(), HarnessPortError>;
     async fn interrupt(&self, run: &ProviderRunRef) -> Result<(), HarnessPortError>;
     async fn respond(
@@ -382,7 +390,7 @@ impl RunSupervisor {
             state.pending_events.clear();
             state.pending_overflow = false;
         }
-        let provider_run = match self.0.harness.start_run(connection_id, input).await {
+        let provider_run = match self.0.harness.start_run(connection_id, run_id, input).await {
             Ok(handle) => handle,
             Err(error @ HarnessPortError::OutcomeUnknown { operation }) => {
                 self.0.finish_start_handshake();
@@ -618,28 +626,19 @@ impl RunSupervisor {
     pub async fn reconcile_run(&self, run_id: RunId) -> Result<RunSnapshot, RunOrchestrationError> {
         self.0.await_startup().await;
         let snapshot = self.0.store.get_run(run_id).await?;
-        let provider_id = snapshot
-            .provider_id
-            .clone()
-            .ok_or(RunOrchestrationError::RunNotActive(run_id))?;
-        let provider_run = ProviderRunRef(provider_id);
+        let provider_run = match snapshot.provider_id.clone() {
+            Some(provider_id) => ProviderRunRef(provider_id),
+            None => self
+                .0
+                .harness
+                .lookup_run(snapshot.connection_id, run_id)
+                .await?
+                .ok_or(RunOrchestrationError::RunNeedsReconciliation(run_id))?,
+        };
         if !self.0.harness.reconnect(&provider_run).await? {
             return Err(RunOrchestrationError::RunNeedsReconciliation(run_id));
         }
-        let snapshot = if snapshot.status == RunStatus::Running {
-            snapshot
-        } else {
-            self.0
-                .transition(run_id, snapshot.status, RunStatus::Running, None)
-                .await?
-        };
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .uncertain_runs
-            .remove(&run_id);
-        Ok(snapshot)
+        self.0.reattach_run(snapshot, provider_run).await
     }
 }
 
@@ -738,7 +737,7 @@ impl Inner {
                 Ok(page) => page,
                 Err(_) => return,
             };
-            for mut run in page.items {
+            for run in page.items {
                 let Some(provider_id) = run.provider_id.clone() else {
                     if matches!(run.status, RunStatus::Starting | RunStatus::Running) {
                         let target = if run.status == RunStatus::Starting {
@@ -753,19 +752,7 @@ impl Inner {
                 let provider_run = ProviderRunRef(provider_id);
                 match self.harness.reconnect(&provider_run).await {
                     Ok(true) => {
-                        if run.status != RunStatus::Running {
-                            if let Ok(updated) = self
-                                .transition(run.id, run.status, RunStatus::Running, None)
-                                .await
-                            {
-                                run = updated;
-                            } else {
-                                continue;
-                            }
-                        }
-                        self.attach_route(run.id, run.work_item_id, provider_run.clone())
-                            .await;
-                        self.restore_requests(&run, &provider_run).await;
+                        let _ = self.reattach_run(run, provider_run).await;
                     }
                     _ if run.status == RunStatus::Starting => {
                         let _ = self
@@ -822,6 +809,41 @@ impl Inner {
         self.ensure_event_pump();
     }
 
+    async fn reattach_run(
+        self: &Arc<Self>,
+        run: RunSnapshot,
+        provider_run: ProviderRunRef,
+    ) -> Result<RunSnapshot, RunOrchestrationError> {
+        let run = if run.status == RunStatus::Running && run.provider_id.is_some() {
+            run
+        } else {
+            self.transition(
+                run.id,
+                run.status,
+                RunStatus::Running,
+                Some(provider_run.provider_id()),
+            )
+            .await?
+        };
+        let attached = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runs
+            .contains_key(&run.id);
+        if !attached {
+            self.attach_route(run.id, run.work_item_id, provider_run.clone())
+                .await;
+        }
+        self.restore_requests(&run, &provider_run).await;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .uncertain_runs
+            .remove(&run.id);
+        Ok(run)
+    }
+
     async fn restore_requests(&self, run: &RunSnapshot, provider_run: &ProviderRunRef) {
         let mut after = None;
         loop {
@@ -863,6 +885,61 @@ impl Inner {
                 break;
             }
         }
+
+        let mut after = None;
+        let mut pending = HashMap::new();
+        loop {
+            let page = match self
+                .store
+                .list_timeline_page(ListTimeline {
+                    run_id: run.id,
+                    after,
+                    limit: 200,
+                })
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+            for item in page.items {
+                match item.kind.as_str() {
+                    "user_input_requested" => {
+                        if let Some(provider_id) = item.provider_id
+                            && let Some(native_id) = provider_id
+                                .value()
+                                .strip_prefix(&format!("{}/", provider_run.native_id()))
+                        {
+                            pending.insert(
+                                item.id,
+                                ProviderRequestRef {
+                                    run: provider_run.clone(),
+                                    native_id: native_id.to_owned(),
+                                },
+                            );
+                        }
+                    }
+                    "user_input_responded" => {
+                        if let Ok(request_id) = item.body.parse() {
+                            pending.remove(&request_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            after = page.next_after;
+            if after.is_none() {
+                break;
+            }
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.user_inputs.extend(
+            pending
+                .into_iter()
+                .map(|(id, request)| (id, (run.id, request))),
+        );
     }
 
     fn ensure_event_pump(self: &Arc<Self>) {
