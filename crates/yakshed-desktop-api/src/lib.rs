@@ -15,12 +15,18 @@ use yakshed_application::{
 use yakshed_domain::{
     ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId, ArtifactKind, Connection,
     ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot, ProjectId, RunId,
-    RunSnapshot, RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemSnapshot,
-    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
+    RunSnapshot, RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemId,
+    TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
 pub const APP_EVENT_CAPACITY: usize = 32;
 const MAX_OPEN_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+/// Desktop message ceiling; protects the application and provider boundary from WebView payloads.
+pub const MAX_RUN_INPUT_BYTES: usize = 256 * 1024;
+/// Follow-up steering is intentionally smaller than an initial context-bearing prompt.
+pub const MAX_STEER_INPUT_BYTES: usize = 64 * 1024;
+/// Server-request responses are bounded independently from provider-native limits.
+pub const MAX_USER_INPUT_RESPONSE_BYTES: usize = 64 * 1024;
 const SNAPSHOT_RETRIES: usize = 256;
 const RECOVERY_PAGE_SIZE: u32 = 50;
 
@@ -190,6 +196,20 @@ pub struct RunApprovalPageEnvelope {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FrontendPendingUserInput {
+    pub id: String,
+    pub run_id: String,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingUserInputPageEnvelope {
+    pub work_item_revision: u64,
+    pub inputs: Vec<FrontendPendingUserInput>,
+    pub next_after: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkItemListItem {
     pub work_item: FrontendWorkItemSnapshot,
     pub revision: u64,
@@ -303,7 +323,7 @@ pub struct DesktopApi {
 
 impl DesktopApi {
     /// Drops oldest events on overflow; consumers recovering missed revisions must call snapshot APIs.
-    pub fn new(ports: ApiPorts) -> Self {
+    pub async fn new(ports: ApiPorts) -> Self {
         let (events, _) = broadcast::channel(APP_EVENT_CAPACITY);
         let run_supervisor = Arc::new(RunSupervisor::new(
             ports.store.clone(),
@@ -311,6 +331,7 @@ impl DesktopApi {
             ports.clock,
             ports.ids,
         ));
+        run_supervisor.ready().await;
         let mut source = run_supervisor.subscribe();
         let relay = events.clone();
         tokio::spawn(async move {
@@ -459,6 +480,60 @@ impl DesktopApi {
         Err(DesktopError::conflict("work item changed during snapshot"))
     }
 
+    pub async fn get_pending_user_input_page(
+        &self,
+        work_item_id: WorkItemId,
+        run_id: RunId,
+        after: Option<TimelineItemId>,
+        limit: u32,
+        expected_revision: Option<u64>,
+    ) -> Result<PendingUserInputPageEnvelope> {
+        let run = self.store.get_run(run_id).await.map_err(map_store_error)?;
+        if run.work_item_id != work_item_id {
+            return Err(DesktopError::invalid_request(
+                "run does not belong to work item",
+            ));
+        }
+        for _ in 0..SNAPSHOT_RETRIES {
+            let revision = self
+                .store
+                .get_work_item(work_item_id)
+                .await
+                .map_err(map_store_error)?
+                .revision
+                .get();
+            if expected_revision.is_some_and(|expected| expected != revision) {
+                return Err(DesktopError::conflict("work item revision changed"));
+            }
+            let page = self
+                .store
+                .list_pending_user_inputs_for_run(run_id, after, limit.min(RECOVERY_PAGE_SIZE))
+                .await
+                .map_err(map_store_error)?;
+            let current = self
+                .store
+                .get_work_item(work_item_id)
+                .await
+                .map_err(map_store_error)?;
+            if current.revision.get() == revision {
+                return Ok(PendingUserInputPageEnvelope {
+                    work_item_revision: revision,
+                    inputs: page
+                        .items
+                        .into_iter()
+                        .map(|input| FrontendPendingUserInput {
+                            id: input.id.to_string(),
+                            run_id: input.run_id.to_string(),
+                            prompt: input.prompt,
+                        })
+                        .collect(),
+                    next_after: page.next_after.map(|id| id.to_string()),
+                });
+            }
+        }
+        Err(DesktopError::conflict("work item changed during snapshot"))
+    }
+
     pub async fn list_work_items(
         &self,
         project_id: ProjectId,
@@ -561,17 +636,25 @@ impl DesktopApi {
         connection_id: ConnectionId,
         input: impl Into<String>,
     ) -> Result<RunId> {
+        let input = input.into();
+        validate_text_limit(&input, MAX_RUN_INPUT_BYTES, "run input is too large")?;
         Ok(self
             .run_supervisor
-            .start_run(work_item_id, connection_id, input.into())
+            .start_run(work_item_id, connection_id, input)
             .await
             .map_err(map_run_error)?
             .id)
     }
 
     pub async fn steer_run(&self, run_id: RunId, message: impl Into<String>) -> Result<()> {
+        let message = message.into();
+        validate_text_limit(
+            &message,
+            MAX_STEER_INPUT_BYTES,
+            "steering input is too large",
+        )?;
         self.run_supervisor
-            .steer(run_id, message.into())
+            .steer(run_id, message)
             .await
             .map_err(map_run_error)
     }
@@ -607,8 +690,14 @@ impl DesktopApi {
         request_id: yakshed_application::UserInputRequestId,
         response: impl Into<String>,
     ) -> Result<()> {
+        let response = response.into();
+        validate_text_limit(
+            &response,
+            MAX_USER_INPUT_RESPONSE_BYTES,
+            "user-input response is too large",
+        )?;
         self.run_supervisor
-            .respond_user_input(request_id, response.into())
+            .respond_user_input(request_id, response)
             .await
             .map_err(map_run_error)
     }
@@ -764,6 +853,14 @@ impl DesktopApi {
             }
         }
         Err(DesktopError::conflict("work item changed during snapshot"))
+    }
+}
+
+fn validate_text_limit(value: &str, max_bytes: usize, message: &'static str) -> Result<()> {
+    if value.len() > max_bytes {
+        Err(DesktopError::invalid_request(message))
+    } else {
+        Ok(())
     }
 }
 

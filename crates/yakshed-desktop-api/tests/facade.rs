@@ -43,7 +43,7 @@ use yakshed_store::{
 #[tokio::test]
 async fn work_item_create_snapshot_round_trip() {
     let fixture = TestFixture::new().await;
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     let created = api
         .create_work_item(fixture.project_id, "task", None)
         .await
@@ -64,6 +64,41 @@ async fn work_item_create_snapshot_round_trip() {
             .iter()
             .any(|item| item.work_item.id == created.work_item.id)
     );
+}
+
+#[tokio::test]
+async fn first_snapshot_waits_for_startup_reconciliation() {
+    let fixture = TestFixture::new().await;
+    let run = fixture
+        .store
+        .create_run(CreateRun {
+            id: fixture.ids.next_run_id(),
+            connection_id: fixture.connection_id,
+            work_item_id: fixture.work_item_id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Starting,
+            target: RunStatus::OutcomeUnknown,
+            provider_id: Some(NamespacedProviderId::new("mock", "restart-ready").unwrap()),
+            occurred_at: UtcTimestamp::from_unix_millis(1),
+            audit_event_id: fixture.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    let api = fixture.api_no_run().await;
+    let snapshot = api
+        .get_work_item_snapshot(fixture.work_item_id)
+        .await
+        .unwrap();
+    assert!(snapshot.runs.iter().any(|item| {
+        item.id == run.id.to_string() && item.status == FrontendRunStatus::Running
+    }));
 }
 
 #[tokio::test]
@@ -109,7 +144,7 @@ async fn recovery_snapshot_exposes_bounded_cursors_for_all_runs_and_approvals() 
             .await
             .unwrap();
     }
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     api.reconcile_run(approval_run.id).await.unwrap();
     let mut run_after = None;
     let mut run_count = 0;
@@ -209,13 +244,17 @@ async fn recovery_matches_user_input_responses_by_request_id() {
                     id: first,
                     kind: "user_input_requested".to_owned(),
                     body: "first".to_owned(),
-                    provider_id: None,
+                    provider_id: Some(
+                        NamespacedProviderId::new("mock", "input-recovery/request-1").unwrap(),
+                    ),
                 },
                 NewTimelineItem {
                     id: second,
                     kind: "user_input_requested".to_owned(),
                     body: "second".to_owned(),
-                    provider_id: None,
+                    provider_id: Some(
+                        NamespacedProviderId::new("mock", "input-recovery/request-2").unwrap(),
+                    ),
                 },
                 NewTimelineItem {
                     id: fixture.ids.next_timeline_item_id(),
@@ -227,14 +266,15 @@ async fn recovery_matches_user_input_responses_by_request_id() {
         })
         .await
         .unwrap();
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     api.reconcile_run(run.id).await.unwrap();
-    let timeline = api
-        .get_work_item_timeline_page(fixture.work_item_id, run.id, None, 50)
+    let pending = api
+        .get_pending_user_input_page(fixture.work_item_id, run.id, None, 50, None)
         .await
         .unwrap();
-    assert_eq!(timeline.items[0].id, first.to_string());
-    assert_eq!(timeline.items[2].body, second.to_string());
+    assert_eq!(pending.inputs.len(), 1);
+    assert_eq!(pending.inputs[0].id, first.to_string());
+    assert_eq!(pending.inputs[0].prompt, "first");
 }
 
 #[tokio::test]
@@ -282,7 +322,7 @@ async fn recovery_snapshot_exposes_uncertain_approval_response() {
         })
         .await
         .unwrap();
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     api.reconcile_run(run.id).await.unwrap();
     let approvals = api
         .get_run_approval_page(fixture.work_item_id, run.id, None, 50, None)
@@ -601,7 +641,7 @@ async fn event_revisions_are_monotonic_and_overflow_recovers_via_snapshot() {
 #[tokio::test]
 async fn set_connection_credential_is_write_only() {
     let fixture = TestFixture::new().await;
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     let value = "canary-secret-value".to_owned();
     let wrote = api
         .set_connection_credential(fixture.connection_id, fixture.slot(), value.clone(), false)
@@ -649,7 +689,9 @@ async fn secret_backend_failures_keep_stable_facade_codes() {
         ),
         (SecretFailure::AlreadyExists, DesktopErrorCode::Conflict),
     ] {
-        let api = fixture.api_with_secret_port(Arc::new(FailingSecretPort(failure)));
+        let api = fixture
+            .api_with_secret_port(Arc::new(FailingSecretPort(failure)))
+            .await;
         let error = api
             .set_connection_credential(fixture.connection_id, fixture.slot(), "never echoed", false)
             .await
@@ -661,7 +703,7 @@ async fn secret_backend_failures_keep_stable_facade_codes() {
 #[tokio::test]
 async fn artifact_list_and_open_round_trip() {
     let fixture = TestFixture::new().await;
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     let bytes = b"artifact-body".to_vec();
     let artifact = fixture
         .artifact_port
@@ -689,7 +731,7 @@ async fn artifact_list_and_open_round_trip() {
 #[tokio::test]
 async fn clear_cache_removes_entries() {
     let fixture = TestFixture::new().await;
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     fixture
         .cache_store
         .put("app", "cache-key", &serde_json::json!({ "foo": "bar" }))
@@ -756,7 +798,7 @@ async fn event_revisions_are_contiguous_without_gap() {
 #[tokio::test]
 async fn open_artifact_rejects_unbounded_request() {
     let fixture = TestFixture::new().await;
-    let api = fixture.api_no_run();
+    let api = fixture.api_no_run().await;
     let bytes = b"bounded".to_vec();
     let artifact = fixture
         .artifact_port
@@ -779,6 +821,87 @@ async fn open_artifact_rejects_unbounded_request() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn text_commands_reject_oversized_payloads_before_supervisor_calls() {
+    let fixture = TestFixture::new().await;
+    let api = fixture.api_no_run().await;
+    let run_error = api
+        .start_run(
+            fixture.work_item_id,
+            fixture.connection_id,
+            "x".repeat(yakshed_desktop_api::MAX_RUN_INPUT_BYTES + 1),
+        )
+        .await
+        .unwrap_err();
+    let steer_error = api
+        .steer_run(
+            fixture.ids.next_run_id(),
+            "x".repeat(yakshed_desktop_api::MAX_STEER_INPUT_BYTES + 1),
+        )
+        .await
+        .unwrap_err();
+    let response_error = api
+        .respond_user_input(
+            fixture.ids.next_timeline_item_id(),
+            "x".repeat(yakshed_desktop_api::MAX_USER_INPUT_RESPONSE_BYTES + 1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(run_error.code, DesktopErrorCode::InvalidRequest);
+    assert_eq!(steer_error.code, DesktopErrorCode::InvalidRequest);
+    assert_eq!(response_error.code, DesktopErrorCode::InvalidRequest);
+    assert_ne!(
+        api.start_run(
+            fixture.work_item_id,
+            fixture.connection_id,
+            "x".repeat(yakshed_desktop_api::MAX_RUN_INPUT_BYTES),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        DesktopErrorCode::InvalidRequest
+    );
+    assert_ne!(
+        api.steer_run(
+            fixture.ids.next_run_id(),
+            "x".repeat(yakshed_desktop_api::MAX_STEER_INPUT_BYTES),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        DesktopErrorCode::InvalidRequest
+    );
+    let provider_request = "boundary-response".parse::<ProviderRequestId>().unwrap();
+    let response_api = fixture
+        .api_for_plan(MockRunPlan::new(vec![
+            MockScriptStep::user_input(provider_request.clone(), "boundary?"),
+            MockScriptStep::await_response(provider_request),
+            MockScriptStep::complete(),
+        ]))
+        .await;
+    let mut events = response_api.subscribe_events();
+    response_api
+        .start_run(fixture.work_item_id, fixture.connection_id, "boundary")
+        .await
+        .unwrap();
+    let opened = wait_for_matching(
+        &mut events,
+        |event| matches!(event.kind, FrontendEventKind::UserInputOpened { .. }),
+        Duration::from_secs(3),
+    )
+    .await;
+    let FrontendEventKind::UserInputOpened { request_id, .. } = opened.kind else {
+        unreachable!()
+    };
+    response_api
+        .respond_user_input(
+            request_id.parse().unwrap(),
+            "x".repeat(yakshed_desktop_api::MAX_USER_INPUT_RESPONSE_BYTES),
+        )
+        .await
+        .unwrap();
 }
 
 struct TestFixture {
@@ -867,11 +990,11 @@ impl TestFixture {
         }
     }
 
-    fn api_no_run(&self) -> DesktopApi {
-        self.api_with_secret_port(self.secret_port.clone())
+    async fn api_no_run(&self) -> DesktopApi {
+        self.api_with_secret_port(self.secret_port.clone()).await
     }
 
-    fn api_with_secret_port(&self, secrets: Arc<dyn SecretPort>) -> DesktopApi {
+    async fn api_with_secret_port(&self, secrets: Arc<dyn SecretPort>) -> DesktopApi {
         DesktopApi::new(ApiPorts {
             store: self.store.clone(),
             harness: Arc::new(NoopRunHarness),
@@ -882,6 +1005,7 @@ impl TestFixture {
             cache: self.cache_port.clone(),
             artifacts: self.artifact_port.clone(),
         })
+        .await
     }
 
     async fn api_for_plan(&self, plan: MockRunPlan) -> DesktopApi {
@@ -897,6 +1021,7 @@ impl TestFixture {
             cache: self.cache_port.clone(),
             artifacts: self.artifact_port.clone(),
         })
+        .await
     }
 
     async fn api_for_plan_with_unknown_interrupt(
@@ -921,6 +1046,7 @@ impl TestFixture {
             cache: self.cache_port.clone(),
             artifacts: self.artifact_port.clone(),
         })
+        .await
     }
 
     fn slot(&self) -> CredentialSlot {
