@@ -10,19 +10,21 @@ use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
 use secrecy::SecretString;
 use tokio::sync::{Mutex, broadcast};
 use yakshed_application::{
-    AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError, ConfigChange, ConfigPort,
-    ConfigPortError, ConfigRevision, CreateProject, CreateWorkItem, IdGenerator, ListTimeline,
-    OpenArtifactCommand, OpenArtifactPayload, PublicConnection, PublicCredentialBinding,
+    AppStore, ArtifactPort, ArtifactPortError, BeginApprovalResponse, CachePort, CachePortError,
+    ConfigChange, ConfigPort, ConfigPortError, ConfigRevision, CreateProject, CreateRun,
+    CreateWorkItem, IdGenerator, ListTimeline, NewTimelineItem, OpenArtifactCommand,
+    OpenArtifactPayload, PendingApproval, PublicConnection, PublicCredentialBinding,
     PublicCredentialSource, PutConnectionCommand, RunSupervisor, SecretPort, SecretPortError,
-    SetConnectionCredentialCommand, SystemClock, SystemIdGenerator,
+    SetConnectionCredentialCommand, SystemClock, SystemIdGenerator, TimelineBatch, TransitionRun,
 };
 use yakshed_desktop_api::{
-    ApiPorts, DesktopApi, FrontendEvent, FrontendEventKind, FrontendRunStatus,
+    ApiPorts, DesktopApi, DesktopErrorCode, FrontendEvent, FrontendEventKind, FrontendRunStatus,
 };
 use yakshed_domain::{
-    ArtifactId, ArtifactKind, Connection, ConnectionId, CredentialBinding, CredentialBindingRecord,
-    CredentialSlot, ProviderStateRootId, RunId, RunStatus, SecretBackendId, SecretLocator,
-    SecretReference, WorkItemId,
+    ApprovalDecision, ApprovalStatus, ArtifactId, ArtifactKind, Connection, ConnectionId,
+    CredentialBinding, CredentialBindingRecord, CredentialSlot, NamespacedProviderId,
+    ProviderStateRootId, RunId, RunStatus, SecretBackendId, SecretLocator, SecretReference,
+    StreamCursor, UtcTimestamp, WorkItemId,
 };
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessError, HarnessEvent, HarnessInput,
@@ -65,6 +67,187 @@ async fn work_item_create_snapshot_round_trip() {
 }
 
 #[tokio::test]
+async fn recovery_snapshot_pages_all_runs_and_approvals() {
+    let fixture = TestFixture::new().await;
+    let mut runs = Vec::new();
+    for _ in 0..201 {
+        runs.push(
+            fixture
+                .store
+                .create_run(CreateRun {
+                    id: fixture.ids.next_run_id(),
+                    connection_id: fixture.connection_id,
+                    work_item_id: fixture.work_item_id,
+                    provider_run: None,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let approval_run = fixture
+        .store
+        .transition_run(TransitionRun {
+            run_id: runs[0].id,
+            expected_current: RunStatus::Starting,
+            target: RunStatus::Running,
+            provider_id: Some(NamespacedProviderId::new("mock", "paged-run").unwrap()),
+            occurred_at: UtcTimestamp::from_unix_millis(1),
+            audit_event_id: fixture.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    for index in 0..205 {
+        fixture
+            .store
+            .record_pending_approval(PendingApproval {
+                id: fixture.ids.next_approval_request_id(),
+                run_id: approval_run.id,
+                provider_id: NamespacedProviderId::new("mock", format!("paged/{index}")).unwrap(),
+                kind: "command".to_owned(),
+                summary: format!("approval {index}"),
+            })
+            .await
+            .unwrap();
+    }
+    let api = fixture.api_no_run();
+    api.reconcile_run(approval_run.id).await.unwrap();
+    let snapshot = api
+        .get_work_item_snapshot(fixture.work_item_id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.runs.len(), 201);
+    assert_eq!(snapshot.pending_approvals.len(), 205);
+}
+
+#[tokio::test]
+async fn recovery_matches_user_input_responses_by_request_id() {
+    let fixture = TestFixture::new().await;
+    let run = fixture
+        .store
+        .create_run(CreateRun {
+            id: fixture.ids.next_run_id(),
+            connection_id: fixture.connection_id,
+            work_item_id: fixture.work_item_id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    let run = fixture
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Starting,
+            target: RunStatus::Running,
+            provider_id: Some(NamespacedProviderId::new("mock", "input-recovery").unwrap()),
+            occurred_at: UtcTimestamp::from_unix_millis(1),
+            audit_event_id: fixture.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    let first = fixture.ids.next_timeline_item_id();
+    let second = fixture.ids.next_timeline_item_id();
+    fixture
+        .store
+        .append_timeline_batch(TimelineBatch {
+            batch_id: fixture.ids.next_timeline_batch_id(),
+            connection_id: fixture.connection_id,
+            run_id: run.id,
+            source_namespace: "app".to_owned(),
+            stream_id: run.id.to_string(),
+            expected_stream_revision: StreamCursor::INITIAL,
+            items: vec![
+                NewTimelineItem {
+                    id: first,
+                    kind: "user_input_requested".to_owned(),
+                    body: "first".to_owned(),
+                    provider_id: None,
+                },
+                NewTimelineItem {
+                    id: second,
+                    kind: "user_input_requested".to_owned(),
+                    body: "second".to_owned(),
+                    provider_id: None,
+                },
+                NewTimelineItem {
+                    id: fixture.ids.next_timeline_item_id(),
+                    kind: "user_input_responded".to_owned(),
+                    body: second.to_string(),
+                    provider_id: None,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    let api = fixture.api_no_run();
+    api.reconcile_run(run.id).await.unwrap();
+    let snapshot = api
+        .get_work_item_snapshot(fixture.work_item_id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.pending_user_inputs.len(), 1);
+    assert_eq!(snapshot.pending_user_inputs[0].request_id, first);
+}
+
+#[tokio::test]
+async fn recovery_snapshot_exposes_uncertain_approval_response() {
+    let fixture = TestFixture::new().await;
+    let run = fixture
+        .store
+        .create_run(CreateRun {
+            id: fixture.ids.next_run_id(),
+            connection_id: fixture.connection_id,
+            work_item_id: fixture.work_item_id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+    let run = fixture
+        .store
+        .transition_run(TransitionRun {
+            run_id: run.id,
+            expected_current: RunStatus::Starting,
+            target: RunStatus::Running,
+            provider_id: Some(NamespacedProviderId::new("mock", "approval-recovery").unwrap()),
+            occurred_at: UtcTimestamp::from_unix_millis(1),
+            audit_event_id: fixture.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    let approval = fixture
+        .store
+        .record_pending_approval(PendingApproval {
+            id: fixture.ids.next_approval_request_id(),
+            run_id: run.id,
+            provider_id: NamespacedProviderId::new("mock", "approval-recovery/request-1").unwrap(),
+            kind: "approval".to_owned(),
+            summary: "uncertain".to_owned(),
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .begin_approval_response(BeginApprovalResponse {
+            approval_id: approval.id,
+            decision: ApprovalDecision::Approved,
+            audit_event_id: fixture.ids.next_audit_event_id(),
+        })
+        .await
+        .unwrap();
+    let api = fixture.api_no_run();
+    api.reconcile_run(run.id).await.unwrap();
+    let snapshot = api
+        .get_work_item_snapshot(fixture.work_item_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        snapshot.pending_approvals[0].status,
+        ApprovalStatus::Responding {
+            decision: ApprovalDecision::Approved
+        }
+    ));
+}
+
+#[tokio::test]
 async fn full_run_lifecycle_batches_chunked_deltas() {
     let fixture = TestFixture::new().await;
     let api = fixture
@@ -104,6 +287,31 @@ async fn full_run_lifecycle_batches_chunked_deltas() {
             .any(|item| item.kind == "command_output_completed")
     );
     assert!(timeline.iter().any(|item| item.kind == "file_mutation"));
+}
+
+#[tokio::test]
+async fn frontend_snapshots_omit_provider_identifiers() {
+    let fixture = TestFixture::new().await;
+    let api = fixture
+        .api_for_plan(MockRunPlan::new(vec![
+            MockScriptStep::message_completed("safe"),
+            MockScriptStep::complete(),
+        ]))
+        .await;
+    let run_id = api
+        .start_run(fixture.work_item_id, fixture.connection_id, "boundary")
+        .await
+        .unwrap();
+    wait_for_run_completion(&fixture.store, run_id).await;
+    let snapshot = api
+        .get_work_item_snapshot(fixture.work_item_id)
+        .await
+        .unwrap();
+    let timeline = api
+        .get_work_item_timeline_page(fixture.work_item_id, run_id, None, 50)
+        .await
+        .unwrap();
+    assert!(!format!("{snapshot:?}{timeline:?}").contains("provider_id"));
 }
 
 #[tokio::test]
@@ -352,16 +560,52 @@ async fn set_connection_credential_is_write_only() {
     assert!(!wrote.overwritten);
     let single = api.connection_get(fixture.connection_id).await.unwrap();
     let listed = api.list_connections().await.unwrap();
-    let connection_payload = format!("{:?}", single.connection);
-    let list_payload = format!("{:?}", listed.connections);
-    assert!(
-        !connection_payload.contains(&value),
-        "connection read must not include secret text"
-    );
-    assert!(
-        !list_payload.contains(&value),
-        "list output must not include secret text"
-    );
+    let error = api
+        .set_connection_credential(fixture.connection_id, fixture.slot(), value.clone(), false)
+        .await
+        .unwrap_err();
+    let facade_payload = format!("{wrote:?}{single:?}{listed:?}{error:?}");
+    assert!(!facade_payload.contains(&value));
+    assert!(!tree_contains(fixture._temp.path(), value.as_bytes()));
+}
+
+fn tree_contains(path: &std::path::Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(path).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            tree_contains(&path, needle)
+        } else {
+            std::fs::read(path)
+                .map(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+                .unwrap_or(false)
+        }
+    })
+}
+
+#[tokio::test]
+async fn secret_backend_failures_keep_stable_facade_codes() {
+    let fixture = TestFixture::new().await;
+    for (failure, expected) in [
+        (SecretFailure::Uncertain, DesktopErrorCode::OutcomeUnknown),
+        (
+            SecretFailure::Unavailable,
+            DesktopErrorCode::BackendUnavailable,
+        ),
+        (SecretFailure::Locked, DesktopErrorCode::InvalidRequest),
+        (SecretFailure::Denied, DesktopErrorCode::Unsupported),
+        (
+            SecretFailure::AuthenticationRequired,
+            DesktopErrorCode::Unsupported,
+        ),
+        (SecretFailure::AlreadyExists, DesktopErrorCode::Conflict),
+    ] {
+        let api = fixture.api_with_secret_port(Arc::new(FailingSecretPort(failure)));
+        let error = api
+            .set_connection_credential(fixture.connection_id, fixture.slot(), "never echoed", false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, expected);
+    }
 }
 
 #[tokio::test]
@@ -574,6 +818,10 @@ impl TestFixture {
     }
 
     fn api_no_run(&self) -> DesktopApi {
+        self.api_with_secret_port(self.secret_port.clone())
+    }
+
+    fn api_with_secret_port(&self, secrets: Arc<dyn SecretPort>) -> DesktopApi {
         DesktopApi::new(ApiPorts {
             store: self.store.clone(),
             run_supervisor: Arc::new(RunSupervisor::new(
@@ -583,7 +831,7 @@ impl TestFixture {
                 self.ids.clone(),
             )),
             config: self.config_port.clone(),
-            secrets: self.secret_port.clone(),
+            secrets,
             cache: self.cache_port.clone(),
             artifacts: self.artifact_port.clone(),
         })
@@ -766,6 +1014,35 @@ impl ConfigPort for TestConfigPort {
 struct TestSecretPort {
     store: Arc<ConfigStore>,
     broker: Arc<CredentialBroker>,
+}
+
+#[derive(Clone, Copy)]
+enum SecretFailure {
+    Uncertain,
+    Unavailable,
+    Locked,
+    Denied,
+    AuthenticationRequired,
+    AlreadyExists,
+}
+
+struct FailingSecretPort(SecretFailure);
+
+#[async_trait]
+impl SecretPort for FailingSecretPort {
+    async fn set_connection_credential(
+        &self,
+        _command: SetConnectionCredentialCommand,
+    ) -> Result<yakshed_application::SecretWriteOutcome, SecretPortError> {
+        Err(match self.0 {
+            SecretFailure::Uncertain => SecretPortError::UncertainWrite,
+            SecretFailure::Unavailable => SecretPortError::BackendUnavailable,
+            SecretFailure::Locked => SecretPortError::Locked,
+            SecretFailure::Denied => SecretPortError::Denied,
+            SecretFailure::AuthenticationRequired => SecretPortError::AuthenticationRequired,
+            SecretFailure::AlreadyExists => SecretPortError::AlreadyExists,
+        })
+    }
 }
 
 impl TestSecretPort {
@@ -967,7 +1244,14 @@ impl yakshed_application::RunHarness for NoopRunHarness {
         &self,
     ) -> Result<Option<yakshed_application::RunHarnessEvent>, yakshed_application::HarnessPortError>
     {
-        Ok(None)
+        std::future::pending().await
+    }
+
+    async fn reconnect(
+        &self,
+        _run: &yakshed_application::ProviderRunRef,
+    ) -> Result<bool, yakshed_application::HarnessPortError> {
+        Ok(true)
     }
 }
 
@@ -1019,22 +1303,16 @@ impl MockPort {
     }
 
     fn run_ref(run: &ProviderRunHandle) -> yakshed_application::ProviderRunRef {
-        yakshed_application::ProviderRunRef {
-            namespace: "mock".to_owned(),
-            native_id: run.to_string(),
-        }
+        yakshed_application::ProviderRunRef::new("mock", run.to_string()).unwrap()
     }
 
     async fn native_run(
         &self,
         run: &yakshed_application::ProviderRunRef,
     ) -> Result<ProviderRunHandle, yakshed_application::HarnessPortError> {
-        self.runs
-            .lock()
-            .await
-            .get(run)
-            .cloned()
-            .ok_or_else(|| yakshed_application::HarnessPortError::NotFound(run.native_id.clone()))
+        self.runs.lock().await.get(run).cloned().ok_or_else(|| {
+            yakshed_application::HarnessPortError::NotFound(run.native_id().to_owned())
+        })
     }
 }
 
@@ -1116,6 +1394,13 @@ impl yakshed_application::RunHarness for MockPort {
     ) -> Result<Option<yakshed_application::RunHarnessEvent>, yakshed_application::HarnessPortError>
     {
         Ok(self.stream.lock().await.recv().await.map(convert_event))
+    }
+
+    async fn reconnect(
+        &self,
+        run: &yakshed_application::ProviderRunRef,
+    ) -> Result<bool, yakshed_application::HarnessPortError> {
+        Ok(self.runs.lock().await.contains_key(run))
     }
 }
 
@@ -1349,24 +1634,7 @@ fn map_config_store_error(error: yakshed_store::ConfigError) -> ConfigPortError 
 }
 
 fn map_secret_error(error: SecretError) -> SecretPortError {
-    match error {
-        SecretError::InvalidBinding {
-            reason: yakshed_secrets::InvalidBindingReason::UnknownConnection,
-            ..
-        } => SecretPortError::ConnectionNotFound,
-        SecretError::InvalidBinding {
-            reason: yakshed_secrets::InvalidBindingReason::UnknownSlot,
-            ..
-        } => SecretPortError::BindingNotFound,
-        SecretError::InvalidBinding {
-            reason:
-                yakshed_secrets::InvalidBindingReason::NotSecretBacked
-                | yakshed_secrets::InvalidBindingReason::Disabled
-                | yakshed_secrets::InvalidBindingReason::StaleBinding,
-            ..
-        } => SecretPortError::NotSecretBacked,
-        _ => SecretPortError::Failed,
-    }
+    error.into()
 }
 
 fn map_artifact_store_error(error: yakshed_store::ArtifactError) -> ArtifactPortError {

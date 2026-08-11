@@ -12,14 +12,15 @@ use yakshed_application::{
     SecretPortError, SetConnectionCredentialCommand, StoreError,
 };
 use yakshed_domain::{
-    ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactKind, Connection, ConnectionId,
-    CredentialBinding, CredentialBindingRecord, CredentialSlot, ProjectId, RunId, RunSnapshot,
-    RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemId,
-    TimelineItemSnapshot, TimelineRevision, WorkItemId, WorkItemSnapshot,
+    ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId, ArtifactKind, Connection,
+    ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot, ProjectId, RunId,
+    RunSnapshot, RunStatus, SecretBackendId, SecretLocator, SecretReference, TimelineItemId,
+    TimelineItemSnapshot, TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
 pub const APP_EVENT_CAPACITY: usize = 32;
 const MAX_OPEN_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+const SNAPSHOT_RETRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesktopErrorCode {
@@ -135,9 +136,33 @@ pub struct WorkItemSnapshotEnvelope {
     /// Durable revision of this work item used for event-gap recovery.
     pub revision: u64,
     pub work_item: WorkItemSnapshot,
-    pub runs: Vec<RunSnapshot>,
-    pub pending_approvals: Vec<ApprovalSnapshot>,
+    pub runs: Vec<FrontendRunSnapshot>,
+    pub pending_approvals: Vec<FrontendApprovalSnapshot>,
     pub pending_user_inputs: Vec<WorkItemPendingUserInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontendRunSnapshot {
+    pub id: RunId,
+    pub connection_id: ConnectionId,
+    pub work_item_id: WorkItemId,
+    pub status: RunStatus,
+    pub created_at: UtcTimestamp,
+    pub ended_at: Option<UtcTimestamp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontendApprovalSnapshot {
+    pub id: ApprovalRequestId,
+    pub connection_id: ConnectionId,
+    pub run_id: RunId,
+    pub kind: String,
+    pub summary: String,
+    pub status: ApprovalStatus,
+    pub requested_at: UtcTimestamp,
+    pub response_started_at: Option<UtcTimestamp>,
+    pub resolved_at: Option<UtcTimestamp>,
+    pub voided_at: Option<UtcTimestamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,8 +188,19 @@ pub struct WorkItemListEnvelope {
 pub struct WorkItemTimelineEnvelope {
     pub run_id: RunId,
     pub work_item_revision: u64,
-    pub items: Vec<TimelineItemSnapshot>,
+    pub items: Vec<FrontendTimelineItemSnapshot>,
     pub next_after: Option<TimelineRevision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontendTimelineItemSnapshot {
+    pub id: TimelineItemId,
+    pub connection_id: ConnectionId,
+    pub run_id: RunId,
+    pub revision: TimelineRevision,
+    pub kind: String,
+    pub body: String,
+    pub created_at: UtcTimestamp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,75 +326,108 @@ impl DesktopApi {
     }
 
     pub async fn get_work_item_snapshot(&self, id: WorkItemId) -> Result<WorkItemSnapshotEnvelope> {
-        let work_item = self
-            .store
-            .get_work_item(id)
-            .await
-            .map_err(map_store_error)?;
-        let revision = work_item.revision.get();
-        let runs = self
-            .store
-            .list_runs_for_work_item(id, None, 200)
-            .await
-            .map_err(map_store_error)?
-            .items;
-        let mut pending_approvals = Vec::new();
-        let mut pending_user_inputs = Vec::new();
-        for run in &runs {
-            let mut approvals = self
+        for _ in 0..SNAPSHOT_RETRIES {
+            let work_item = self
                 .store
-                .list_approvals_for_run(run.id, None, 200)
+                .get_work_item(id)
                 .await
-                .map_err(map_store_error)?
-                .items;
-            approvals.retain(|approval| {
-                matches!(approval.status, yakshed_domain::ApprovalStatus::Pending)
-            });
-            pending_approvals.extend(approvals);
-
+                .map_err(map_store_error)?;
+            let revision = work_item.revision.get();
+            let mut runs = Vec::new();
             let mut after = None;
-            let mut requested: VecDeque<(TimelineItemId, String)> = VecDeque::new();
             loop {
                 let page = self
                     .store
-                    .list_timeline_page(yakshed_application::ListTimeline {
-                        run_id: run.id,
-                        after,
-                        limit: 200,
-                    })
+                    .list_runs_for_work_item(id, after, 200)
                     .await
                     .map_err(map_store_error)?;
-                for item in page.items {
-                    match item.kind.as_str() {
-                        "user_input_requested" => {
-                            requested.push_back((item.id, item.body));
-                        }
-                        "user_input_responded" => {
-                            requested.pop_front();
-                        }
-                        _ => {}
-                    }
-                }
+                runs.extend(page.items);
                 after = page.next_after;
                 if after.is_none() {
                     break;
                 }
             }
-            pending_user_inputs.extend(requested.into_iter().map(|(request_id, prompt)| {
-                WorkItemPendingUserInput {
-                    run_id: run.id,
-                    request_id,
-                    prompt,
+            let mut pending_approvals = Vec::new();
+            let mut pending_user_inputs = Vec::new();
+            for run in &runs {
+                let mut approval_after = None;
+                loop {
+                    let page = self
+                        .store
+                        .list_approvals_for_run(run.id, approval_after, 200)
+                        .await
+                        .map_err(map_store_error)?;
+                    pending_approvals.extend(page.items.into_iter().filter(|approval| {
+                        matches!(
+                            approval.status,
+                            ApprovalStatus::Pending | ApprovalStatus::Responding { .. }
+                        )
+                    }));
+                    approval_after = page.next_after;
+                    if approval_after.is_none() {
+                        break;
+                    }
                 }
-            }));
+
+                let mut timeline_after = None;
+                let mut requested: VecDeque<(TimelineItemId, String)> = VecDeque::new();
+                loop {
+                    let page = self
+                        .store
+                        .list_timeline_page(yakshed_application::ListTimeline {
+                            run_id: run.id,
+                            after: timeline_after,
+                            limit: 200,
+                        })
+                        .await
+                        .map_err(map_store_error)?;
+                    for item in page.items {
+                        match item.kind.as_str() {
+                            "user_input_requested" => requested.push_back((item.id, item.body)),
+                            "user_input_responded" => {
+                                if let Ok(request_id) = item.body.parse()
+                                    && let Some(index) = requested
+                                        .iter()
+                                        .position(|(pending_id, _)| *pending_id == request_id)
+                                {
+                                    requested.remove(index);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    timeline_after = page.next_after;
+                    if timeline_after.is_none() {
+                        break;
+                    }
+                }
+                pending_user_inputs.extend(requested.into_iter().map(|(request_id, prompt)| {
+                    WorkItemPendingUserInput {
+                        run_id: run.id,
+                        request_id,
+                        prompt,
+                    }
+                }));
+            }
+            let current = self
+                .store
+                .get_work_item(id)
+                .await
+                .map_err(map_store_error)?;
+            if current.revision.get() == revision {
+                return Ok(WorkItemSnapshotEnvelope {
+                    revision,
+                    work_item,
+                    runs: runs.into_iter().map(frontend_run).collect(),
+                    pending_approvals: pending_approvals
+                        .into_iter()
+                        .map(frontend_approval)
+                        .collect(),
+                    pending_user_inputs,
+                });
+            }
         }
-        Ok(WorkItemSnapshotEnvelope {
-            revision,
-            work_item,
-            runs,
-            pending_approvals,
-            pending_user_inputs,
-        })
+        Err(DesktopError::conflict("work item changed during snapshot"))
     }
 
     pub async fn list_work_items(
@@ -478,6 +547,14 @@ impl DesktopApi {
         self.run_supervisor
             .interrupt(run_id)
             .await
+            .map_err(map_run_error)
+    }
+
+    pub async fn reconcile_run(&self, run_id: RunId) -> Result<FrontendRunSnapshot> {
+        self.run_supervisor
+            .reconcile_run(run_id)
+            .await
+            .map(frontend_run)
             .map_err(map_run_error)
     }
 
@@ -605,28 +682,78 @@ impl DesktopApi {
                 "run does not belong to work item",
             ));
         }
-        let work_item_revision = self
-            .store
-            .get_work_item(work_item_id)
-            .await
-            .map_err(map_store_error)?
-            .revision
-            .get();
-        let page = self
-            .store
-            .list_timeline_page(yakshed_application::ListTimeline {
-                run_id,
-                after,
-                limit,
-            })
-            .await
-            .map_err(map_store_error)?;
-        Ok(WorkItemTimelineEnvelope {
-            run_id,
-            work_item_revision,
-            items: page.items,
-            next_after: page.next_after,
-        })
+        for _ in 0..SNAPSHOT_RETRIES {
+            let work_item_revision = self
+                .store
+                .get_work_item(work_item_id)
+                .await
+                .map_err(map_store_error)?
+                .revision
+                .get();
+            let page = self
+                .store
+                .list_timeline_page(yakshed_application::ListTimeline {
+                    run_id,
+                    after,
+                    limit,
+                })
+                .await
+                .map_err(map_store_error)?;
+            let current_revision = self
+                .store
+                .get_work_item(work_item_id)
+                .await
+                .map_err(map_store_error)?
+                .revision
+                .get();
+            if current_revision == work_item_revision {
+                return Ok(WorkItemTimelineEnvelope {
+                    run_id,
+                    work_item_revision,
+                    items: page.items.into_iter().map(frontend_timeline_item).collect(),
+                    next_after: page.next_after,
+                });
+            }
+        }
+        Err(DesktopError::conflict("work item changed during snapshot"))
+    }
+}
+
+fn frontend_run(run: RunSnapshot) -> FrontendRunSnapshot {
+    FrontendRunSnapshot {
+        id: run.id,
+        connection_id: run.connection_id,
+        work_item_id: run.work_item_id,
+        status: run.status,
+        created_at: run.created_at,
+        ended_at: run.ended_at,
+    }
+}
+
+fn frontend_approval(approval: ApprovalSnapshot) -> FrontendApprovalSnapshot {
+    FrontendApprovalSnapshot {
+        id: approval.id,
+        connection_id: approval.connection_id,
+        run_id: approval.run_id,
+        kind: approval.kind,
+        summary: approval.summary,
+        status: approval.status,
+        requested_at: approval.requested_at,
+        response_started_at: approval.response_started_at,
+        resolved_at: approval.resolved_at,
+        voided_at: approval.voided_at,
+    }
+}
+
+fn frontend_timeline_item(item: TimelineItemSnapshot) -> FrontendTimelineItemSnapshot {
+    FrontendTimelineItemSnapshot {
+        id: item.id,
+        connection_id: item.connection_id,
+        run_id: item.run_id,
+        revision: item.revision,
+        kind: item.kind,
+        body: item.body,
+        created_at: item.created_at,
     }
 }
 
@@ -743,8 +870,14 @@ fn map_run_error(error: RunOrchestrationError) -> DesktopError {
         },
         RunOrchestrationError::Store(error) => map_store_error(error),
         RunOrchestrationError::RunNotActive(_) => DesktopError::not_found("run is not active"),
+        RunOrchestrationError::RunNeedsReconciliation(_) => {
+            DesktopError::outcome_unknown("reconcile_run")
+        }
         RunOrchestrationError::ApprovalNotPending(_) => {
             DesktopError::invalid_request("approval is not pending")
+        }
+        RunOrchestrationError::ApprovalDecisionConflict(_) => {
+            DesktopError::conflict("approval decision conflicts with in-flight response")
         }
         RunOrchestrationError::UserInputNotPending(_) => {
             DesktopError::invalid_request("user input is not pending")
