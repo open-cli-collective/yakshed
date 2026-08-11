@@ -33,8 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_RS = Path("crates/provider-codex/src/lib.rs")
 FAKE_CODEX = Path("crates/provider-codex/tests/fake_codex.py")
 
-CODEX_VERSION_RE = re.compile(r'^(\s*const LAST_VALIDATED_CODEX_VERSION: &str = ")\\d+\\.\\d+\\.\\d+(";)')
-FAKE_CLI_VERSION_RE = re.compile(r'("cliVersion":\\s*")\\d+\\.\\d+\\.\\d+(")')
+CODEX_VERSION_RE = re.compile(
+    r'^(\s*const LAST_VALIDATED_CODEX_VERSION: &str = ")\d+\.\d+\.\d+(";)',
+    re.MULTILINE,
+)
+FAKE_CLI_VERSION_RE = re.compile(r'("cliVersion":\s*")\d+\.\d+\.\d+(")', re.MULTILINE)
 
 
 def updated_lock(lock: dict, value: dict, schema_digest: str, validated_at: str) -> dict:
@@ -65,17 +68,23 @@ def updated_lock(lock: dict, value: dict, schema_digest: str, validated_at: str)
     return result
 
 
-def update_last_validated_metadata(root_version: str, repo_root: Path = REPO_ROOT) -> None:
+def update_last_validated_metadata(
+    root_version: str, repo_root: Path = REPO_ROOT
+) -> list[tuple[Path, str]]:
     paths = [
-        (repo_root / LIB_RS, CODEX_VERSION_RE, f'\\1{root_version}\\2'),
-        (repo_root / FAKE_CODEX, FAKE_CLI_VERSION_RE, f'\\1{root_version}\\2'),
+        (repo_root / LIB_RS, CODEX_VERSION_RE, f'\\g<1>{root_version}\\g<2>'),
+        (repo_root / FAKE_CODEX, FAKE_CLI_VERSION_RE, f'\\g<1>{root_version}\\g<2>'),
     ]
+    staged_updates: list[tuple[Path, str, str]] = []
     for path, pattern, replacement in paths:
         text = path.read_text(encoding="utf-8")
         rewritten, count = pattern.subn(replacement, text)
         if count != 1:
             raise ValueError(f"unable to update last-validated version in {path}")
+        staged_updates.append((path, text, rewritten))
+    for path, _original_text, rewritten in staged_updates:
         path.write_text(rewritten, encoding="utf-8")
+    return [(path, original_text) for path, original_text, _ in staged_updates]
 
 
 def run_repin(
@@ -109,13 +118,20 @@ def run_repin(
         backup = Path(temp) / "previous-schema"
         new_lock = Path(temp) / "codex-lock.json"
         new_lock.write_text(rendered, encoding="utf-8")
+
+        metadata_backups: list[tuple[Path, str]] = []
+        if update_metadata:
+            metadata_backups = update_last_validated_metadata(
+                replacement["codex_version"], repo_root
+            )
         try:
             schema_root.rename(backup)
             generated.rename(schema_root)
             new_lock.replace(lock_path)
-            if update_metadata:
-                update_last_validated_metadata(replacement["codex_version"], repo_root)
         except Exception:
+            if metadata_backups:
+                for path, original_text in reversed(metadata_backups):
+                    path.write_text(original_text, encoding="utf-8")
             if schema_root.exists():
                 shutil.rmtree(schema_root)
             if backup.exists():
@@ -153,13 +169,27 @@ def self_test() -> None:
             json.dumps({"release_repo": "openai/codex", "codex_version": "9.8.6", "targets": {target: {"asset": name, "sha256": "a"*64}}, "adapter_revision": 0}, indent=2) + "\n",
             encoding="utf-8",
         )
+        (root / "crates/provider-codex/src").mkdir(parents=True, exist_ok=True)
+        (root / "crates/provider-codex/tests").mkdir(parents=True, exist_ok=True)
+        (root / LIB_RS).write_text(
+            'const LAST_VALIDATED_CODEX_VERSION: &str = "9.8.6";\n',
+            encoding="utf-8",
+        )
+        (root / FAKE_CODEX).write_text(
+            '{"cliVersion": "9.8.6", "model": "fake-model"}\n',
+            encoding="utf-8",
+        )
+        real_lib = (REPO_ROOT / LIB_RS).read_text(encoding="utf-8")
+        real_fake = (REPO_ROOT / FAKE_CODEX).read_text(encoding="utf-8")
+        assert CODEX_VERSION_RE.search(real_lib), "unable to match LAST_VALIDATED_CODEX_VERSION pattern in repo/src/lib.rs"
+        assert FAKE_CLI_VERSION_RE.search(real_fake), "unable to match cliVersion pattern in repo/tests/fake_codex.py"
         code = None
         try:
             run_repin(
                 json.loads((pins / "codex-lock.json").read_text(encoding="utf-8")),
                 tag="rust-v9.8.7",
                 dry_run=False,
-                update_metadata=False,
+                update_metadata=True,
                 repo_root=root,
                 release_fn=lambda *_args: {"tag_name": "rust-v9.8.7", "assets": [{"name": name, "digest": "sha256:" + "a" * 64}]},
                 generate_schema_fn=lambda *_args: (_ for _ in ()).throw(
@@ -172,8 +202,59 @@ def self_test() -> None:
         except Exception as error:
             raise AssertionError(f"expected TarError, got {type(error).__name__}: {error}")
         assert code == 3
+
+    with tempfile.TemporaryDirectory(prefix=".codex-repin-selftest-", dir=Path(__file__).resolve().parent) as temp:
+        root = Path(temp) / "repo"
+        pins = root / "pins"
+        pins.mkdir(parents=True)
+        schema_root = pins / "codex-app-server-schema"
+        schema_root.mkdir()
+        new_lock = pins / "codex-lock.json"
+        (root / "crates/provider-codex/src").mkdir(parents=True, exist_ok=True)
+        (root / "crates/provider-codex/tests").mkdir(parents=True, exist_ok=True)
+        lock_contents = {
+            "release_repo": "openai/codex",
+            "codex_version": "9.8.6",
+            "targets": {target: {"asset": name, "sha256": "a"*64}},
+            "adapter_revision": 4,
+        }
+        new_lock.write_text(json.dumps(lock_contents, indent=2) + "\n", encoding="utf-8")
+        lib_path = root / LIB_RS
+        fake_path = root / FAKE_CODEX
+        lib_path.write_text('const LAST_VALIDATED_CODEX_VERSION: &str = "9.8.6";\n', encoding="utf-8")
+        fake_path.write_text('{"cliVersion": "9.8.6", "model": "fake-model"}\n', encoding="utf-8")
+
+        rewrites = update_last_validated_metadata("9.9.0", repo_root=root)
+        assert len(rewrites) == 2
+        updated_lib = lib_path.read_text(encoding="utf-8")
+        updated_fake = fake_path.read_text(encoding="utf-8")
+        assert 'const LAST_VALIDATED_CODEX_VERSION: &str = "9.9.0";' in updated_lib
+        assert '"cliVersion": "9.9.0"' in updated_fake
+
+        lock_json = json.loads(new_lock.read_text(encoding="utf-8"))
+        def write_fake_schema(_value: dict, _target: str, output: Path) -> dict:
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "schema.json").write_text("{}", encoding="utf-8")
+            return {"name": name, "digest": f"sha256:{'a' * 64}"}
+
+        run_repin(
+            lock_json,
+            tag="rust-v9.8.7",
+            dry_run=False,
+            update_metadata=True,
+            repo_root=root,
+            release_fn=lambda *_args: {"tag_name": "rust-v9.8.7", "assets": [{"name": name, "digest": "sha256:" + "a" * 64}]},
+            generate_schema_fn=write_fake_schema,
+        )
+        final_lock = json.loads((pins / "codex-lock.json").read_text(encoding="utf-8"))
+        final_lib = (root / LIB_RS).read_text(encoding="utf-8")
+        final_fake = (root / FAKE_CODEX).read_text(encoding="utf-8")
+        assert final_lock["codex_version"] == "9.8.7"
+        assert 'const LAST_VALIDATED_CODEX_VERSION: &str = "9.8.7";' in final_lib
+        assert '"cliVersion": "9.8.7"' in final_fake
     print("ok: lock rewrite self-test passed")
     print("ok: malformed archive path raises TarError")
+    print("ok: metadata rewrite self-test passed")
 
 
 def parse_args() -> argparse.Namespace:
