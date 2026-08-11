@@ -10,10 +10,11 @@ use yakshed_domain::{ConnectionId, CredentialSlot};
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery, HarnessCredentialRequirement,
     HarnessDescriptor, HarnessError, HarnessEvent, HarnessEventPermit, HarnessEventSender,
-    HarnessInput, HarnessRunTerminal, NativePayload, Page, ProviderEventStream,
-    ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle, ProviderRunId,
-    ProviderSession, ProviderSessionId, ProviderSessionSummary, RunOptions, RuntimeHandle,
-    SanitizedDiagnostic, SessionPageCursor, SessionQuery, StartSessionSpec, event_channel,
+    HarnessInput, HarnessRunTerminal, NativePayload, Page, ProviderCommandHandle,
+    ProviderCommandId, ProviderEventStream, ProviderRequestHandle, ProviderRequestId,
+    ProviderResponse, ProviderRunHandle, ProviderRunId, ProviderSession, ProviderSessionId,
+    ProviderSessionSummary, RunOptions, RuntimeHandle, SanitizedDiagnostic, SessionPageCursor,
+    SessionQuery, StartSessionSpec, event_channel,
 };
 
 /// Deterministic run/runtime faults. `DelayApproval` is released manually rather than by sleep.
@@ -769,11 +770,18 @@ impl MockHarness {
                     chunk,
                     native,
                 } => PendingDelivery {
-                    event: HarnessEvent::CommandOutputCompleted {
-                        run: run_handle.clone(),
-                        command,
-                        output: chunk,
-                        native: self.native(native),
+                    event: {
+                        let command_text = command.clone();
+                        let command_id =
+                            ProviderCommandId::new(command).expect("invalid command id");
+                        let command = ProviderCommandHandle::new(run_handle.clone(), command_id);
+                        HarnessEvent::CommandOutputCompleted {
+                            run: run_handle.clone(),
+                            command,
+                            command_text,
+                            output: chunk,
+                            native: self.native(native),
+                        }
                     },
                     commit: DeliveryCommit::Step {
                         terminal_after: None,

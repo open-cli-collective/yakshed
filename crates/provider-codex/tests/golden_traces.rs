@@ -14,8 +14,8 @@ const TRACES: &[(&str, &str, &[&str])] = &[
         "command-execution",
         include_str!("../test-data/golden/command-execution.jsonl"),
         &[
-            "command_delta:cargo test:ok",
-            "command_completed:cargo test:ok",
+            "command_delta:golden-runtime/thread-golden/turn-golden/command-1:ok",
+            "command_completed:golden-runtime/thread-golden/turn-golden/command-1:ok",
         ],
     ),
     (
@@ -125,10 +125,13 @@ fn reducer_scopes_colliding_item_ids_to_their_runs() {
             HarnessEvent::CommandOutputDelta {
                 run: actual,
                 command,
+                command_text,
                 ..
             } => {
                 assert_eq!(actual, *run);
-                assert_eq!(command, expected);
+                assert_eq!(&*command_text, expected);
+                assert_eq!(command.run(), run);
+                assert_eq!(command.native_id().as_str(), "command-1");
             }
             event => panic!("expected command output, got {event:?}"),
         }
@@ -146,14 +149,20 @@ fn reducer_scopes_colliding_item_ids_to_their_runs() {
         }
     });
     reducer.reduce(completed.to_string(), &completed, Some(run_a.clone()), None);
-    assert_eq!(command_for(&mut reducer, &run_a, "command-1"), "");
+    assert_eq!(
+        command_text_for(&mut reducer, &run_a, "command-1"),
+        Some(String::new())
+    );
 
     let terminal = serde_json::json!({
         "method": "turn/completed",
         "params": {"turn": {"status": "completed"}}
     });
     reducer.reduce(terminal.to_string(), &terminal, Some(run_b.clone()), None);
-    assert_eq!(command_for(&mut reducer, &run_b, "command-1"), "");
+    assert_eq!(
+        command_text_for(&mut reducer, &run_b, "command-1"),
+        Some(String::new())
+    );
 }
 
 #[test]
@@ -238,7 +247,11 @@ fn run_named(turn: &str) -> ProviderRunHandle {
     )
 }
 
-fn command_for(reducer: &mut Reducer, run: &ProviderRunHandle, item_id: &str) -> String {
+fn command_text_for(
+    reducer: &mut Reducer,
+    run: &ProviderRunHandle,
+    item_id: &str,
+) -> Option<String> {
     let value = serde_json::json!({
         "method": "item/commandExecution/outputDelta",
         "params": {"itemId": item_id, "delta": "output"}
@@ -249,7 +262,7 @@ fn command_for(reducer: &mut Reducer, run: &ProviderRunHandle, item_id: &str) ->
         .next()
         .unwrap()
     {
-        HarnessEvent::CommandOutputDelta { command, .. } => command,
+        HarnessEvent::CommandOutputDelta { command_text, .. } => Some(command_text),
         event => panic!("expected command output, got {event:?}"),
     }
 }

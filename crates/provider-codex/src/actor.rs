@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::Path,
     process::Stdio,
     sync::{
         Arc,
@@ -28,7 +29,7 @@ const DIAGNOSTIC_CAPACITY: usize = 32;
 pub enum RequestKind {
     EmptyObject,
     ThreadList,
-    Session,
+    Session { expected_thread_id: Option<String> },
     StartRun { session_id: ProviderSessionId },
     TurnSteer { expected_turn_id: ProviderRunId },
 }
@@ -223,6 +224,7 @@ async fn run_actor(
     ));
     let stderr = child.take_stderr().expect("spawned child has stderr");
     let stderr_task = tokio::spawn(read_stderr(stderr, inbound_tx));
+    let expected_home = normalize_codex_home(&spec.key.codex_home.to_string_lossy());
 
     let initialize = json!({
         "id": 1,
@@ -240,7 +242,10 @@ async fn run_actor(
                     if let Some(error) = value.get("error") {
                         return Err(classify_protocol_error(error, &sanitizer));
                     }
-                    if !value.get("result").is_some_and(valid_initialize_response) {
+                    if !value
+                        .get("result")
+                        .is_some_and(|result| valid_initialize_response(result, &expected_home))
+                    {
                         return Err(HarnessError::Protocol {
                             diagnostic: SanitizedDiagnostic::sanitized(
                                 "Codex initialize response did not match the pinned schema",
@@ -463,20 +468,54 @@ async fn run_actor(
     stderr_task.abort();
 }
 
-fn valid_initialize_response(value: &Value) -> bool {
+fn valid_initialize_response(value: &Value, expected_home: &str) -> bool {
     let Some(result) = value.as_object() else {
         return false;
     };
     result
         .get("codexHome")
         .and_then(Value::as_str)
-        .is_some_and(|path| std::path::Path::new(path).is_absolute())
+        .is_some_and(|path| {
+            let normalized = normalize_codex_home(path);
+            !normalized.is_empty() && Path::new(path).is_absolute() && normalized == expected_home
+        })
         && result
             .get("platformFamily")
             .and_then(Value::as_str)
             .is_some()
         && result.get("platformOs").and_then(Value::as_str).is_some()
         && result.get("userAgent").and_then(Value::as_str).is_some()
+}
+
+fn is_root(path: &str) -> bool {
+    if cfg!(windows) {
+        path.len() == 3 && path.as_bytes()[1] == b':' && matches!(path.as_bytes()[2], b'/' | b'\\')
+    } else {
+        path == "/"
+    }
+}
+
+fn normalize_codex_home(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let normalized = if is_root(trimmed) {
+        trimmed
+    } else {
+        trimmed.trim_end_matches(['/', '\\'].as_ref())
+    };
+    if is_root(trimmed) {
+        if cfg!(windows) {
+            return normalized.to_ascii_lowercase();
+        }
+        return normalized.to_owned();
+    }
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized.to_owned()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,12 +562,28 @@ async fn handle_frame(
             return Ok(());
         }
         match &pending_request.kind {
-            RequestKind::Session => {
+            RequestKind::Session { expected_thread_id } => {
                 if let Some(thread_id) = result
                     .get("thread")
                     .and_then(|thread| thread.get("id"))
                     .and_then(Value::as_str)
                 {
+                    if let Some(expected) = expected_thread_id
+                        && expected != thread_id
+                    {
+                        push_diagnostic(
+                            diagnostics,
+                            format!(
+                                "session resume returned mismatched thread id: expected {expected}, got {thread_id}"
+                            ),
+                        );
+                        let _ = pending_request.reply.send(Err(HarnessError::Protocol {
+                            diagnostic: SanitizedDiagnostic::sanitized(
+                                "session resume returned mismatched thread id",
+                            ),
+                        }));
+                        return Ok(());
+                    }
                     loaded_sessions.insert(thread_id.to_owned());
                 }
             }
@@ -686,7 +741,7 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
                     .get("nextCursor")
                     .is_none_or(|cursor| cursor.is_null() || cursor.is_string())
         }
-        RequestKind::Session => {
+        RequestKind::Session { expected_thread_id } => {
             has_fields(
                 object,
                 &[
@@ -706,6 +761,13 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
                     .is_some()
                 && object.get("sandbox").and_then(Value::as_object).is_some()
                 && object.get("thread").is_some_and(valid_thread)
+                && expected_thread_id.as_ref().is_none_or(|expected| {
+                    object
+                        .get("thread")
+                        .and_then(|thread| thread.get("id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|thread_id| thread_id == expected.as_str())
+                })
         }
         RequestKind::StartRun { .. } => object.get("turn").is_some_and(valid_turn),
         RequestKind::TurnSteer { expected_turn_id } => object

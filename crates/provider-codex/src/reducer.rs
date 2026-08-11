@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use yakshed_harness::{
-    HarnessEvent, HarnessRunTerminal, NativePayload, ProviderRequestHandle, ProviderRunHandle,
-    SanitizedDiagnostic,
+    HarnessEvent, HarnessRunTerminal, NativePayload, ProviderCommandHandle, ProviderCommandId,
+    ProviderRequestHandle, ProviderRunHandle, SanitizedDiagnostic,
 };
 
 #[derive(Default)]
 pub struct Reducer {
-    commands: HashMap<(ProviderRunHandle, String), String>,
+    commands: HashMap<ProviderCommandHandle, String>,
 }
 
 impl Reducer {
@@ -44,8 +44,14 @@ impl Reducer {
                 let id = require!(item.get("id").and_then(Value::as_str));
                 if item_type == "commandExecution" {
                     let command = require!(item.get("command").and_then(Value::as_str));
-                    self.commands
-                        .insert((event_run, id.to_owned()), command.to_owned());
+                    let command_id = match ProviderCommandId::new(id) {
+                        Ok(id) => id,
+                        Err(_) => return vec![malformed(Some(event_run), method, native)],
+                    };
+                    self.commands.insert(
+                        ProviderCommandHandle::new(event_run, command_id),
+                        command.to_owned(),
+                    );
                     Vec::new()
                 } else if matches!(item_type, "agentMessage" | "fileChange") {
                     Vec::new()
@@ -70,12 +76,19 @@ impl Reducer {
                 let event_run = require!(run.clone());
                 let item_id = require!(string(params, "itemId"));
                 let chunk = require!(string(params, "delta"));
+                let command = match ProviderCommandId::new(item_id) {
+                    Ok(id) => id,
+                    Err(_) => return vec![malformed(Some(event_run), method, native)],
+                };
+                let command_handle = ProviderCommandHandle::new(event_run.clone(), command);
+                let command_text = self
+                    .commands
+                    .get(&command_handle)
+                    .cloned()
+                    .unwrap_or_default();
                 vec![HarnessEvent::CommandOutputDelta {
-                    command: self
-                        .commands
-                        .get(&(event_run.clone(), item_id))
-                        .cloned()
-                        .unwrap_or_default(),
+                    command: command_handle,
+                    command_text,
                     run: event_run,
                     chunk,
                     native,
@@ -217,15 +230,20 @@ impl Reducer {
                     .collect()
             }
             Some("commandExecution") => {
-                self.commands
-                    .remove(&(event_run.clone(), item_id.to_owned()));
-                let Some(command) = string(item, "command") else {
-                    return vec![malformed(run, method, native)];
+                let command_id = match ProviderCommandId::new(item_id) {
+                    Ok(id) => id,
+                    Err(_) => return vec![malformed(Some(event_run), method, native)],
                 };
+                let command = ProviderCommandHandle::new(event_run.clone(), command_id);
+                let command_text = self
+                    .commands
+                    .remove(&command)
+                    .unwrap_or_else(|| string(item, "command").unwrap_or_default());
                 let output = string(item, "aggregatedOutput").unwrap_or_default();
                 vec![HarnessEvent::CommandOutputCompleted {
                     run: event_run,
                     command,
+                    command_text,
                     output,
                     native,
                 }]
@@ -240,8 +258,7 @@ impl Reducer {
     }
 
     pub(crate) fn retire_run(&mut self, run: &ProviderRunHandle) {
-        self.commands
-            .retain(|(command_run, _), _| command_run != run);
+        self.commands.retain(|handle, _| handle.run() != run);
     }
 }
 

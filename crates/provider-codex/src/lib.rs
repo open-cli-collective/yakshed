@@ -285,7 +285,9 @@ impl HarnessAdapter for CodexAdapter {
                 "thread/start",
                 json!({"cwd": spec.working_directory.as_str()}),
                 true,
-                RequestKind::Session,
+                RequestKind::Session {
+                    expected_thread_id: None,
+                },
             )
             .await?;
         let mut session = self.parse_session(&result, &spec.title)?;
@@ -317,7 +319,9 @@ impl HarnessAdapter for CodexAdapter {
                 "thread/resume",
                 json!({"threadId": id.as_str()}),
                 false,
-                RequestKind::Session,
+                RequestKind::Session {
+                    expected_thread_id: Some(id.as_str().to_owned()),
+                },
             )
             .await?;
         self.parse_session(&result, "Codex thread")

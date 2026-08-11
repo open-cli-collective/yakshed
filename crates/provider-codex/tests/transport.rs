@@ -227,6 +227,14 @@ transport_test!(malformed_initialize_never_marks_the_runtime_ready, {
     ));
 });
 
+transport_test!(initialize_home_mismatch_is_protocol_error, {
+    let test = adapter("initialize_home_mismatch", 1024 * 1024, None);
+    assert!(matches!(
+        test.adapter.capabilities(&test.runtime).await,
+        Err(HarnessError::Protocol { .. })
+    ));
+});
+
 transport_test!(failed_name_set_is_best_effort_after_session_creation, {
     let test = adapter("malformed_name_ack", 1024 * 1024, None);
     let created = session(&test).await;
@@ -251,6 +259,17 @@ transport_test!(failed_name_set_is_best_effort_after_session_creation, {
             .iter()
             .any(|diagnostic| diagnostic.contains("outcome is unknown"))
     );
+});
+
+transport_test!(resume_session_mismatched_thread_id_is_protocol_error, {
+    let test = adapter("resume_mismatched_thread", 1024 * 1024, None);
+    let created = session(&test).await;
+    assert!(matches!(
+        test.adapter
+            .resume_session(&test.runtime, &created.id)
+            .await,
+        Err(HarnessError::Protocol { .. })
+    ));
 });
 
 transport_test!(

@@ -347,6 +347,20 @@ for line in sys.stdin:
         if SCENARIO == "malformed_initialize":
             emit({"id": request_id, "result": {}})
             continue
+        if SCENARIO == "initialize_home_mismatch":
+            emit(
+                {
+                    "id": request_id,
+                    "result": {
+                        "codexHome": os.environ["CODEX_HOME"] + "-mismatch",
+                        "platformFamily": "unix",
+                        "platformOs": "test",
+                        "userAgent": "fake-codex",
+                    },
+                },
+                split=SCENARIO in ("chunked", "transport_split_batch"),
+            )
+            continue
         emit(
             {
                 "id": request_id,
@@ -396,6 +410,9 @@ for line in sys.stdin:
             emit({"id": request_id, "result": {"data": page, "nextCursor": next_cursor}})
         elif method == "thread/resume":
             selected = next(item for item in threads if item["id"] == message["params"]["threadId"])
+            if SCENARIO == "resume_mismatched_thread":
+                selected = selected.copy()
+                selected["id"] = "thread-mismatch"
             emit({"id": request_id, "result": session_response(selected)})
         elif method == "turn/start":
             if SCENARIO == "shutdown_settlement" and active is not None:
