@@ -520,6 +520,8 @@ pub enum ConfigPortError {
     NotFound,
     #[error("unsupported operation")]
     Unsupported,
+    #[error("credential migration is pending")]
+    MigrationPending,
     #[error("configuration service unavailable")]
     Unavailable,
 }
@@ -544,6 +546,8 @@ pub enum SecretPortError {
     AlreadyExists,
     #[error("secret write outcome is uncertain")]
     UncertainWrite,
+    #[error("credential migration is pending")]
+    MigrationPending,
     #[error("credential operation failed")]
     Failed,
 }

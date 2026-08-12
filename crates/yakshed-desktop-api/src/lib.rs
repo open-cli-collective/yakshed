@@ -1227,6 +1227,9 @@ fn map_config_error(error: ConfigPortError) -> DesktopError {
             DesktopError::conflict("configuration revision conflict")
         }
         ConfigPortError::Validation => DesktopError::invalid_request("configuration is invalid"),
+        ConfigPortError::MigrationPending => {
+            DesktopError::conflict("credential migration is pending")
+        }
         ConfigPortError::NotFound => DesktopError::not_found("configuration entry not found"),
         ConfigPortError::Unsupported | ConfigPortError::Unavailable => {
             DesktopError::unsupported("configuration unavailable")
@@ -1250,6 +1253,9 @@ fn map_secret_error(error: SecretPortError) -> DesktopError {
         }
         SecretPortError::AlreadyExists => DesktopError::conflict("credential already exists"),
         SecretPortError::UncertainWrite => DesktopError::outcome_unknown("secret write uncertain"),
+        SecretPortError::MigrationPending => {
+            DesktopError::conflict("credential migration is pending")
+        }
         SecretPortError::NotSecretBacked => {
             DesktopError::unsupported("credential binding is not secret-backed")
         }

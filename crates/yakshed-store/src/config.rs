@@ -433,7 +433,7 @@ impl StoreInner {
             });
         }
 
-        let mut config = current.config;
+        let mut config = current.config.clone();
         apply_change(&mut config, change)?;
         validate_config(&config, self.backend_capabilities)?;
         let revision = current
@@ -443,16 +443,44 @@ impl StoreInner {
             .ok_or_else(|| ConfigError::Validation("config revision overflow".to_owned()))?;
 
         #[cfg(test)]
-        {
+        let write_result = {
             let fault = self
                 .next_write_fault
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            write_config_with_hook(&self.config_path, &config, || apply_fault(fault))?;
-        }
+            match fault {
+                Some(WriteFault::AfterCommit) => {
+                    write_config(&self.config_path, &config).and_then(|()| {
+                        Err(ConfigError::Io {
+                            path: self.config_path.clone(),
+                            source: io::Error::other("injected post-commit failure"),
+                        })
+                    })
+                }
+                fault => write_config_with_hook(&self.config_path, &config, || apply_fault(fault)),
+            }
+        };
         #[cfg(not(test))]
-        write_config(&self.config_path, &config)?;
+        let write_result = write_config(&self.config_path, &config);
+
+        if let Err(error) = write_result {
+            if let Ok(observed) = read_config(&self.config_path, self.backend_capabilities) {
+                let observed_revision = if observed == current.config {
+                    current.revision
+                } else {
+                    ConfigRevision::new(revision)
+                };
+                *self
+                    .state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = ConfigSnapshot {
+                    revision: observed_revision,
+                    config: observed,
+                };
+            }
+            return Err(error);
+        }
 
         let snapshot = ConfigSnapshot {
             revision: ConfigRevision::new(revision),
@@ -787,6 +815,7 @@ impl From<PathError> for ConfigError {
 #[cfg(test)]
 enum WriteFault {
     Permission,
+    AfterCommit,
     Slow {
         started: Arc<std::sync::atomic::AtomicBool>,
         finished: Arc<std::sync::atomic::AtomicBool>,
@@ -801,6 +830,7 @@ fn apply_fault(fault: Option<WriteFault>) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "injected temp-file permission failure",
         )),
+        Some(WriteFault::AfterCommit) => unreachable!("handled around the commit"),
         Some(WriteFault::Slow {
             started,
             finished,
@@ -1048,6 +1078,79 @@ mod tests {
             &mut config,
             ConfigChange::FinishCredentialMigration,
         )));
+    }
+
+    #[tokio::test]
+    async fn post_commit_error_adopts_durable_migration_checkpoint() {
+        const CAPABILITIES: &[SecretBackendCapability] = &[
+            SecretBackendCapability::available("local-file"),
+            SecretBackendCapability::available("local-os"),
+        ];
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let store = ConfigStore::open(paths.clone(), CAPABILITIES).unwrap();
+        let source = SecretBackend {
+            id: SecretBackendId::new("legacy-local-file").unwrap(),
+            settings: SecretBackendSettings::LocalFile {
+                path: temp
+                    .path()
+                    .join("secrets.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        };
+        let target = SecretBackend {
+            id: SecretBackendId::new("local-os").unwrap(),
+            settings: SecretBackendSettings::LocalOs,
+        };
+        let snapshot = store
+            .update(
+                ConfigRevision::INITIAL,
+                ConfigChange::PutSecretBackend(source.clone()),
+            )
+            .await
+            .unwrap();
+        let snapshot = store
+            .update(
+                snapshot.revision,
+                ConfigChange::BeginCredentialMigration(CredentialMigrationRecord {
+                    source,
+                    target: target.clone(),
+                    phase: CredentialMigrationPhase::Copying,
+                    locators: Vec::new(),
+                    receipts: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        *store
+            .inner
+            .next_write_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(WriteFault::AfterCommit);
+
+        assert!(matches!(
+            store
+                .update(
+                    snapshot.revision,
+                    ConfigChange::CheckpointCredentialMigration,
+                )
+                .await,
+            Err(ConfigError::Io { .. })
+        ));
+        let in_memory = store.snapshot();
+        assert_eq!(
+            in_memory
+                .config
+                .credential_migration
+                .as_ref()
+                .unwrap()
+                .phase,
+            CredentialMigrationPhase::CleanupPending
+        );
+        assert_eq!(in_memory.config.secret_backends, vec![target]);
+        let reopened = ConfigStore::open(paths, CAPABILITIES).unwrap().snapshot();
+        assert_eq!(reopened.config, in_memory.config);
     }
 
     #[tokio::test]
