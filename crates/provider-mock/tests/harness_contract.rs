@@ -42,7 +42,7 @@ fn mock_declares_credential_delivery_per_slot() {
 
     assert!(requirements.iter().any(|requirement| {
         requirement.slot.as_str() == "codex.account"
-            && requirement.delivery == HarnessCredentialDelivery::HarnessManaged
+            && requirement.delivery == HarnessCredentialDelivery::Delegated
     }));
     assert!(requirements.iter().any(|requirement| {
         requirement.slot.as_str() == "anthropic.api_key"

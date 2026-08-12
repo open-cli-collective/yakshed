@@ -361,7 +361,7 @@ def delegated_connection() -> Mapping[str, Any]:
                 "slot": "codex.account",
                 "source": "delegated",
                 "authority": "mock-delegated",
-                "delivery": {"kind": "harness_managed"},
+                "delivery": {"kind": "delegated"},
             }
         ],
     }
@@ -449,8 +449,8 @@ def run_contract(args: argparse.Namespace, root: Path, canaries: CanarySet) -> N
         require(
             delegated_credentials
             and delegated_credentials[0].get("status") == "delegated"
-            and delegated_credentials[0].get("delivery") == {"kind": "harness_managed"},
-            "delegated harness-managed delivery was not preserved",
+            and delegated_credentials[0].get("delivery") == {"kind": "delegated"},
+            "delegated delivery was not preserved",
         )
 
         host.request(

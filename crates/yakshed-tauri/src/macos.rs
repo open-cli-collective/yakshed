@@ -4,9 +4,9 @@ use tokio::sync::broadcast;
 use yakshed_desktop_api::{
     ApiPorts, ApprovalDecisionInput, ArtifactListEnvelope, ConfigRevision, ConnectionEnvelope,
     ConnectionInput, ConnectionListEnvelope, CredentialSlot, DesktopApi, DesktopErrorCode,
-    FrontendEvent, FrontendRunSnapshot, OpenArtifactEnvelope, PendingUserInputPageEnvelope,
-    RunApprovalPageEnvelope, RunId, SecretWriteEnvelope, WorkItemListEnvelope,
-    WorkItemSnapshotEnvelope, WorkItemTimelineEnvelope,
+    FrontendAccountStatus, FrontendEvent, FrontendRunSnapshot, OpenArtifactEnvelope,
+    PendingUserInputPageEnvelope, RunApprovalPageEnvelope, RunId, SecretWriteEnvelope,
+    WorkItemListEnvelope, WorkItemSnapshotEnvelope, WorkItemTimelineEnvelope,
 };
 
 pub use yakshed_desktop_api::{StartupError, StartupErrorCode};
@@ -210,6 +210,15 @@ command!(set_connection_credential(
         )
         .await
     });
+command!(account_status(state; connection_id: String) -> FrontendAccountStatus {
+    state.account_status(parse_domain_id("connection_id", connection_id)?).await
+});
+command!(account_login_start(state; connection_id: String) -> FrontendAccountStatus {
+    state.account_login_start(parse_domain_id("connection_id", connection_id)?).await
+});
+command!(account_logout(state; connection_id: String) -> () {
+    state.account_logout(parse_domain_id("connection_id", connection_id)?).await
+});
 command!(list_artifacts(state; work_item_id: String) -> ArtifactListEnvelope {
     state
         .list_artifacts(parse_domain_id("work_item_id", work_item_id)?)

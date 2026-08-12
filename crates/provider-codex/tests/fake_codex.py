@@ -19,6 +19,7 @@ initialized = False
 active = None
 boundary_errors = set()
 recorded = {}
+account_state = "none" if SCENARIO.startswith("account_login") else "authenticated"
 
 
 def record_golden(value):
@@ -436,7 +437,28 @@ for line in sys.stdin:
         initialized = True
     else:
         assert initialized, "request arrived before initialized notification"
-        if method == "thread/start":
+        if method == "account/read":
+            account = None
+            if account_state == "authenticated":
+                account = {"type": "chatgpt", "email": "yak@example.test", "planType": "plus"}
+            elif account_state == "unknown":
+                account = {"type": "apiKey"}
+            emit({"id": request_id, "result": {"account": account, "requiresOpenaiAuth": True}})
+        elif method == "account/login/start":
+            assert message["params"]["type"] == "chatgpt"
+            assert "apiKey" not in message["params"]
+            emit({"id": request_id, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": "https://auth.example.test/login-1"}})
+            if SCENARIO == "account_login_failure":
+                account_state = "unknown"
+                emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": False, "error": "YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT"}})
+            else:
+                account_state = "authenticated"
+                emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": True, "error": None}})
+        elif method == "account/logout":
+            account_state = "none"
+            emit({"id": request_id, "result": {}})
+            emit({"method": "account/updated", "params": {"authMode": None}})
+        elif method == "thread/start":
             thread_id = f"thread-{len(threads) + 1}"
             value = thread(thread_id, message["params"]["cwd"])
             threads.append(value)

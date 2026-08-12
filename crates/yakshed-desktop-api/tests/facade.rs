@@ -1833,6 +1833,7 @@ fn map_harness_error(error: HarnessError) -> yakshed_application::HarnessPortErr
         }
         HarnessError::Overloaded => yakshed_application::HarnessPortError::Overloaded,
         HarnessError::Disconnected => yakshed_application::HarnessPortError::Disconnected,
+        HarnessError::NotAuthenticated => yakshed_application::HarnessPortError::NotAuthenticated,
         HarnessError::OutcomeUnknown { operation } => {
             yakshed_application::HarnessPortError::OutcomeUnknown { operation }
         }

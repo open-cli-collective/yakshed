@@ -46,6 +46,9 @@
             "allow-connection-get",
             "allow-list-connections",
             "allow-set-connection-credential",
+            "allow-account-status",
+            "allow-account-login-start",
+            "allow-account-logout",
             "allow-list-artifacts",
             "allow-open-artifact",
             "allow-clear-cache"

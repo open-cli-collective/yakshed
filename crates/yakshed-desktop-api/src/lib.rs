@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 pub use yakshed_application::RunOrchestrationError;
 use yakshed_application::{
-    AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
-    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem,
+    AccountStatus, AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort,
+    CachePortError, Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem,
     CredentialMigrationPendingReason, CredentialMigrationStatus, IdGenerator, ListWorkItems,
     OpenArtifactCommand, OpenArtifactPayload, PublicCredentialBinding, PublicCredentialSource,
     PutConnectionCommand, RunHarness, RunSupervisor, SecretPort, SecretPortError,
@@ -46,6 +46,7 @@ pub enum DesktopErrorCode {
     NotFound,
     Unsupported,
     BackendUnavailable,
+    NotAuthenticated,
     PersistenceError,
     OutcomeUnknown,
     InternalError,
@@ -134,6 +135,28 @@ pub enum FrontendRunStatus {
     Interrupted,
     Disconnected,
     OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum FrontendAccountStatus {
+    NotAuthenticated,
+    LoginInProgress { login_id: String, auth_url: String },
+    Authenticated { email: Option<String>, plan: String },
+    Unknown,
+}
+
+impl From<AccountStatus> for FrontendAccountStatus {
+    fn from(status: AccountStatus) -> Self {
+        match status {
+            AccountStatus::NotAuthenticated => Self::NotAuthenticated,
+            AccountStatus::LoginInProgress { login_id, auth_url } => {
+                Self::LoginInProgress { login_id, auth_url }
+            }
+            AccountStatus::Authenticated { email, plan } => Self::Authenticated { email, plan },
+            AccountStatus::Unknown => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -747,6 +770,35 @@ impl DesktopApi {
             .id)
     }
 
+    pub async fn account_status(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<FrontendAccountStatus> {
+        self.run_supervisor
+            .account_status(connection_id)
+            .await
+            .map(Into::into)
+            .map_err(map_run_error)
+    }
+
+    pub async fn account_login_start(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<FrontendAccountStatus> {
+        self.run_supervisor
+            .account_login_start(connection_id)
+            .await
+            .map(Into::into)
+            .map_err(map_run_error)
+    }
+
+    pub async fn account_logout(&self, connection_id: ConnectionId) -> Result<()> {
+        self.run_supervisor
+            .account_logout(connection_id)
+            .await
+            .map_err(map_run_error)
+    }
+
     pub async fn steer_run(&self, run_id: RunId, message: impl Into<String>) -> Result<()> {
         let message = message.into();
         validate_text_limit(
@@ -1185,6 +1237,10 @@ fn map_run_error(error: RunOrchestrationError) -> DesktopError {
             yakshed_application::HarnessPortError::Unsupported(_) => {
                 DesktopError::unsupported("operation unsupported")
             }
+            yakshed_application::HarnessPortError::NotAuthenticated => DesktopError::new(
+                DesktopErrorCode::NotAuthenticated,
+                "connection is not authenticated",
+            ),
             yakshed_application::HarnessPortError::Disconnected => {
                 DesktopError::unsupported("harness disconnected")
             }

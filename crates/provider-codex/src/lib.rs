@@ -15,11 +15,11 @@ use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 use yakshed_domain::{ConnectionId, CredentialSlot};
 use yakshed_harness::{
-    HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery, HarnessCredentialRequirement,
-    HarnessDescriptor, HarnessError, HarnessInput, Page, ProviderEventStream,
-    ProviderRequestHandle, ProviderResponse, ProviderRunHandle, ProviderRunId, ProviderSession,
-    ProviderSessionId, ProviderSessionSummary, RunOptions, RuntimeHandle, RuntimePath,
-    SessionPageCursor, SessionQuery, StartSessionSpec, event_channel,
+    HarnessAccountStatus, HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery,
+    HarnessCredentialRequirement, HarnessDescriptor, HarnessError, HarnessInput, Page,
+    ProviderEventStream, ProviderRequestHandle, ProviderResponse, ProviderRunHandle, ProviderRunId,
+    ProviderSession, ProviderSessionId, ProviderSessionSummary, RunOptions, RuntimeHandle,
+    RuntimePath, SessionPageCursor, SessionQuery, StartSessionSpec, event_channel,
 };
 
 // Metadata only; runtime compatibility is intentionally not gated. See pins/codex-lock.json.
@@ -217,8 +217,69 @@ impl HarnessAdapter for CodexAdapter {
     fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement> {
         vec![HarnessCredentialRequirement {
             slot: CredentialSlot::new("codex.account").expect("constant slot is valid"),
-            delivery: HarnessCredentialDelivery::HarnessManaged,
+            delivery: HarnessCredentialDelivery::Delegated,
         }]
+    }
+
+    async fn account_status(
+        &self,
+        runtime: &RuntimeHandle,
+    ) -> Result<HarnessAccountStatus, HarnessError> {
+        let result = self
+            .runtime(runtime)
+            .await?
+            .request(
+                "account/read",
+                json!({"refreshToken": false}),
+                false,
+                RequestKind::AccountRead,
+            )
+            .await?;
+        let Some(account) = result.get("account").filter(|account| !account.is_null()) else {
+            return Ok(HarnessAccountStatus::NotAuthenticated);
+        };
+        if account.get("type").and_then(Value::as_str) != Some("chatgpt") {
+            return Ok(HarnessAccountStatus::Unknown);
+        }
+        Ok(HarnessAccountStatus::Authenticated {
+            email: account
+                .get("email")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            plan: account
+                .get("planType")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        })
+    }
+
+    async fn account_login_start(
+        &self,
+        runtime: &RuntimeHandle,
+    ) -> Result<HarnessAccountStatus, HarnessError> {
+        let result = self
+            .runtime(runtime)
+            .await?
+            .request(
+                "account/login/start",
+                json!({"type": "chatgpt", "useHostedLoginSuccessPage": true}),
+                true,
+                RequestKind::AccountLoginStart,
+            )
+            .await?;
+        Ok(HarnessAccountStatus::LoginInProgress {
+            login_id: required_string(&result, "loginId")?.to_owned(),
+            auth_url: required_string(&result, "authUrl")?.to_owned(),
+        })
+    }
+
+    async fn account_logout(&self, runtime: &RuntimeHandle) -> Result<(), HarnessError> {
+        self.runtime(runtime)
+            .await?
+            .request("account/logout", json!({}), true, RequestKind::EmptyObject)
+            .await?;
+        Ok(())
     }
 
     async fn capabilities(
@@ -340,6 +401,12 @@ impl HarnessAdapter for CodexAdapter {
             return Err(HarnessError::InvalidInput(
                 "session does not belong to this Codex runtime".to_owned(),
             ));
+        }
+        if !matches!(
+            self.account_status(&session.runtime).await?,
+            HarnessAccountStatus::Authenticated { .. }
+        ) {
+            return Err(HarnessError::NotAuthenticated);
         }
         let result = self
             .runtime(&session.runtime)

@@ -28,6 +28,8 @@ const DIAGNOSTIC_CAPACITY: usize = 32;
 
 pub enum RequestKind {
     EmptyObject,
+    AccountRead,
+    AccountLoginStart,
     ThreadList,
     Session { expected_thread_id: Option<String> },
     StartRun { session_id: ProviderSessionId },
@@ -677,7 +679,11 @@ async fn handle_frame(
                         .await;
                 }
             }
-            RequestKind::EmptyObject | RequestKind::ThreadList | RequestKind::TurnSteer { .. } => {}
+            RequestKind::EmptyObject
+            | RequestKind::AccountRead
+            | RequestKind::AccountLoginStart
+            | RequestKind::ThreadList
+            | RequestKind::TurnSteer { .. } => {}
         }
         let _ = pending_request.reply.send(Ok(result));
         return Ok(());
@@ -688,6 +694,12 @@ async fn handle_frame(
         .and_then(Value::as_str)
         .unwrap_or("codex.unknown")
         .to_owned();
+    if matches!(
+        method.as_str(),
+        "account/login/completed" | "account/updated"
+    ) {
+        return Ok(());
+    }
     let mut safe_value = value;
     sanitizer.sanitize_value(&mut safe_value);
     let run = run_for_message(&safe_value, runs);
@@ -801,6 +813,28 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
     };
     match kind {
         RequestKind::EmptyObject => object.is_empty(),
+        RequestKind::AccountRead => {
+            object
+                .get("requiresOpenaiAuth")
+                .and_then(Value::as_bool)
+                .is_some()
+                && object.get("account").is_none_or(|account| {
+                    account.is_null()
+                        || account.as_object().is_some_and(|account| {
+                            account
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| {
+                                    matches!(kind, "apiKey" | "chatgpt" | "amazonBedrock")
+                                })
+                        })
+                })
+        }
+        RequestKind::AccountLoginStart => {
+            object.get("type").and_then(Value::as_str) == Some("chatgpt")
+                && object.get("loginId").and_then(Value::as_str).is_some()
+                && object.get("authUrl").and_then(Value::as_str).is_some()
+        }
         RequestKind::ThreadList => {
             object
                 .get("data")

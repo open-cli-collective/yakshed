@@ -1040,6 +1040,7 @@ fn work_json(item: &WorkItemSnapshot) -> Value {
 fn delivery_json(delivery: &HarnessCredentialDelivery) -> Value {
     match delivery {
         HarnessCredentialDelivery::HarnessManaged => json!({"kind": "harness_managed"}),
+        HarnessCredentialDelivery::Delegated => json!({"kind": "delegated"}),
         HarnessCredentialDelivery::ProcessEnvironment { variable } => {
             json!({"kind": "process_environment", "variable": variable})
         }
@@ -1064,7 +1065,7 @@ fn validate_binding_requirement(
         (binding, delivery),
         (
             CredentialBinding::Delegated { .. },
-            HarnessCredentialDelivery::HarnessManaged
+            HarnessCredentialDelivery::HarnessManaged | HarnessCredentialDelivery::Delegated
         ) | (
             CredentialBinding::Secret { .. },
             HarnessCredentialDelivery::ProcessEnvironment { .. }
@@ -1084,6 +1085,7 @@ fn validate_requested_delivery(
 ) -> Result<(), HostError> {
     match (requested, declared) {
         (DeliveryInput::HarnessManaged, HarnessCredentialDelivery::HarnessManaged) => Ok(()),
+        (DeliveryInput::Delegated, HarnessCredentialDelivery::Delegated) => Ok(()),
         (
             DeliveryInput::ProcessEnvironment {
                 variable: requested,
@@ -1305,6 +1307,7 @@ enum CredentialInput {
 enum DeliveryInput {
     ProcessEnvironment { variable: String },
     HarnessManaged,
+    Delegated,
 }
 
 #[derive(Deserialize)]

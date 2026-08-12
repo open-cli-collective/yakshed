@@ -378,6 +378,7 @@ fn map_harness_error(error: HarnessError) -> HarnessPortError {
         HarnessError::Unsupported(message) => HarnessPortError::Unsupported(message.to_owned()),
         HarnessError::Overloaded => HarnessPortError::Overloaded,
         HarnessError::Disconnected => HarnessPortError::Disconnected,
+        HarnessError::NotAuthenticated => HarnessPortError::NotAuthenticated,
         HarnessError::OutcomeUnknown { operation } => {
             HarnessPortError::OutcomeUnknown { operation }
         }
@@ -721,6 +722,18 @@ async fn every_registered_handler_is_invocable_against_a_real_desktop_api() {
     )
     .unwrap();
     call!("list_connections", json!({})).unwrap();
+    let _ = call!(
+        "account_status",
+        json!({ "connectionId": fixture.connection_id })
+    );
+    let _ = call!(
+        "account_login_start",
+        json!({ "connectionId": fixture.connection_id })
+    );
+    let _ = call!(
+        "account_logout",
+        json!({ "connectionId": fixture.connection_id })
+    );
     call!(
         "set_connection_credential",
         json!({ "connectionId": fixture.connection_id.to_string(), "slot": "mock.api_key", "value": "secret", "overwrite": false })

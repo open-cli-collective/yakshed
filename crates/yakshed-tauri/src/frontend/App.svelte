@@ -3,6 +3,7 @@
   import {
     client,
     type Approval,
+    type AccountStatus,
     type Connection,
     type CredentialMigrationStatus,
     type DesktopError,
@@ -25,6 +26,7 @@
   let connections: Connection[] = [];
   let configRevision = 0;
   let credentialMigration: CredentialMigrationStatus = { status: "ready" };
+  let account: AccountStatus = { state: "unknown" };
   let loading = true;
   let error: DesktopError | null = null;
   let uncertain: string | null = null;
@@ -47,6 +49,7 @@
       connections = listedConnections.connections;
       configRevision = listedConnections.config_revision;
       credentialMigration = listedConnections.credential_migration;
+      await refreshAccount();
       try {
         await client.createProject(PROJECT_ID, "YakShed");
       } catch (cause) {
@@ -130,6 +133,10 @@
     } catch (cause) {
       const problem = desktopError(cause);
       if (problem.code === "outcome_unknown") uncertain = "Run start may have succeeded. Reconcile before retrying.";
+      else if (problem.code === "not_authenticated") {
+        account = { state: "not_authenticated" };
+        settingsOpen = true;
+      }
       else error = problem;
     }
   }
@@ -189,22 +196,41 @@
         harness: "codex",
         model_provider: String(data.get("provider")),
         provider_state: `connection-${id}`,
-        credentials: [{ slot: "codex.account", source: "secret", backend: "local-os", locator: `${id}-account` }],
+        credentials: [{ slot: "codex.account", source: "delegated", authority: "codex-app-server" }],
       },
     );
     connections = [...connections, saved.connection];
     configRevision = saved.config_revision;
+    await refreshAccount();
     form.reset();
   }
 
-  async function writeCredential(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async function login(): Promise<void> {
     if (!connections[0]) return;
-    const form = event.currentTarget as HTMLFormElement;
-    const value = String(new FormData(form).get("credential") ?? "");
-    if (!value) return;
-    await client.setCredential(connections[0].id, "codex.account", value, true);
-    form.reset();
+    try {
+      account = await client.accountLoginStart(connections[0].id);
+    } catch {
+      account = { state: "unknown" };
+    }
+  }
+
+  async function refreshAccount(): Promise<void> {
+    if (!connections[0]) return;
+    try {
+      account = await client.accountStatus(connections[0].id);
+    } catch {
+      account = { state: "unknown" };
+    }
+  }
+
+  async function logout(): Promise<void> {
+    if (!connections[0]) return;
+    try {
+      await client.accountLogout(connections[0].id);
+      account = { state: "not_authenticated" };
+    } catch {
+      account = { state: "unknown" };
+    }
   }
 
   function toggleTheme(): void {
@@ -318,12 +344,23 @@
           <button>Add connection</button>
         </form>
         {#if connections[0]}
-          <form onsubmit={(event) => void writeCredential(event)}>
+          <section class="account-status" aria-live="polite">
             <p><strong>{connections[0].name}</strong></p>
-            <label for="credential">API credential <small>write-only</small></label>
-            <input id="credential" name="credential" type="password" autocomplete="off" required />
-            <button>Store credential</button>
-          </form>
+            {#if account.state === "authenticated"}
+              <p>Signed in{account.email ? ` as ${account.email}` : ""} · {account.plan}</p>
+              <button type="button" onclick={() => void logout()}>Sign out</button>
+            {:else if account.state === "login_in_progress"}
+              <p>Sign-in is waiting in your browser.</p>
+              <a href={account.auth_url} target="_blank" rel="noreferrer">Continue sign-in</a>
+              <button type="button" onclick={() => void refreshAccount()}>Refresh status</button>
+            {:else if account.state === "not_authenticated"}
+              <p>Codex is not authenticated for this connection.</p>
+              <button type="button" onclick={() => void login()}>Sign in with Codex</button>
+            {:else}
+              <p>Codex account status is unknown.</p>
+              <button type="button" onclick={() => void login()}>Try sign-in</button>
+            {/if}
+          </section>
         {/if}
       </aside>
     {/if}

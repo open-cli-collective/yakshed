@@ -7,6 +7,7 @@ test.beforeEach(async ({ page }) => {
     let configRevision = 0;
     let workItem: Record<string, unknown> | null = null;
     let connection: Record<string, unknown> | null = null;
+    let account: Record<string, unknown> = { state: "not_authenticated" };
     let run: Record<string, unknown> | null = null;
     let approvals: Array<Record<string, unknown>> = [];
     let inputs: Array<Record<string, unknown>> = [];
@@ -35,6 +36,16 @@ test.beforeEach(async ({ page }) => {
             configRevision += 1;
             return { config_revision: configRevision, connection };
           case "set_connection_credential": return { overwritten: true };
+          case "account_status":
+            if (sessionStorage.getItem("codex-missing")) throw { code: "unsupported", message: "Codex unavailable" };
+            if (account.state === "login_in_progress") {
+              account = { state: "authenticated", email: "yak@example.test", plan: "plus" };
+            }
+            return account;
+          case "account_login_start":
+            account = { state: "login_in_progress", login_id: "login-1", auth_url: "https://auth.example.test/login-1" };
+            return account;
+          case "account_logout": account = { state: "not_authenticated" }; return undefined;
           case "list_work_items": return { items: workItem ? [{ work_item: { ...workItem, revision }, revision }] : [], next_after: null };
           case "create_work_item":
             workItem = { id: "work-1", project_id: args.projectId, title: args.title, status: "active", parent_id: null, revision, created_at_ms: now, updated_at_ms: now };
@@ -45,6 +56,7 @@ test.beforeEach(async ({ page }) => {
           case "get_run_approval_page": return { work_item_revision: revision, approvals, next_after: null };
           case "get_pending_user_input_page": return { work_item_revision: revision, inputs, next_after: null };
           case "start_run": {
+            if (account.state !== "authenticated") throw { code: "not_authenticated", message: "Codex account is not authenticated" };
             run = { id: "run-1", connection_id: connection?.id, work_item_id: workItem?.id, status: "running", created_at_ms: now, ended_at_ms: null };
             revision += 2;
             timeline = [
@@ -110,10 +122,11 @@ test("runs the product loop through approval, input, interrupt, and reconciliati
   await page.getByLabel("Name").fill("Scripted mock");
   await page.getByLabel("Model provider").fill("codex");
   await page.getByRole("button", { name: "Add connection" }).click();
-  await page.getByLabel(/API credential/).fill("S5-CANARY-NEVER-RENDER");
-  await page.getByRole("button", { name: "Store credential" }).click();
-  await expect(page.getByLabel(/API credential/)).toHaveValue("");
-  await expect(page.locator("body")).not.toContainText("S5-CANARY-NEVER-RENDER");
+  await expect(page.getByText("Codex is not authenticated for this connection.")).toBeVisible();
+  await page.getByRole("button", { name: "Sign in with Codex" }).click();
+  await expect(page.getByRole("link", { name: "Continue sign-in" })).toHaveAttribute("href", "https://auth.example.test/login-1");
+  await page.getByRole("button", { name: "Refresh status" }).click();
+  await expect(page.getByText("Signed in as yak@example.test · plus")).toBeVisible();
   await page.getByRole("button", { name: "Close connections" }).click();
 
   await page.getByLabel("New work item").fill("Ship the desktop shell");
@@ -156,4 +169,15 @@ test("surfaces a locked keychain migration without failing startup", async ({ pa
   await expect(page.getByText("CREDENTIAL MIGRATION PENDING")).toBeVisible();
   await expect(page.getByText(/Keychain migration is locked/)).toBeVisible();
   await expect(page.getByText("STARTUP FAILED", { exact: false })).toHaveCount(0);
+});
+
+test("a missing Codex runtime leaves the account status unknown without failing startup", async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem("codex-missing", "1"));
+  await page.goto("/");
+  await page.getByRole("button", { name: /Connections/ }).click();
+  await page.getByLabel("Name").fill("Codex unavailable");
+  await page.getByLabel("Model provider").fill("codex");
+  await page.getByRole("button", { name: "Add connection" }).click();
+  await expect(page.getByText("Codex account status is unknown.")).toBeVisible();
+  await expect(page.getByText("YakShed could not open.")).not.toBeVisible();
 });

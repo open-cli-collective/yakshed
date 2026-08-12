@@ -868,7 +868,7 @@ impl HarnessAdapter for MockHarness {
 
     fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement> {
         [
-            ("codex.account", HarnessCredentialDelivery::HarnessManaged),
+            ("codex.account", HarnessCredentialDelivery::Delegated),
             (
                 "anthropic.api_key",
                 HarnessCredentialDelivery::ProcessEnvironment {

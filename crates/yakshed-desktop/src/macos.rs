@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use provider_codex::{CodexAdapter, CodexRuntimeKey, CodexRuntimeSpec};
 use tokio::sync::{Mutex, Notify, mpsc};
 use yakshed_application::{
-    ArtifactPort, ArtifactPortError, CachePort, CachePortError, ConfigChange,
+    AccountStatus, ArtifactPort, ArtifactPortError, CachePort, CachePortError, ConfigChange,
     ConfigConnectionSnapshot, ConfigPort, ConfigPortError, ConfigSnapshot, CredentialCopyState,
     CredentialMigrationPendingReason, CredentialMigrationPhase, CredentialMigrationRecord,
     CredentialMigrationStatus, HarnessPortError, HarnessResponse, OpenArtifactCommand,
@@ -26,9 +26,9 @@ use yakshed_domain::{
     RunId, SecretBackend, SecretBackendId, SecretBackendSettings, WorkItemId,
 };
 use yakshed_harness::{
-    HarnessAdapter, HarnessError, HarnessEvent, HarnessInput, HarnessRunTerminal,
-    ProviderEventStream, ProviderRequestHandle, ProviderResponse, ProviderRunHandle, RunOptions,
-    RuntimeHandle, RuntimePath, StartSessionSpec,
+    HarnessAccountStatus, HarnessAdapter, HarnessError, HarnessEvent, HarnessInput,
+    HarnessRunTerminal, ProviderEventStream, ProviderRequestHandle, ProviderResponse,
+    ProviderRunHandle, RunOptions, RuntimeHandle, RuntimePath, StartSessionSpec,
 };
 use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, LocalFileBackend, LocalOsBackend, NoopSecretAuditSink,
@@ -874,6 +874,29 @@ impl CodexHarness {
         Ok(adapter)
     }
 
+    fn account_adapter(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<(Arc<CodexAdapter>, RuntimeHandle), HarnessPortError> {
+        let connection = self
+            .config
+            .snapshot()
+            .config
+            .connections
+            .into_iter()
+            .find(|connection| connection.id == connection_id)
+            .ok_or_else(|| HarnessPortError::NotFound(connection_id.to_string()))?;
+        if connection.harness != "codex" {
+            return Err(HarnessPortError::Unsupported(format!(
+                "connection {} uses harness {}",
+                connection.id, connection.harness
+            )));
+        }
+        let runtime =
+            RuntimeHandle::new(format!("codex-{connection_id}")).map_err(map_harness_error)?;
+        Ok((self.adapter(&connection)?, runtime))
+    }
+
     fn register_run(
         &self,
         connection_id: ConnectionId,
@@ -979,6 +1002,38 @@ impl CodexHarness {
 
 #[async_trait]
 impl RunHarness for CodexHarness {
+    async fn account_status(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<AccountStatus, HarnessPortError> {
+        let (adapter, runtime) = self.account_adapter(connection_id)?;
+        adapter
+            .account_status(&runtime)
+            .await
+            .map(account_status)
+            .map_err(map_harness_error)
+    }
+
+    async fn account_login_start(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<AccountStatus, HarnessPortError> {
+        let (adapter, runtime) = self.account_adapter(connection_id)?;
+        adapter
+            .account_login_start(&runtime)
+            .await
+            .map(account_status)
+            .map_err(map_harness_error)
+    }
+
+    async fn account_logout(&self, connection_id: ConnectionId) -> Result<(), HarnessPortError> {
+        let (adapter, runtime) = self.account_adapter(connection_id)?;
+        adapter
+            .account_logout(&runtime)
+            .await
+            .map_err(map_harness_error)
+    }
+
     async fn start_run(
         &self,
         connection_id: ConnectionId,
@@ -1385,6 +1440,7 @@ fn map_harness_error(error: HarnessError) -> HarnessPortError {
         HarnessError::Unsupported(message) => HarnessPortError::Unsupported(message.to_owned()),
         HarnessError::Overloaded => HarnessPortError::Overloaded,
         HarnessError::Disconnected => HarnessPortError::Disconnected,
+        HarnessError::NotAuthenticated => HarnessPortError::NotAuthenticated,
         HarnessError::OutcomeUnknown { operation } => {
             HarnessPortError::OutcomeUnknown { operation }
         }
@@ -1398,6 +1454,19 @@ fn map_harness_error(error: HarnessError) -> HarnessPortError {
         HarnessError::Runtime { diagnostic } => {
             HarnessPortError::Runtime(diagnostic.sanitized_text().to_owned())
         }
+    }
+}
+
+fn account_status(status: HarnessAccountStatus) -> AccountStatus {
+    match status {
+        HarnessAccountStatus::NotAuthenticated => AccountStatus::NotAuthenticated,
+        HarnessAccountStatus::LoginInProgress { login_id, auth_url } => {
+            AccountStatus::LoginInProgress { login_id, auth_url }
+        }
+        HarnessAccountStatus::Authenticated { email, plan } => {
+            AccountStatus::Authenticated { email, plan }
+        }
+        HarnessAccountStatus::Unknown => AccountStatus::Unknown,
     }
 }
 
@@ -1431,7 +1500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_config_accepts_a_secret_backed_connection() {
+    async fn production_config_accepts_a_delegated_codex_connection() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
         let backend = local_backend();
@@ -1449,11 +1518,8 @@ mod tests {
             provider_state: ProviderStateRootId::new("codex-test").unwrap(),
             credentials: vec![CredentialBindingRecord {
                 slot: CredentialSlot::new("codex.account").unwrap(),
-                binding: CredentialBinding::Secret {
-                    reference: SecretReference {
-                        backend_id: backend.id.clone(),
-                        locator: SecretLocator::new("codex/account").unwrap(),
-                    },
+                binding: CredentialBinding::Delegated {
+                    authority: "codex-app-server".to_owned(),
                 },
             }],
         };
@@ -1466,8 +1532,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(snapshot.config.secret_backends, vec![backend]);
-        assert_eq!(snapshot.config.secret_backends[0].kind(), "local-os");
+        assert!(snapshot.config.secret_backends.is_empty());
         assert_eq!(snapshot.config.connections.len(), 1);
     }
 

@@ -3,9 +3,9 @@ use std::{path::PathBuf, time::Duration};
 use provider_codex::{CodexAdapter, CodexRuntimeKey, CodexRuntimeSpec};
 use yakshed_domain::ApprovalDecision;
 use yakshed_harness::{
-    HarnessAdapter, HarnessCredentialDelivery, HarnessError, HarnessEvent, HarnessInput,
-    HarnessRunTerminal, ProviderResponse, RunOptions, RuntimeHandle, RuntimePath, SessionQuery,
-    StartSessionSpec,
+    HarnessAccountStatus, HarnessAdapter, HarnessCredentialDelivery, HarnessError, HarnessEvent,
+    HarnessInput, HarnessRunTerminal, ProviderResponse, RunOptions, RuntimeHandle, RuntimePath,
+    SessionQuery, StartSessionSpec,
 };
 
 struct TestAdapter {
@@ -81,7 +81,7 @@ macro_rules! transport_test {
 }
 
 #[test]
-fn codex_declares_harness_managed_account_authentication() {
+fn codex_declares_delegated_account_authentication() {
     let test = adapter("interruptible", 1024 * 1024, None);
     assert!(
         test.adapter
@@ -89,10 +89,75 @@ fn codex_declares_harness_managed_account_authentication() {
             .iter()
             .any(|requirement| {
                 requirement.slot.as_str() == "codex.account"
-                    && requirement.delivery == HarnessCredentialDelivery::HarnessManaged
+                    && requirement.delivery == HarnessCredentialDelivery::Delegated
             })
     );
 }
+
+transport_test!(account_login_status_and_logout_are_sanitized, {
+    let test = adapter("account_login_success", 1024 * 1024, None);
+    let mut events = test.adapter.subscribe().unwrap();
+    assert_eq!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::NotAuthenticated
+    );
+    let login = test
+        .adapter
+        .account_login_start(&test.runtime)
+        .await
+        .unwrap();
+    assert!(matches!(
+        login,
+        HarnessAccountStatus::LoginInProgress { ref login_id, ref auth_url }
+            if login_id == "login-1" && auth_url == "https://auth.example.test/login-1"
+    ));
+    assert_eq!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::Authenticated {
+            email: Some("yak@example.test".to_owned()),
+            plan: "plus".to_owned(),
+        }
+    );
+    test.adapter.account_logout(&test.runtime).await.unwrap();
+    assert_eq!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::NotAuthenticated
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), events.recv())
+            .await
+            .is_err()
+    );
+});
+
+transport_test!(failed_account_login_becomes_unknown_without_native_error, {
+    let test = adapter("account_login_failure", 1024 * 1024, None);
+    test.adapter
+        .account_login_start(&test.runtime)
+        .await
+        .unwrap();
+    assert_eq!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::Unknown
+    );
+    let rendered = format!("{:?}", test.adapter.diagnostics().await.unwrap());
+    assert!(!rendered.contains("YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT"));
+});
+
+transport_test!(run_start_requires_an_authenticated_account, {
+    let test = adapter("account_login_success", 1024 * 1024, None);
+    let session = session(&test).await;
+    assert_eq!(
+        test.adapter
+            .start_run(
+                &session,
+                HarnessInput::new("run").unwrap(),
+                RunOptions::default(),
+            )
+            .await,
+        Err(HarnessError::NotAuthenticated)
+    );
+});
 
 transport_test!(split_frames_and_rapid_batches_preserve_event_order, {
     let test = adapter("transport_split_batch", 1024 * 1024, None);
