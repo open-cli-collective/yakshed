@@ -3,6 +3,8 @@
 mod broker;
 #[cfg(feature = "dev-secrets")]
 mod local_file;
+#[cfg(target_os = "macos")]
+mod local_os;
 #[cfg(feature = "dev-secrets")]
 mod memory;
 
@@ -27,18 +29,31 @@ pub use broker::{
 };
 #[cfg(feature = "dev-secrets")]
 pub use local_file::LocalFileBackend;
+#[cfg(target_os = "macos")]
+pub use local_os::LocalOsBackend;
 #[cfg(feature = "dev-secrets")]
 pub use memory::{MemorySecretBackend, MemorySecretFault};
 
 pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
+pub const LOCAL_OS_BACKEND_KIND: &str = "local-os";
+
+#[cfg(target_os = "macos")]
+const LOCAL_OS_CAPABILITY: SecretBackendCapability =
+    SecretBackendCapability::available(LOCAL_OS_BACKEND_KIND);
+#[cfg(not(target_os = "macos"))]
+const LOCAL_OS_CAPABILITY: SecretBackendCapability = SecretBackendCapability {
+    kind: LOCAL_OS_BACKEND_KIND,
+    availability: SecretBackendAvailability::UnsupportedPlatform,
+};
 
 #[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
-const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 3] = [
     SecretBackendCapability::available("memory"),
     SecretBackendCapability::available(LOCAL_FILE_BACKEND_KIND),
+    LOCAL_OS_CAPABILITY,
 ];
 #[cfg(not(feature = "dev-secrets"))]
-const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 3] = [
     SecretBackendCapability {
         kind: "memory",
         availability: SecretBackendAvailability::MissingFeature {
@@ -51,17 +66,19 @@ const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
             feature: "dev-secrets",
         },
     },
+    LOCAL_OS_CAPABILITY,
 ];
 #[cfg(all(
     feature = "dev-secrets",
     not(any(target_os = "macos", target_os = "linux"))
 ))]
-const BACKEND_CAPABILITIES: [SecretBackendCapability; 2] = [
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 3] = [
     SecretBackendCapability::available("memory"),
     SecretBackendCapability {
         kind: LOCAL_FILE_BACKEND_KIND,
         availability: SecretBackendAvailability::UnsupportedPlatform,
     },
+    LOCAL_OS_CAPABILITY,
 ];
 
 pub const fn backend_capabilities() -> &'static [SecretBackendCapability] {

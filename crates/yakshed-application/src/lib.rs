@@ -204,6 +204,7 @@ pub enum SecretBackendConfigurationError {
     },
     WrongKind {
         backend: SecretBackendId,
+        expected: &'static str,
     },
     DuplicateLocalFilePath {
         backend: SecretBackendId,
@@ -234,8 +235,8 @@ impl fmt::Display for SecretBackendConfigurationError {
                 formatter,
                 "secret backend {backend} kind {kind} is unsupported on this platform"
             ),
-            Self::WrongKind { backend } => {
-                write!(formatter, "secret backend {backend} is not local-file")
+            Self::WrongKind { backend, expected } => {
+                write!(formatter, "secret backend {backend} is not {expected}")
             }
             Self::DuplicateLocalFilePath { backend } => write!(
                 formatter,

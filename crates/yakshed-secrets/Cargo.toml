@@ -12,6 +12,7 @@ dev-secrets = [
     "dep:serde",
     "dep:serde_json",
 ]
+keychain-integration = []
 
 [dependencies]
 async-trait.workspace = true
@@ -25,6 +26,13 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 yakshed-application.workspace = true
 yakshed-domain.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+
+[[test]]
+name = "keychain_integration"
+required-features = ["keychain-integration"]
