@@ -1029,6 +1029,7 @@ struct ImmediateWriteBackend {
 struct SlowWriteBackend {
     writes: Arc<AtomicUsize>,
     started: Arc<Notify>,
+    completed: Arc<Notify>,
 }
 
 #[async_trait]
@@ -1072,9 +1073,11 @@ impl SecretAdministrator for SlowWriteBackend {
     ) -> Result<PutSecretOutcome, SecretError> {
         self.started.notify_waiters();
         let writes = Arc::clone(&self.writes);
+        let completed = Arc::clone(&self.completed);
         tokio::task::spawn_blocking(move || {
             std::thread::sleep(Duration::from_millis(80));
             writes.fetch_add(1, Ordering::SeqCst);
+            completed.notify_one();
         })
         .await
         .unwrap();
@@ -1091,6 +1094,7 @@ async fn dispatched_mutation_cancellation_is_uncertain_and_audited() {
     let backend = Arc::new(SlowWriteBackend {
         writes: Arc::new(AtomicUsize::new(0)),
         started: Arc::new(Notify::new()),
+        completed: Arc::new(Notify::new()),
     });
     let connections = Arc::new(vec![connection(
         CONNECTION_A,
@@ -1138,7 +1142,7 @@ async fn dispatched_mutation_cancellation_is_uncertain_and_audited() {
         task.await.unwrap(),
         Err(SecretError::UncertainWrite { .. })
     ));
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    backend.completed.notified().await;
     assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
     assert!(audit.0.lock().unwrap().iter().any(|event| {
         event.operation == SecretOperation::Put
