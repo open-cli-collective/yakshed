@@ -12,7 +12,6 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
 };
-use yakshed_domain::validate_onepassword_locator;
 
 use crate::{
     ONEPASSWORD_BACKEND_KIND, ResolvedSecret, ResolvedSecretSource, SecretAccessContext,
@@ -32,14 +31,13 @@ const ENV_ALLOWLIST: &[&str] = &[
     "OP_SERVICE_ACCOUNT_TOKEN",
     "OP_CONNECT_HOST",
     "OP_CONNECT_TOKEN",
-    "SSH_AUTH_SOCK",
 ];
 
 /// Resolve-only adapter using `op read --no-newline --force op://vault/item/field`.
 pub struct OnePasswordBackend {
     id: SecretBackendId,
     executable: OsString,
-    account: Option<String>,
+    account: String,
     timeout: Duration,
 }
 
@@ -92,9 +90,7 @@ impl OnePasswordBackend {
     async fn run(&self, operation: &str, args: &[&str]) -> Result<SecretBytes, SecretError> {
         let mut command = self.command(operation);
         command.args(args);
-        if let Some(account) = &self.account {
-            command.arg("--account").arg(account);
-        }
+        command.arg("--account").arg(&self.account);
         let mut child = command
             .spawn()
             .map_err(|_| SecretError::BackendUnavailable {
@@ -161,7 +157,7 @@ impl SecretResolver for OnePasswordBackend {
         locator: &SecretLocator,
         _context: &SecretAccessContext,
     ) -> Result<ResolvedSecret, SecretError> {
-        validate_onepassword_locator(locator).map_err(|_| SecretError::InvalidLocator {
+        validate_locator(locator).map_err(|_| SecretError::InvalidLocator {
             backend: self.id.clone(),
             reason: "locator must be an op secret reference".to_owned(),
         })?;
@@ -182,6 +178,19 @@ impl SecretResolver for OnePasswordBackend {
             None,
         ))
     }
+}
+
+pub(crate) fn validate_locator(locator: &SecretLocator) -> Result<(), &'static str> {
+    let Some(reference) = locator.as_str().strip_prefix("op://") else {
+        return Err("onepassword locator must start with op://");
+    };
+    if reference.split('/').count() != 3
+        || reference.split('/').any(|component| component.is_empty())
+        || reference.contains(['?', '#'])
+    {
+        return Err("onepassword locator must be op://vault/item/field");
+    }
+    Ok(())
 }
 
 fn classify_exit(backend: &SecretBackendId, _status: ExitStatus, stderr: &[u8]) -> SecretError {
@@ -364,11 +373,11 @@ mod tests {
             }
         }
 
-        fn backend(&self, account: Option<&str>) -> OnePasswordBackend {
+        fn backend(&self, account: &str) -> OnePasswordBackend {
             OnePasswordBackend::from_config(&SecretBackend {
                 id: SecretBackendId::new("onepassword-test").unwrap(),
                 settings: SecretBackendSettings::OnePassword {
-                    account: account.map(str::to_owned),
+                    account: account.to_owned(),
                     executable: Some(self.executable.to_string_lossy().into_owned()),
                 },
             })
@@ -401,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn fake_op_resolves_without_secret_in_argv_or_ambient_environment() {
         let fake = FakeOp::new();
-        let backend = fake.backend(None);
+        let backend = fake.backend("work");
 
         assert_eq!(
             backend.probe().await.unwrap(),
@@ -418,6 +427,8 @@ mod tests {
         let rendered = invocation.to_string();
         assert!(rendered.contains("--no-newline"));
         assert!(rendered.contains("--force"));
+        assert!(rendered.contains("--account"));
+        assert!(rendered.contains("work"));
         assert!(rendered.contains("op://vault/item/password"));
         assert!(!rendered.contains(CANARY));
         for name in invocation["environment"].as_array().unwrap() {
@@ -435,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn fake_op_maps_missing_locked_absent_and_malformed_without_leaks() {
         let fake = FakeOp::new();
-        let backend = fake.backend(None);
+        let backend = fake.backend("work");
         let missing = match backend.resolve(&locator("missing"), &context()).await {
             Ok(_) => panic!("missing secret resolved"),
             Err(error) => error,
@@ -443,14 +454,14 @@ mod tests {
         assert!(matches!(missing, SecretError::NotFound { .. }));
         assert!(!format!("{missing:?}").contains("vault/item"));
 
-        let locked = fake.backend(Some("locked")).probe().await.unwrap_err();
+        let locked = fake.backend("locked").probe().await.unwrap_err();
         assert!(matches!(locked, SecretError::Locked { .. }));
         assert!(!format!("{locked:?}").contains(CANARY));
 
         let absent = OnePasswordBackend::from_config(&SecretBackend {
             id: SecretBackendId::new("missing-op").unwrap(),
             settings: SecretBackendSettings::OnePassword {
-                account: None,
+                account: "work".to_owned(),
                 executable: Some(
                     fake.executable
                         .with_file_name("absent")
@@ -482,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn hanging_fake_op_process_group_is_killed_and_reaped() {
         let fake = FakeOp::new();
-        let backend = fake.backend(None).with_timeout(Duration::from_secs(1));
+        let backend = fake.backend("work").with_timeout(Duration::from_secs(1));
         let error = match backend.resolve(&locator("hang"), &context()).await {
             Ok(_) => panic!("hanging secret resolved"),
             Err(error) => error,
@@ -505,13 +516,14 @@ mod tests {
             .find(|capability| capability.kind == ONEPASSWORD_BACKEND_KIND)
             .unwrap();
         assert_eq!(capability.access, crate::SecretBackendAccess::ResolveOnly);
-        assert!(validate_onepassword_locator(&locator("password")).is_ok());
+        let validate_locator = capability.validate_locator.unwrap();
+        assert!(validate_locator(&locator("password")).is_ok());
         for invalid in [
             "vault/item/field",
             "op://vault/item",
             "op://vault/item/field/extra",
         ] {
-            assert!(validate_onepassword_locator(&SecretLocator::new(invalid).unwrap()).is_err());
+            assert!(validate_locator(&SecretLocator::new(invalid).unwrap()).is_err());
         }
     }
 }

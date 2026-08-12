@@ -924,7 +924,7 @@ impl SecretBackend {
 pub enum SecretBackendSettings {
     LocalOs,
     OnePassword {
-        account: Option<String>,
+        account: String,
         executable: Option<String>,
     },
     Environment,
@@ -943,10 +943,17 @@ impl SecretBackendSettings {
     ) -> Result<Self, ValidationError> {
         let settings = match (kind, account, path, executable) {
             ("local-os", None, None, None) => Self::LocalOs,
-            ("onepassword", account, None, executable) => Self::OnePassword {
-                account,
-                executable,
-            },
+            ("onepassword" | "onepassword-cli", Some(account), None, executable) => {
+                Self::OnePassword {
+                    account,
+                    executable,
+                }
+            }
+            ("onepassword" | "onepassword-cli", None, None, _) => {
+                return Err(ValidationError(
+                    "onepassword secret backend requires an account".to_owned(),
+                ));
+            }
             ("environment", None, None, None) => Self::Environment,
             ("memory", None, None, None) => Self::Memory,
             ("local-file", None, Some(path), None) => Self::LocalFile { path },
@@ -981,9 +988,7 @@ impl SecretBackendSettings {
                 account,
                 executable,
             } => {
-                if let Some(account) = account {
-                    require_nonempty("secret backend account", account)?;
-                }
+                require_nonempty("secret backend account", account)?;
                 if let Some(executable) = executable {
                     require_nonempty("secret backend executable", executable)?;
                 }
@@ -993,23 +998,6 @@ impl SecretBackendSettings {
             _ => Ok(()),
         }
     }
-}
-
-pub fn validate_onepassword_locator(locator: &SecretLocator) -> Result<(), ValidationError> {
-    let Some(reference) = locator.as_str().strip_prefix("op://") else {
-        return Err(ValidationError(
-            "onepassword locator must start with op://".to_owned(),
-        ));
-    };
-    if reference.split('/').count() != 3
-        || reference.split('/').any(|component| component.is_empty())
-        || reference.contains(['?', '#'])
-    {
-        return Err(ValidationError(
-            "onepassword locator must be op://vault/item/field".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn require_nonempty(field: &'static str, value: &str) -> Result<(), ValidationError> {

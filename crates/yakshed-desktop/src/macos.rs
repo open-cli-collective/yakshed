@@ -17,8 +17,8 @@ use yakshed_application::{
     CredentialMigrationStatus, HarnessPortError, HarnessResponse, OpenArtifactCommand,
     OpenArtifactPayload, ProviderCommandRef, ProviderRequestRef, ProviderRunRef, PublicConnection,
     PublicConnectionList, PublicCredentialBinding, PublicCredentialSource, PutConnectionCommand,
-    RunHarness, RunHarnessEvent, RunTerminal, SecretPort, SecretPortError, SecretWriteOutcome,
-    SetConnectionCredentialCommand, SystemClock, SystemIdGenerator,
+    RunHarness, RunHarnessEvent, RunTerminal, SecretBackendAccess, SecretPort, SecretPortError,
+    SecretWriteOutcome, SetConnectionCredentialCommand, SystemClock, SystemIdGenerator,
 };
 use yakshed_desktop_api::{ApiPorts, StartupError};
 use yakshed_domain::{
@@ -651,6 +651,21 @@ impl SecretPort for ProductionSecrets {
             .iter()
             .find(|binding| binding.slot == command.slot)
             .ok_or(SecretPortError::BindingNotFound)?;
+        if let CredentialBinding::Secret { reference } = &binding.binding
+            && snapshot
+                .config
+                .secret_backends
+                .iter()
+                .find(|backend| backend.id == reference.backend_id)
+                .and_then(|backend| {
+                    backend_capabilities()
+                        .iter()
+                        .find(|capability| capability.kind == backend.kind())
+                })
+                .is_some_and(|capability| capability.access == SecretBackendAccess::ResolveOnly)
+        {
+            return Err(SecretPortError::ResolveOnly);
+        }
         if snapshot
             .config
             .credential_migration
@@ -1456,6 +1471,73 @@ mod tests {
         assert_eq!(snapshot.config.connections.len(), 1);
     }
 
+    #[tokio::test]
+    async fn production_secret_write_rejects_resolve_only_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let backend = SecretBackend {
+            id: SecretBackendId::new("onepassword-work").unwrap(),
+            settings: SecretBackendSettings::OnePassword {
+                account: "work".to_owned(),
+                executable: Some("/definitely/absent/op".to_owned()),
+            },
+        };
+        let slot = CredentialSlot::new("provider.api-key").unwrap();
+        let mut connection = connection(
+            "0193f26e-7a72-7000-8000-00000000d002",
+            "codex",
+            "onepassword-test",
+        );
+        connection.credentials.push(CredentialBindingRecord {
+            slot: slot.clone(),
+            binding: CredentialBinding::Secret {
+                reference: SecretReference {
+                    backend_id: backend.id.clone(),
+                    locator: SecretLocator::new("op://vault/item/field").unwrap(),
+                },
+            },
+        });
+        let store = test_config(&paths);
+        store
+            .update(
+                ConfigRevision::INITIAL,
+                ConfigChange::PutConnectionWithSecretBackends {
+                    connection: connection.clone(),
+                    secret_backends: vec![backend.clone()],
+                },
+            )
+            .await
+            .unwrap();
+        let resolver = Arc::new(OnePasswordBackend::from_config(&backend).unwrap());
+        let broker = Arc::new(
+            CredentialBroker::new(
+                [(
+                    backend.id.clone(),
+                    SecretBackendHandle {
+                        resolver,
+                        administrator: None,
+                    },
+                )],
+                &[connection.clone()],
+                Arc::new(NoopSecretAuditSink),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            ProductionSecrets { store, broker }
+                .set_connection_credential(SetConnectionCredentialCommand {
+                    connection_id: connection.id,
+                    slot,
+                    value: SecretValue::new("write-canary"),
+                    overwrite: false,
+                })
+                .await,
+            Err(SecretPortError::ResolveOnly)
+        ));
+    }
+
     async fn plaintext_fixture(
         paths: &AppPaths,
     ) -> (Arc<ConfigStore>, SecretBackend, Vec<SecretLocator>) {
@@ -2120,7 +2202,7 @@ mod tests {
         let onepassword = SecretBackend {
             id: SecretBackendId::new("onepassword-work").unwrap(),
             settings: SecretBackendSettings::OnePassword {
-                account: Some("work".to_owned()),
+                account: "work".to_owned(),
                 executable: Some("/definitely/absent/op".to_owned()),
             },
         };

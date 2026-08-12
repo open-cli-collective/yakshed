@@ -26,7 +26,7 @@ with `op://vault/item/field` locators. Validate a real CLI installation manually
 without printing the secret:
 
 ```sh
-python3 scripts/validate_onepassword.py --reference 'op://vault/item/field'
+python3 scripts/validate_onepassword.py --account work --reference 'op://vault/item/field'
 ```
 
 This gate is intentionally local-only and must use a user-provided reference.

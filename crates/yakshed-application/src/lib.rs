@@ -12,7 +12,7 @@ use yakshed_domain::{
     NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderRunIdentity, ProviderStateRootId,
     RunId, RunSnapshot, RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings,
     SecretLocator, StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot,
-    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot, validate_onepassword_locator,
+    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
 mod run_supervisor;
@@ -115,13 +115,16 @@ impl AppConfig {
                     )));
                 }
                 if let CredentialBinding::Secret { reference } = &credential.binding
-                    && self.secret_backends.iter().any(|backend| {
-                        backend.id == reference.backend_id
-                            && matches!(backend.settings, SecretBackendSettings::OnePassword { .. })
-                    })
+                    && let Some(backend) = self
+                        .secret_backends
+                        .iter()
+                        .find(|backend| backend.id == reference.backend_id)
+                    && let Some(validate_locator) = backend_capabilities
+                        .iter()
+                        .find(|capability| capability.kind == backend.kind())
+                        .and_then(|capability| capability.validate_locator)
                 {
-                    validate_onepassword_locator(&reference.locator)
-                        .map_err(|error| ConfigValidationError::invalid(error.to_string()))?;
+                    validate_locator(&reference.locator).map_err(ConfigValidationError::invalid)?;
                 }
             }
         }
@@ -367,12 +370,15 @@ impl fmt::Display for SecretBackendConfigurationError {
 
 impl Error for SecretBackendConfigurationError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct SecretBackendCapability {
     pub kind: &'static str,
     pub availability: SecretBackendAvailability,
     pub access: SecretBackendAccess,
+    pub validate_locator: Option<SecretLocatorValidator>,
 }
+
+pub type SecretLocatorValidator = fn(&SecretLocator) -> Result<(), &'static str>;
 
 impl SecretBackendCapability {
     pub const fn available(kind: &'static str) -> Self {
@@ -380,6 +386,7 @@ impl SecretBackendCapability {
             kind,
             availability: SecretBackendAvailability::Available,
             access: SecretBackendAccess::ReadWrite,
+            validate_locator: None,
         }
     }
 
@@ -388,7 +395,13 @@ impl SecretBackendCapability {
             kind,
             availability: SecretBackendAvailability::Available,
             access: SecretBackendAccess::ResolveOnly,
+            validate_locator: None,
         }
+    }
+
+    pub const fn with_locator_validator(mut self, validator: SecretLocatorValidator) -> Self {
+        self.validate_locator = Some(validator);
+        self
     }
 }
 
@@ -559,6 +572,8 @@ pub enum SecretPortError {
     BindingNotFound,
     #[error("credential binding is not writeable")]
     NotSecretBacked,
+    #[error("secret backend is resolve-only")]
+    ResolveOnly,
     #[error("secret backend unavailable")]
     BackendUnavailable,
     #[error("secret backend returned locked")]

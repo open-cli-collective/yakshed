@@ -50,15 +50,18 @@ const LOCAL_OS_CAPABILITY: SecretBackendCapability = SecretBackendCapability {
     kind: LOCAL_OS_BACKEND_KIND,
     availability: SecretBackendAvailability::UnsupportedPlatform,
     access: SecretBackendAccess::ReadWrite,
+    validate_locator: None,
 };
 #[cfg(unix)]
 const ONEPASSWORD_CAPABILITY: SecretBackendCapability =
-    SecretBackendCapability::resolve_only(ONEPASSWORD_BACKEND_KIND);
+    SecretBackendCapability::resolve_only(ONEPASSWORD_BACKEND_KIND)
+        .with_locator_validator(onepassword::validate_locator);
 #[cfg(not(unix))]
 const ONEPASSWORD_CAPABILITY: SecretBackendCapability = SecretBackendCapability {
     kind: ONEPASSWORD_BACKEND_KIND,
     availability: SecretBackendAvailability::UnsupportedPlatform,
     access: SecretBackendAccess::ResolveOnly,
+    validate_locator: None,
 };
 
 #[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
@@ -76,6 +79,7 @@ const BACKEND_CAPABILITIES: [SecretBackendCapability; 4] = [
             feature: "dev-secrets",
         },
         access: SecretBackendAccess::ReadWrite,
+        validate_locator: None,
     },
     SecretBackendCapability {
         kind: LOCAL_FILE_BACKEND_KIND,
@@ -83,6 +87,7 @@ const BACKEND_CAPABILITIES: [SecretBackendCapability; 4] = [
             feature: "dev-secrets",
         },
         access: SecretBackendAccess::ReadWrite,
+        validate_locator: None,
     },
     LOCAL_OS_CAPABILITY,
     ONEPASSWORD_CAPABILITY,
@@ -97,6 +102,7 @@ const BACKEND_CAPABILITIES: [SecretBackendCapability; 4] = [
         kind: LOCAL_FILE_BACKEND_KIND,
         availability: SecretBackendAvailability::UnsupportedPlatform,
         access: SecretBackendAccess::ReadWrite,
+        validate_locator: None,
     },
     LOCAL_OS_CAPABILITY,
     ONEPASSWORD_CAPABILITY,

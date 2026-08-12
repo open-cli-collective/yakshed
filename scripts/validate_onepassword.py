@@ -10,7 +10,7 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument("--reference", required=True)
 parser.add_argument("--executable", default="op")
-parser.add_argument("--account")
+parser.add_argument("--account", required=True)
 args = parser.parse_args()
 
 parts = args.reference.removeprefix("op://").split("/")
@@ -18,8 +18,7 @@ if not args.reference.startswith("op://") or len(parts) != 3 or not all(parts):
     parser.error("reference must be op://vault/item/field")
 
 command = [args.executable, "read", "--no-newline", "--force", args.reference]
-if args.account:
-    command.extend(["--account", args.account])
+command.extend(["--account", args.account])
 allowed = {
     key: value
     for key, value in os.environ.items()
@@ -32,7 +31,6 @@ allowed = {
         "OP_SERVICE_ACCOUNT_TOKEN",
         "OP_CONNECT_HOST",
         "OP_CONNECT_TOKEN",
-        "SSH_AUTH_SOCK",
     }
 }
 allowed["NO_COLOR"] = "1"

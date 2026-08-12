@@ -441,6 +441,7 @@ An encrypted-file backend can be added later as an explicit store with an explic
 
 Use the official `op` CLI in the first implementation.
 
+- Require an explicit account identifier; never inherit the CLI's ambient account.
 - Read with `op read --no-newline --force <secret-reference>`; this is the only
   secret-bearing command surface in v1.
 - Use `tokio::process::Command`, never a shell.

@@ -337,7 +337,7 @@ impl From<&SecretBackend> for SecretBackendDto {
             SecretBackendSettings::OnePassword {
                 account,
                 executable,
-            } => (account.clone(), None, executable.clone()),
+            } => (Some(account.clone()), None, executable.clone()),
             SecretBackendSettings::LocalFile { path } => (None, Some(path.clone()), None),
             _ => (None, None, None),
         };

@@ -1259,6 +1259,7 @@ fn map_secret_error(error: SecretPortError) -> DesktopError {
         SecretPortError::NotSecretBacked => {
             DesktopError::unsupported("credential binding is not secret-backed")
         }
+        SecretPortError::ResolveOnly => DesktopError::unsupported("secret backend is resolve-only"),
         SecretPortError::Failed => {
             DesktopError::new(DesktopErrorCode::PersistenceError, "secret write failed")
         }
