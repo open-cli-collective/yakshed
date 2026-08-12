@@ -4491,6 +4491,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "yakshed-desktop"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "provider-codex",
+ "tauri",
+ "tauri-build",
+ "tempfile",
+ "tokio",
+ "yakshed-application",
+ "yakshed-desktop-api",
+ "yakshed-domain",
+ "yakshed-harness",
+ "yakshed-secrets",
+ "yakshed-store",
+ "yakshed-tauri",
+]
+
+[[package]]
 name = "yakshed-desktop-api"
 version = "0.1.0"
 dependencies = [

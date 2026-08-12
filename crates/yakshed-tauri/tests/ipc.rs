@@ -438,7 +438,9 @@ fn build_app(
     tauri::WebviewWindow<tauri::test::MockRuntime>,
 ) {
     let app = configure(tauri::test::mock_builder(), state)
-        .build(tauri::generate_context!())
+        .build(tauri::generate_context!(
+            "../yakshed-desktop/tauri.conf.json"
+        ))
         .unwrap();
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
@@ -629,7 +631,6 @@ async fn malformed_command_payloads_are_rejected_as_invalid_request() {
                     "provider_state": "",
                     "credentials": [],
                 },
-                "ensureMemorySecretBackend": false,
             }),
         )
         .unwrap_err(),
@@ -710,7 +711,6 @@ async fn every_registered_handler_is_invocable_against_a_real_desktop_api() {
                 provider_state: "second-provider".to_owned(),
                 credentials: Vec::new(),
             },
-            "ensureMemorySecretBackend": false
         })
     )
     .unwrap();

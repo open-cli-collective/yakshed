@@ -4,9 +4,13 @@
   "version": "0.1.0",
   "identifier": "dev.yakshed.desktop",
   "build": {
+    "beforeDevCommand": "npm --prefix yakshed-tauri run dev",
+    "beforeBuildCommand": "npm --prefix yakshed-tauri run build",
+    "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "frontend"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -51,7 +55,8 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": ["app"],
     "icon": ["../../design/YakShed-UI/uploads/pasted-1786202555766-0.png"]
   }
 }

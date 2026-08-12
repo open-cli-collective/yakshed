@@ -20,16 +20,17 @@ use yakshed_application::{
     StoreError, StreamCursorState, TimelineBatch, TimelinePage, TransitionRun, WorkItemPage,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ConnectionId,
-    DataRevision, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus,
-    StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision,
-    UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
+    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId,
+    ArtifactKind, ArtifactProvenance, ArtifactRecord, ConnectionId, DataRevision,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderRunIdentity, RunId, RunSnapshot,
+    RunStatus, StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot,
+    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
 };
 
 use crate::AppPaths;
 
 const DATABASE_FILE: &str = "yakshed.sqlite3";
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 6;
 const MAX_PAGE_SIZE: u32 = 200;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 
@@ -68,13 +69,21 @@ CREATE TABLE runs (
         status IN ('starting', 'running', 'completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown')
     ),
     provider_namespace TEXT,
+    provider_runtime_id TEXT,
+    provider_session_id TEXT,
     provider_run_id TEXT,
     created_at_ms INTEGER NOT NULL,
     ended_at_ms INTEGER,
-    CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
+    CHECK (
+        (provider_namespace IS NULL) = (provider_runtime_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_session_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_run_id IS NULL)
+    ),
     CHECK ((status IN ('completed', 'failed', 'interrupted')) = (ended_at_ms IS NOT NULL)),
     UNIQUE (connection_id, id),
-    UNIQUE (connection_id, provider_namespace, provider_run_id)
+    UNIQUE (
+        connection_id, provider_namespace, provider_runtime_id, provider_session_id, provider_run_id
+    )
 );
 
 CREATE TABLE timeline_items (
@@ -90,7 +99,7 @@ CREATE TABLE timeline_items (
     CHECK ((provider_namespace IS NULL) = (provider_item_id IS NULL)),
     FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
     UNIQUE (run_id, revision),
-    UNIQUE (connection_id, provider_namespace, provider_item_id)
+    UNIQUE (connection_id, run_id, provider_namespace, provider_item_id)
 );
 
 CREATE TABLE approval_requests (
@@ -108,7 +117,7 @@ CREATE TABLE approval_requests (
     resolved_at_ms INTEGER,
     voided_at_ms INTEGER,
     FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
-    UNIQUE (connection_id, provider_namespace, provider_approval_id),
+    UNIQUE (connection_id, run_id, provider_namespace, provider_approval_id),
     CHECK (
         (status = 'pending' AND decision IS NULL AND response_started_at_ms IS NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
         OR (status = 'responding' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
@@ -130,7 +139,7 @@ CREATE TABLE projection_cursors (
     last_payload_digest TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
-    PRIMARY KEY (connection_id, source_namespace, stream_id)
+    PRIMARY KEY (connection_id, run_id, source_namespace, stream_id)
 );
 
 CREATE TABLE audit_events (
@@ -211,6 +220,127 @@ SELECT
 FROM runs;
 DROP TABLE runs;
 ALTER TABLE runs_v3 RENAME TO runs;
+"#;
+
+const MIGRATE_V3_TO_V4: &str = r#"
+CREATE TABLE artifacts (
+    id TEXT PRIMARY KEY NOT NULL,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+    run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'plan', 'diff', 'file', 'image', 'command_log', 'browser_capture', 'provider_payload'
+    )),
+    digest TEXT NOT NULL,
+    byte_len INTEGER NOT NULL CHECK (byte_len >= 0),
+    media_type TEXT NOT NULL CHECK (length(trim(media_type)) > 0),
+    provenance TEXT NOT NULL CHECK (length(trim(provenance)) > 0)
+);
+CREATE INDEX artifacts_work_item_order ON artifacts(work_item_id, id);
+"#;
+
+const MIGRATE_V4_TO_V5: &str = r#"
+DROP TABLE IF EXISTS runs_v5;
+CREATE TABLE runs_v5 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (
+        status IN ('starting', 'running', 'completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown')
+    ),
+    provider_namespace TEXT,
+    provider_runtime_id TEXT,
+    provider_session_id TEXT,
+    provider_run_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    ended_at_ms INTEGER,
+    CHECK (
+        (provider_namespace IS NULL) = (provider_runtime_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_session_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_run_id IS NULL)
+    ),
+    CHECK ((status IN ('completed', 'failed', 'interrupted')) = (ended_at_ms IS NOT NULL)),
+    UNIQUE (connection_id, id),
+    UNIQUE (
+        connection_id, provider_namespace, provider_runtime_id, provider_session_id, provider_run_id
+    )
+);
+INSERT INTO runs_v5 (
+    id, connection_id, work_item_id, status, provider_namespace,
+    provider_runtime_id, provider_session_id, provider_run_id, created_at_ms, ended_at_ms
+)
+SELECT
+    id, connection_id, work_item_id, status, provider_namespace,
+    provider_namespace, provider_run_id, provider_run_id, created_at_ms, ended_at_ms
+FROM runs;
+DROP TABLE runs;
+ALTER TABLE runs_v5 RENAME TO runs;
+"#;
+
+const MIGRATE_V5_TO_V6: &str = r#"
+CREATE TABLE timeline_items_v6 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+    body TEXT NOT NULL,
+    provider_namespace TEXT,
+    provider_item_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    CHECK ((provider_namespace IS NULL) = (provider_item_id IS NULL)),
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    UNIQUE (run_id, revision),
+    UNIQUE (connection_id, run_id, provider_namespace, provider_item_id)
+);
+INSERT INTO timeline_items_v6 SELECT * FROM timeline_items;
+DROP TABLE timeline_items;
+ALTER TABLE timeline_items_v6 RENAME TO timeline_items;
+
+CREATE TABLE approval_requests_v6 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    provider_namespace TEXT NOT NULL,
+    provider_approval_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+    summary TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'responding', 'resolved', 'voided')),
+    decision TEXT CHECK (decision IN ('approved', 'denied')),
+    requested_at_ms INTEGER NOT NULL,
+    response_started_at_ms INTEGER,
+    resolved_at_ms INTEGER,
+    voided_at_ms INTEGER,
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    UNIQUE (connection_id, run_id, provider_namespace, provider_approval_id),
+    CHECK (
+        (status = 'pending' AND decision IS NULL AND response_started_at_ms IS NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
+        OR (status = 'responding' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
+        OR (status = 'resolved' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NOT NULL AND voided_at_ms IS NULL)
+        OR (status = 'voided' AND resolved_at_ms IS NULL AND voided_at_ms IS NOT NULL
+            AND ((decision IS NULL AND response_started_at_ms IS NULL)
+                 OR (decision IS NOT NULL AND response_started_at_ms IS NOT NULL)))
+    )
+);
+INSERT INTO approval_requests_v6 SELECT * FROM approval_requests;
+DROP TABLE approval_requests;
+ALTER TABLE approval_requests_v6 RENAME TO approval_requests;
+
+CREATE TABLE projection_cursors_v6 (
+    connection_id TEXT NOT NULL,
+    source_namespace TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    cursor INTEGER NOT NULL CHECK (cursor >= 0),
+    last_batch_id TEXT NOT NULL,
+    last_start_cursor INTEGER NOT NULL CHECK (last_start_cursor >= 0),
+    last_payload_digest TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    PRIMARY KEY (connection_id, run_id, source_namespace, stream_id)
+);
+INSERT INTO projection_cursors_v6 SELECT * FROM projection_cursors;
+DROP TABLE projection_cursors;
+ALTER TABLE projection_cursors_v6 RENAME TO projection_cursors;
 "#;
 
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
@@ -308,6 +438,119 @@ impl SqliteStore {
             .map_err(|_| StoreError::Closed)?;
         drop(sender);
         result_receiver.await.map_err(|_| StoreError::Closed)?
+    }
+
+    pub async fn put_artifact_metadata(
+        &self,
+        artifact: ArtifactRecord,
+    ) -> Result<ArtifactRecord, StoreError> {
+        validate_app_id("artifact id", artifact.id.is_v7())?;
+        validate_text("artifact media type", &artifact.media_type)?;
+        let byte_len = i64::try_from(artifact.byte_len)
+            .map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            let transaction = worker
+                .connection
+                .transaction()
+                .map_err(map_database_error)?;
+            let existing = transaction
+                .query_row(
+                    &format!("{ARTIFACT_SELECT} WHERE id = ?1"),
+                    [artifact.id.to_string()],
+                    artifact_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                return if existing == artifact {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Conflict(format!(
+                        "artifact id already exists with different content: {}",
+                        artifact.id
+                    )))
+                };
+            }
+            if let Some(run_id) = artifact.run_id {
+                let owns_run = transaction
+                    .query_row(
+                        "SELECT 1 FROM runs WHERE id = ?1 AND work_item_id = ?2",
+                        params![run_id.to_string(), artifact.work_item_id.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(map_database_error)?
+                    .is_some();
+                if !owns_run {
+                    return Err(StoreError::Conflict(format!(
+                        "run {run_id} does not belong to work item {}",
+                        artifact.work_item_id
+                    )));
+                }
+            }
+            transaction
+                .execute(
+                    "INSERT INTO artifacts (
+                        id, work_item_id, run_id, kind, digest, byte_len, media_type, provenance
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        artifact.id.to_string(),
+                        artifact.work_item_id.to_string(),
+                        artifact.run_id.map(|id| id.to_string()),
+                        artifact_kind(artifact.kind),
+                        artifact.digest.to_string(),
+                        byte_len,
+                        artifact.media_type,
+                        artifact.provenance.as_str(),
+                    ],
+                )
+                .map_err(map_database_error)?;
+            transaction.commit().map_err(map_database_error)?;
+            Ok(artifact)
+        })
+        .await
+    }
+
+    pub async fn list_artifact_metadata(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> Result<Vec<ArtifactRecord>, StoreError> {
+        self.call(move |worker| {
+            let mut statement = worker
+                .connection
+                .prepare(&format!(
+                    "{ARTIFACT_SELECT} WHERE work_item_id = ?1 ORDER BY id"
+                ))
+                .map_err(map_database_error)?;
+            statement
+                .query_map([work_item_id.to_string()], artifact_from_row)
+                .map_err(map_database_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_database_error)
+        })
+        .await
+    }
+
+    pub async fn get_artifact_metadata(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<ArtifactRecord, StoreError> {
+        self.call(move |worker| {
+            worker
+                .connection
+                .query_row(
+                    &format!("{ARTIFACT_SELECT} WHERE id = ?1"),
+                    [artifact_id.to_string()],
+                    artifact_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "artifact",
+                    id: artifact_id.to_string(),
+                })
+        })
+        .await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -446,6 +689,9 @@ fn migrations() -> Migrations<'static> {
         M::up(MIGRATE_V1_TO_V2)
             .comment("expand run lifecycle statuses and start/reconnect transitions"),
         M::up(MIGRATE_V2_TO_V3).comment("keep recoverable runs and approvals active"),
+        M::up(MIGRATE_V3_TO_V4).comment("persist immutable artifact metadata"),
+        M::up(MIGRATE_V4_TO_V5).comment("persist lossless provider run identity"),
+        M::up(MIGRATE_V5_TO_V6).comment("scope provider projections by application run"),
     ])
 }
 
@@ -639,6 +885,90 @@ fn provider_id(
     }
 }
 
+fn provider_run_identity(
+    namespace: Option<String>,
+    runtime_id: Option<String>,
+    session_id: Option<String>,
+    run_id: Option<String>,
+) -> rusqlite::Result<Option<ProviderRunIdentity>> {
+    match (namespace, runtime_id, session_id, run_id) {
+        (None, None, None, None) => Ok(None),
+        (Some(namespace), Some(runtime_id), Some(session_id), Some(run_id)) => {
+            ProviderRunIdentity::new(namespace, runtime_id, session_id, run_id)
+                .map(Some)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+const ARTIFACT_SELECT: &str = "
+SELECT id, work_item_id, run_id, kind, digest, byte_len, media_type, provenance
+FROM artifacts";
+
+fn artifact_from_row(row: &Row<'_>) -> rusqlite::Result<ArtifactRecord> {
+    let kind: String = row.get(3)?;
+    Ok(ArtifactRecord {
+        id: parse_column(row, 0)?,
+        work_item_id: parse_column(row, 1)?,
+        run_id: row
+            .get::<_, Option<String>>(2)?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        kind: match kind.as_str() {
+            "plan" => ArtifactKind::Plan,
+            "diff" => ArtifactKind::Diff,
+            "file" => ArtifactKind::File,
+            "image" => ArtifactKind::Image,
+            "command_log" => ArtifactKind::CommandLog,
+            "browser_capture" => ArtifactKind::BrowserCapture,
+            "provider_payload" => ArtifactKind::ProviderPayload,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+        digest: parse_column(row, 4)?,
+        byte_len: u64::try_from(row.get::<_, i64>(5)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        media_type: row.get(6)?,
+        provenance: ArtifactProvenance::new(row.get::<_, String>(7)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+    })
+}
+
+const fn artifact_kind(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Plan => "plan",
+        ArtifactKind::Diff => "diff",
+        ArtifactKind::File => "file",
+        ArtifactKind::Image => "image",
+        ArtifactKind::CommandLog => "command_log",
+        ArtifactKind::BrowserCapture => "browser_capture",
+        ArtifactKind::ProviderPayload => "provider_payload",
+    }
+}
+
 const WORK_ITEM_SELECT: &str = "
 SELECT w.id, w.project_id, w.title, w.status,
        (SELECT e.parent_id FROM work_edges e WHERE e.child_id = w.id),
@@ -719,7 +1049,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<ProjectSnapshot> {
 
 const RUN_SELECT: &str = "
 SELECT id, connection_id, work_item_id, status, provider_namespace,
-       provider_run_id, created_at_ms, ended_at_ms
+       provider_runtime_id, provider_session_id, provider_run_id, created_at_ms, ended_at_ms
 FROM runs";
 
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
@@ -728,10 +1058,10 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
         connection_id: parse_column(row, 1)?,
         work_item_id: parse_column(row, 2)?,
         status: run_status_from_value(&row.get::<_, String>(3)?)?,
-        provider_id: provider_id(row.get(4)?, row.get(5)?)?,
-        created_at: UtcTimestamp::from_unix_millis(row.get(6)?),
+        provider_id: provider_run_identity(row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)?,
+        created_at: UtcTimestamp::from_unix_millis(row.get(8)?),
         ended_at: row
-            .get::<_, Option<i64>>(7)?
+            .get::<_, Option<i64>>(9)?
             .map(UtcTimestamp::from_unix_millis),
     })
 }
@@ -801,21 +1131,24 @@ fn apply_run_transition(
     command: &TransitionRun,
 ) -> Result<RunSnapshot, StoreError> {
     let run = get_run(transaction, command.run_id)?;
-    let (provider_namespace, provider_run_id) =
-        command
-            .provider_id
-            .as_ref()
-            .map_or((None, None), |provider| {
-                (
-                    Some(provider.namespace().to_owned()),
-                    Some(provider.value().to_owned()),
-                )
-            });
+    let (provider_namespace, provider_runtime_id, provider_session_id, provider_run_id) = command
+        .provider_id
+        .as_ref()
+        .map_or((None, None, None, None), |provider| {
+            (
+                Some(provider.namespace().to_owned()),
+                Some(provider.runtime_id().to_owned()),
+                Some(provider.session_id().to_owned()),
+                Some(provider.run_id().to_owned()),
+            )
+        });
     let changed = transaction
         .execute(
             "UPDATE runs SET status = ?2, ended_at_ms = ?3,
                  provider_namespace = COALESCE(?5, provider_namespace),
-                 provider_run_id = COALESCE(?6, provider_run_id)
+                 provider_runtime_id = COALESCE(?6, provider_runtime_id),
+                 provider_session_id = COALESCE(?7, provider_session_id),
+                 provider_run_id = COALESCE(?8, provider_run_id)
              WHERE id = ?1 AND status = ?4",
             params![
                 command.run_id.to_string(),
@@ -823,6 +1156,8 @@ fn apply_run_transition(
                 ended_at_ms(command.target, command.occurred_at.unix_millis()),
                 run_status_value(command.expected_current),
                 provider_namespace,
+                provider_runtime_id,
+                provider_session_id,
                 provider_run_id,
             ],
         )
@@ -1003,6 +1338,7 @@ struct PersistedStreamCursor {
 fn find_stream_cursor(
     connection: &Connection,
     connection_id: ConnectionId,
+    run_id: RunId,
     source_namespace: &str,
     stream_id: &str,
 ) -> Result<Option<PersistedStreamCursor>, StoreError> {
@@ -1011,8 +1347,13 @@ fn find_stream_cursor(
             "SELECT connection_id, run_id, cursor, last_batch_id, last_start_cursor,
                     last_payload_digest
              FROM projection_cursors
-             WHERE connection_id = ?1 AND source_namespace = ?2 AND stream_id = ?3",
-            params![connection_id.to_string(), source_namespace, stream_id],
+             WHERE connection_id = ?1 AND run_id = ?2 AND source_namespace = ?3 AND stream_id = ?4",
+            params![
+                connection_id.to_string(),
+                run_id.to_string(),
+                source_namespace,
+                stream_id
+            ],
             |row| {
                 let cursor = u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -1416,27 +1757,30 @@ impl AppStore for SqliteStore {
                     )));
                 }
             }
-            let (namespace, provider_run_id) =
-                command
-                    .provider_run
-                    .as_ref()
-                    .map_or((None, None), |provider| {
-                        (
-                            Some(provider.namespace().to_owned()),
-                            Some(provider.value().to_owned()),
-                        )
-                    });
+            let (namespace, runtime_id, session_id, provider_run_id) = command
+                .provider_run
+                .as_ref()
+                .map_or((None, None, None, None), |provider| {
+                    (
+                        Some(provider.namespace().to_owned()),
+                        Some(provider.runtime_id().to_owned()),
+                        Some(provider.session_id().to_owned()),
+                        Some(provider.run_id().to_owned()),
+                    )
+                });
             transaction
                 .execute(
                     "INSERT INTO runs
                      (id, connection_id, work_item_id, status, provider_namespace,
-                      provider_run_id, created_at_ms)
-                     VALUES (?1, ?2, ?3, 'starting', ?4, ?5, ?6)",
+                      provider_runtime_id, provider_session_id, provider_run_id, created_at_ms)
+                     VALUES (?1, ?2, ?3, 'starting', ?4, ?5, ?6, ?7, ?8)",
                     params![
                         command.id.to_string(),
                         command.connection_id.to_string(),
                         command.work_item_id.to_string(),
                         namespace,
+                        runtime_id,
+                        session_id,
                         provider_run_id,
                         now.unix_millis()
                     ],
@@ -1640,6 +1984,7 @@ impl AppStore for SqliteStore {
             let cursor = find_stream_cursor(
                 &transaction,
                 batch.connection_id,
+                batch.run_id,
                 &batch.source_namespace,
                 &batch.stream_id,
             )?;
@@ -1726,7 +2071,7 @@ impl AppStore for SqliteStore {
                      (connection_id, source_namespace, stream_id, run_id, cursor, last_batch_id,
                       last_start_cursor, last_payload_digest, updated_at_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(connection_id, source_namespace, stream_id) DO UPDATE SET
+                     ON CONFLICT(connection_id, run_id, source_namespace, stream_id) DO UPDATE SET
                          cursor = excluded.cursor,
                          last_batch_id = excluded.last_batch_id,
                          last_start_cursor = excluded.last_start_cursor,
@@ -1765,6 +2110,7 @@ impl AppStore for SqliteStore {
             let cursor = find_stream_cursor(
                 &worker.connection,
                 query.connection_id,
+                query.run_id,
                 &query.source_namespace,
                 &query.stream_id,
             )?;
@@ -2361,7 +2707,9 @@ mod tests {
                 run_id: run.id,
                 expected_current: RunStatus::Starting,
                 target: RunStatus::Running,
-                provider_id: Some(NamespacedProviderId::new("mock", "run-1").unwrap()),
+                provider_id: Some(
+                    ProviderRunIdentity::new("mock", "runtime-1", "session-1", "run-1").unwrap(),
+                ),
                 occurred_at: UtcTimestamp::from_unix_millis(42),
                 audit_event_id: ids.next_audit_event_id(),
             })

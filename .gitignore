@@ -6,6 +6,9 @@ crates/**/target/
 node_modules/
 dist/
 .vite/
+crates/yakshed-tauri/test-results/
+crates/yakshed-desktop/frontend/
+crates/yakshed-desktop/gen/
 
 # Tauri
 src-tauri/target/

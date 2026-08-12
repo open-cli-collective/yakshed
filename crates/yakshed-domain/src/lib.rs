@@ -43,6 +43,16 @@ impl fmt::Display for ConnectionId {
 #[serde(try_from = "String", into = "String")]
 pub struct ArtifactId(Uuid);
 
+impl ArtifactId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn is_v7(self) -> bool {
+        self.0.get_version_num() == 7
+    }
+}
+
 impl FromStr for ArtifactId {
     type Err = ValidationError;
 
@@ -449,6 +459,67 @@ impl NamespacedProviderId {
     }
 }
 
+/// Lossless provider-owned identity for one run across runtime and session scopes.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderRunIdentity {
+    namespace: String,
+    runtime_id: String,
+    session_id: String,
+    run_id: String,
+}
+
+impl ProviderRunIdentity {
+    pub fn new(
+        namespace: impl Into<String>,
+        runtime_id: impl Into<String>,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+    ) -> Result<Self, ValidationError> {
+        let namespace = namespace.into();
+        let runtime_id = runtime_id.into();
+        let session_id = session_id.into();
+        let run_id = run_id.into();
+        require_provider_component("provider namespace", &namespace, 128)?;
+        require_provider_component("provider runtime id", &runtime_id, 4096)?;
+        require_provider_component("provider session id", &session_id, 4096)?;
+        require_provider_component("provider run id", &run_id, 4096)?;
+        Ok(Self {
+            namespace,
+            runtime_id,
+            session_id,
+            run_id,
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+}
+
+fn require_provider_component(
+    field: &'static str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), ValidationError> {
+    require_nonempty(field, value)?;
+    if value.len() > max_len || value.chars().any(char::is_control) {
+        return Err(ValidationError(format!("invalid {field}")));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectSnapshot {
     pub id: ProjectId,
@@ -521,7 +592,7 @@ pub struct RunSnapshot {
     pub connection_id: ConnectionId,
     pub work_item_id: WorkItemId,
     pub status: RunStatus,
-    pub provider_id: Option<NamespacedProviderId>,
+    pub provider_id: Option<ProviderRunIdentity>,
     pub created_at: UtcTimestamp,
     pub ended_at: Option<UtcTimestamp>,
 }
@@ -1055,6 +1126,23 @@ mod tests {
         }
         assert!(ProviderStateRootId::new("com0").is_ok());
         assert!(ProviderStateRootId::new("com10").is_ok());
+    }
+
+    #[test]
+    fn provider_run_identity_is_lossless_and_component_bounded() {
+        let component = "x".repeat(4096);
+        let identity = ProviderRunIdentity::new(
+            "codex",
+            component.clone(),
+            component.clone(),
+            component.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(identity.runtime_id(), component);
+        assert_eq!(identity.session_id(), component);
+        assert_eq!(identity.run_id(), component);
+        assert!(ProviderRunIdentity::new("codex", "x".repeat(4097), "s", "r").is_err());
     }
 
     #[test]

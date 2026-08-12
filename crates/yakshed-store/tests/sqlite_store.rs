@@ -7,9 +7,10 @@ use yakshed_application::{
     ListWorkItems, NewTimelineItem, PendingApproval, StoreError, TimelineBatch, TransitionRun,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalStatus, AuditEventId, ConnectionId,
-    NamespacedProviderId, ProjectId, RunId, RunSnapshot, RunStatus, StreamCursor, TimelineBatchId,
-    TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
+    ApprovalDecision, ApprovalRequestId, ApprovalStatus, ArtifactId, ArtifactKind,
+    ArtifactProvenance, ArtifactRecord, AuditEventId, ConnectionId, ContentDigest,
+    NamespacedProviderId, ProjectId, ProviderRunIdentity, RunId, RunSnapshot, RunStatus,
+    StreamCursor, TimelineBatchId, TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
 };
 use yakshed_store::{AppPaths, ConfigStore, SqliteStore};
 
@@ -111,11 +112,15 @@ fn connection_b() -> ConnectionId {
     "0193f26e-7a72-7000-8000-00000000bbb2".parse().unwrap()
 }
 
+fn provider_run(value: impl Into<String>) -> ProviderRunIdentity {
+    ProviderRunIdentity::new("mock", "runtime", "session", value).unwrap()
+}
+
 async fn accept_run(store: &SqliteStore, ids: &TestIds, run: RunSnapshot) -> RunSnapshot {
     let provider_id = run
         .provider_id
         .clone()
-        .or_else(|| Some(NamespacedProviderId::new("mock", format!("run/{}", run.id)).unwrap()));
+        .or_else(|| Some(provider_run(format!("run/{}", run.id))));
     store
         .transition_run(TransitionRun {
             run_id: run.id,
@@ -130,7 +135,7 @@ async fn accept_run(store: &SqliteStore, ids: &TestIds, run: RunSnapshot) -> Run
 }
 
 #[tokio::test]
-async fn empty_database_migrates_to_v3_before_ready() {
+async fn empty_database_migrates_to_v6_before_ready() {
     let context = Context::open().await;
     let database = context.paths.data_root.join("yakshed.sqlite3");
     context.store.shutdown().await.unwrap();
@@ -149,7 +154,7 @@ async fn empty_database_migrates_to_v3_before_ready() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        3
+        6
     );
     for table in [
         "projects",
@@ -160,6 +165,7 @@ async fn empty_database_migrates_to_v3_before_ready() {
         "approval_requests",
         "projection_cursors",
         "audit_events",
+        "artifacts",
     ] {
         assert!(
             connection
@@ -172,6 +178,76 @@ async fn empty_database_migrates_to_v3_before_ready() {
             "missing {table}"
         );
     }
+}
+
+#[tokio::test]
+async fn v4_migration_retains_legacy_provider_run_binding() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "legacy binding".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: Some(provider_run("legacy-run")),
+        })
+        .await
+        .unwrap();
+    let run = accept_run(&context.store, &context.ids, run).await;
+    context.store.shutdown().await.unwrap();
+
+    let database = context.paths.data_root.join("yakshed.sqlite3");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE runs_v4 (
+                id TEXT PRIMARY KEY NOT NULL,
+                connection_id TEXT NOT NULL,
+                work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+                status TEXT NOT NULL,
+                provider_namespace TEXT,
+                provider_run_id TEXT,
+                created_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER
+            );
+            INSERT INTO runs_v4
+            SELECT id, connection_id, work_item_id, status, provider_namespace,
+                   provider_run_id, created_at_ms, ended_at_ms
+            FROM runs;
+            DROP TABLE runs;
+            ALTER TABLE runs_v4 RENAME TO runs;
+            PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStore::open(
+        context.paths.clone(),
+        Arc::new(FixedClock),
+        context.ids.clone(),
+    )
+    .await
+    .unwrap();
+    let migrated = reopened.get_run(run.id).await.unwrap();
+    let provider = migrated.provider_id.unwrap();
+    assert_eq!(provider.namespace(), "mock");
+    assert_eq!(provider.runtime_id(), "mock");
+    assert_eq!(provider.session_id(), "legacy-run");
+    assert_eq!(provider.run_id(), "legacy-run");
 }
 
 #[tokio::test]
@@ -251,9 +327,17 @@ async fn v2_migration_preserves_run_children() {
                 UNIQUE (connection_id, id),
                 UNIQUE (connection_id, provider_namespace, provider_run_id)
             );
-            INSERT INTO runs_v1 SELECT * FROM runs;
+            INSERT INTO runs_v1 (
+                id, connection_id, work_item_id, status, provider_namespace,
+                provider_run_id, created_at_ms, ended_at_ms
+            )
+            SELECT
+                id, connection_id, work_item_id, status, provider_namespace,
+                provider_run_id, created_at_ms, ended_at_ms
+            FROM runs;
             DROP TABLE runs;
             ALTER TABLE runs_v1 RENAME TO runs;
+            DROP TABLE artifacts;
             PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -332,7 +416,7 @@ async fn newer_schema_is_rejected_without_modification() {
         SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::UnsupportedNewerSchema {
             found: 99,
-            supported: 3
+            supported: 6
         })
     ));
     assert_eq!(fs::read(database).unwrap(), before);
@@ -447,7 +531,7 @@ async fn duplicate_provider_id_is_a_conflict() {
         })
         .await
         .unwrap();
-    let provider_id = NamespacedProviderId::new("mock", "same-run").unwrap();
+    let provider_id = provider_run("same-run");
     context
         .store
         .create_run(CreateRun {
@@ -474,6 +558,59 @@ async fn duplicate_provider_id_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn artifact_run_must_belong_to_the_same_work_item() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work_a = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "A".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let work_b = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "B".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work_b.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        context
+            .store
+            .put_artifact_metadata(ArtifactRecord {
+                id: ArtifactId::new_v7(),
+                work_item_id: work_a.id,
+                run_id: Some(run.id),
+                kind: ArtifactKind::Plan,
+                digest: ContentDigest::new("0".repeat(64)).unwrap(),
+                byte_len: 1,
+                media_type: "text/plain".to_owned(),
+                provenance: ArtifactProvenance::new("test").unwrap(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
 async fn provider_ids_and_streams_are_scoped_by_connection() {
     let context = Context::open().await;
     let project_id = context.project().await;
@@ -487,7 +624,7 @@ async fn provider_ids_and_streams_are_scoped_by_connection() {
         })
         .await
         .unwrap();
-    let provider_run = NamespacedProviderId::new("mock", "same-native-run").unwrap();
+    let provider_run = provider_run("same-native-run");
     let run_a = context
         .store
         .create_run(CreateRun {
@@ -508,12 +645,36 @@ async fn provider_ids_and_streams_are_scoped_by_connection() {
         })
         .await
         .unwrap();
+    let run_c = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work.id,
+            provider_run: Some(
+                ProviderRunIdentity::new("mock", "runtime", "other-session", "same-native-run")
+                    .unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
     let run_a = accept_run(&context.store, &context.ids, run_a).await;
     let run_b = accept_run(&context.store, &context.ids, run_b).await;
+    let run_c = accept_run(&context.store, &context.ids, run_c).await;
     assert_eq!(run_a.connection_id, connection_a());
     assert_eq!(run_b.connection_id, connection_b());
+    assert_eq!(run_a.provider_id.as_ref().unwrap().runtime_id(), "runtime");
+    assert_eq!(run_a.provider_id.as_ref().unwrap().session_id(), "session");
+    assert_eq!(
+        run_a.provider_id.as_ref().unwrap().run_id(),
+        "same-native-run"
+    );
 
-    for (connection_id, run_id) in [(connection_a(), run_a.id), (connection_b(), run_b.id)] {
+    for (connection_id, run_id) in [
+        (connection_a(), run_a.id),
+        (connection_b(), run_b.id),
+        (connection_a(), run_c.id),
+    ] {
         context
             .store
             .append_timeline_batch(TimelineBatch {
@@ -551,7 +712,11 @@ async fn provider_ids_and_streams_are_scoped_by_connection() {
         Err(StoreError::Conflict(_))
     ));
 
-    for (connection_id, run_id) in [(connection_a(), run_a.id), (connection_b(), run_b.id)] {
+    for (connection_id, run_id) in [
+        (connection_a(), run_a.id),
+        (connection_b(), run_b.id),
+        (connection_a(), run_c.id),
+    ] {
         let approval = context
             .store
             .record_pending_approval(PendingApproval {
@@ -1765,7 +1930,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
             id: ids.next_run_id(),
             connection_id: connection_a(),
             work_item_id: child.id,
-            provider_run: Some(NamespacedProviderId::new("mock", "run/restart").unwrap()),
+            provider_run: Some(provider_run("run/restart")),
         })
         .await
         .unwrap();
@@ -1774,7 +1939,7 @@ async fn reopened_store_serves_all_durable_state_written_before_shutdown() {
             id: ids.next_run_id(),
             connection_id: connection_a(),
             work_item_id: child.id,
-            provider_run: Some(NamespacedProviderId::new("mock", "run/restart-2").unwrap()),
+            provider_run: Some(provider_run("run/restart-2")),
         })
         .await
         .unwrap();

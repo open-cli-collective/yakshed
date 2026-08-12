@@ -7,7 +7,6 @@ use std::{
 
 use async_trait::async_trait;
 use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
-use secrecy::SecretString;
 use tokio::sync::{Mutex, broadcast};
 use yakshed_application::{
     AppStore, ArtifactPort, ArtifactPortError, BeginApprovalResponse, CachePort, CachePortError,
@@ -22,9 +21,9 @@ use yakshed_desktop_api::{
 };
 use yakshed_domain::{
     ApprovalDecision, ArtifactId, ArtifactKind, Connection, ConnectionId, CredentialBinding,
-    CredentialBindingRecord, CredentialSlot, NamespacedProviderId, ProviderStateRootId, RunId,
-    RunStatus, SecretBackendId, SecretLocator, SecretReference, StreamCursor, UtcTimestamp,
-    WorkItemId,
+    CredentialBindingRecord, CredentialSlot, NamespacedProviderId, ProviderRunIdentity,
+    ProviderStateRootId, RunId, RunStatus, SecretBackendId, SecretLocator, SecretReference,
+    StreamCursor, UtcTimestamp, WorkItemId,
 };
 use yakshed_harness::{
     HarnessAdapter, HarnessCapabilities, HarnessError, HarnessEvent, HarnessInput,
@@ -39,6 +38,10 @@ use yakshed_secrets::{
 use yakshed_store::{
     AppPaths, ArtifactMetadata, ArtifactStore, CacheStore, ConfigStore, SqliteStore,
 };
+
+fn provider_run(value: &str) -> ProviderRunIdentity {
+    ProviderRunIdentity::new("mock", "runtime", "session", value).unwrap()
+}
 
 #[tokio::test]
 async fn work_item_create_snapshot_round_trip() {
@@ -85,7 +88,7 @@ async fn first_snapshot_waits_for_startup_reconciliation() {
             run_id: run.id,
             expected_current: RunStatus::Starting,
             target: RunStatus::OutcomeUnknown,
-            provider_id: Some(NamespacedProviderId::new("mock", "restart-ready").unwrap()),
+            provider_id: Some(provider_run("restart-ready")),
             occurred_at: UtcTimestamp::from_unix_millis(1),
             audit_event_id: fixture.ids.next_audit_event_id(),
         })
@@ -125,7 +128,7 @@ async fn recovery_snapshot_exposes_bounded_cursors_for_all_runs_and_approvals() 
             run_id: runs[0].id,
             expected_current: RunStatus::Starting,
             target: RunStatus::Running,
-            provider_id: Some(NamespacedProviderId::new("mock", "paged-run").unwrap()),
+            provider_id: Some(provider_run("paged-run")),
             occurred_at: UtcTimestamp::from_unix_millis(1),
             audit_event_id: fixture.ids.next_audit_event_id(),
         })
@@ -222,7 +225,7 @@ async fn recovery_matches_user_input_responses_by_request_id() {
             run_id: run.id,
             expected_current: RunStatus::Starting,
             target: RunStatus::Running,
-            provider_id: Some(NamespacedProviderId::new("mock", "input-recovery").unwrap()),
+            provider_id: Some(provider_run("input-recovery")),
             occurred_at: UtcTimestamp::from_unix_millis(1),
             audit_event_id: fixture.ids.next_audit_event_id(),
         })
@@ -296,7 +299,7 @@ async fn recovery_snapshot_exposes_uncertain_approval_response() {
             run_id: run.id,
             expected_current: RunStatus::Starting,
             target: RunStatus::Running,
-            provider_id: Some(NamespacedProviderId::new("mock", "approval-recovery").unwrap()),
+            provider_id: Some(provider_run("approval-recovery")),
             occurred_at: UtcTimestamp::from_unix_millis(1),
             audit_event_id: fixture.ids.next_audit_event_id(),
         })
@@ -967,7 +970,6 @@ impl TestFixture {
             .put_connection(PutConnectionCommand {
                 expected_config_revision: ConfigRevision::INITIAL,
                 connection: test_connection(connection_id),
-                ensure_memory_secret_backend: true,
             })
             .await
             .unwrap();
@@ -1122,8 +1124,7 @@ impl ConfigPort for TestConfigPort {
             .connection
             .credentials
             .iter()
-            .any(|binding| matches!(binding.binding, CredentialBinding::Secret { .. }))
-            || command.ensure_memory_secret_backend;
+            .any(|binding| matches!(binding.binding, CredentialBinding::Secret { .. }));
         let secret_backends = if needs_memory {
             vec![yakshed_domain::SecretBackend {
                 id: SecretBackendId::new("memory").unwrap(),
@@ -1251,7 +1252,7 @@ impl SecretPort for TestSecretPort {
                 std::slice::from_ref(connection),
                 binding,
                 &context,
-                &SecretString::from(command.value.expose()),
+                command.value.as_secret(),
                 PutSecretOptions {
                     overwrite: command.overwrite,
                 },

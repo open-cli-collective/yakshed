@@ -3,6 +3,7 @@ members = [
     "crates/provider-codex",
     "crates/provider-mock",
     "crates/yakshed-application",
+    "crates/yakshed-desktop",
     "crates/yakshed-desktop-api",
     "crates/yakshed-tauri",
     "crates/yakshed-domain",
@@ -24,6 +25,7 @@ atomic-write-file = "=0.3.0"
 directories = "=6.0.0"
 libc = "=0.2.189"
 provider-mock = { path = "crates/provider-mock" }
+provider-codex = { path = "crates/provider-codex" }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 rusqlite_migration = "=2.6.0"
 secrecy = "=0.10.3"
@@ -44,3 +46,4 @@ yakshed-domain = { path = "crates/yakshed-domain" }
 yakshed-harness = { path = "crates/yakshed-harness" }
 yakshed-secrets = { path = "crates/yakshed-secrets" }
 yakshed-store = { path = "crates/yakshed-store" }
+yakshed-tauri = { path = "crates/yakshed-tauri" }

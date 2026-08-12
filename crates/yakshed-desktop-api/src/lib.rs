@@ -617,21 +617,14 @@ impl DesktopApi {
         &self,
         expected_config_revision: ConfigRevision,
         connection: PublicConnection,
-        ensure_memory_secret_backend: bool,
     ) -> Result<ConnectionEnvelope> {
         let connection_id = connection.id;
-        let needs_memory_secret_backend = ensure_memory_secret_backend
-            || connection
-                .credentials
-                .iter()
-                .any(|binding| matches!(binding.source, PublicCredentialSource::Secret { .. }));
         let connection = to_domain_connection(connection)?;
         let snapshot = self
             .config
             .put_connection(PutConnectionCommand {
                 expected_config_revision,
                 connection,
-                ensure_memory_secret_backend: needs_memory_secret_backend,
             })
             .await
             .map_err(map_config_error)?;

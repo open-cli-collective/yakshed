@@ -4,15 +4,15 @@ use std::path::Path;
 use std::{collections::HashSet, error::Error, fmt};
 
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use thiserror::Error as ThisError;
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactRecord,
     AuditEventId, Connection, ConnectionId, CredentialBinding, CredentialSlot,
-    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderStateRootId, RunId, RunSnapshot,
-    RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator, StreamCursor,
-    TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
-    WorkItemId, WorkItemSnapshot,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderRunIdentity, ProviderStateRootId,
+    RunId, RunSnapshot, RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings,
+    SecretLocator, StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot,
+    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
 mod run_supervisor;
@@ -356,7 +356,6 @@ pub struct PublicConnectionList {
 pub struct PutConnectionCommand {
     pub expected_config_revision: ConfigRevision,
     pub connection: Connection,
-    pub ensure_memory_secret_backend: bool,
 }
 
 pub struct SetConnectionCredentialCommand {
@@ -435,8 +434,8 @@ impl SecretValue {
         }
     }
 
-    pub fn expose(&self) -> &str {
-        self.value.expose_secret()
+    pub fn as_secret(&self) -> &SecretString {
+        &self.value
     }
 }
 
@@ -598,7 +597,7 @@ pub struct CreateRun {
     pub id: RunId,
     pub connection_id: ConnectionId,
     pub work_item_id: WorkItemId,
-    pub provider_run: Option<NamespacedProviderId>,
+    pub provider_run: Option<ProviderRunIdentity>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -606,7 +605,7 @@ pub struct TransitionRun {
     pub run_id: RunId,
     pub expected_current: RunStatus,
     pub target: RunStatus,
-    pub provider_id: Option<NamespacedProviderId>,
+    pub provider_id: Option<ProviderRunIdentity>,
     pub occurred_at: UtcTimestamp,
     pub audit_event_id: AuditEventId,
 }
