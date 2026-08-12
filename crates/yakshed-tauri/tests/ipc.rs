@@ -438,7 +438,9 @@ fn build_app(
     tauri::WebviewWindow<tauri::test::MockRuntime>,
 ) {
     let app = configure(tauri::test::mock_builder(), state)
-        .build(tauri::generate_context!())
+        .build(tauri::generate_context!(
+            "../yakshed-desktop/tauri.conf.json"
+        ))
         .unwrap();
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()

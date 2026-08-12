@@ -34,7 +34,18 @@ fn registered_command_roster_is_exact() {
 
 #[test]
 fn hardened_config_is_exact() {
-    let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+    let config: Value =
+        serde_json::from_str(include_str!("../../yakshed-desktop/tauri.conf.json")).unwrap();
+    assert_eq!(
+        config["build"],
+        serde_json::json!({
+            "beforeDevCommand": "npm --prefix yakshed-tauri run dev",
+            "beforeBuildCommand": "npm --prefix yakshed-tauri run build",
+            "devUrl": "http://127.0.0.1:5173",
+            "frontendDist": "frontend"
+        })
+    );
+    assert_eq!(config["app"]["withGlobalTauri"], true);
     assert_eq!(config["app"]["windows"].as_array().unwrap().len(), 1);
     assert_eq!(config["app"]["windows"][0]["label"], "main");
     assert_eq!(config["app"]["windows"][0]["devtools"], false);
@@ -67,6 +78,8 @@ fn hardened_config_is_exact() {
             .iter()
             .all(|permission| !permission.contains(':') || permission.starts_with("core:event:"))
     );
+    assert_eq!(config["bundle"]["active"], true);
+    assert_eq!(config["bundle"]["targets"], serde_json::json!(["app"]));
 }
 
 #[test]
@@ -85,4 +98,29 @@ fn shell_manifest_has_only_desktop_api_as_a_workspace_runtime_dependency() {
         .filter(|name| name.starts_with("yakshed-") || name.starts_with("provider-"))
         .collect();
     assert_eq!(workspace_crates, ["yakshed-desktop-api"]);
+}
+
+#[test]
+fn desktop_manifest_is_the_only_full_graph_composition_root() {
+    let manifest: toml::Value =
+        toml::from_str(include_str!("../../yakshed-desktop/Cargo.toml")).unwrap();
+    let dependencies = manifest["target"]["cfg(target_os = \"macos\")"]["dependencies"]
+        .as_table()
+        .unwrap();
+    let actual: BTreeSet<_> = dependencies
+        .keys()
+        .filter(|name| name.starts_with("yakshed-") || name.starts_with("provider-"))
+        .map(String::as_str)
+        .collect();
+    let expected = BTreeSet::from([
+        "provider-codex",
+        "yakshed-application",
+        "yakshed-desktop-api",
+        "yakshed-domain",
+        "yakshed-harness",
+        "yakshed-secrets",
+        "yakshed-store",
+        "yakshed-tauri",
+    ]);
+    assert_eq!(actual, expected);
 }

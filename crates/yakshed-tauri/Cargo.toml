@@ -17,11 +17,13 @@ tauri = { workspace = true, features = ["test"] }
 tauri-build.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
+toml.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
 async-trait.workspace = true
 provider-mock.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
-toml.workspace = true
 yakshed-application.workspace = true
 yakshed-domain.workspace = true
 yakshed-harness.workspace = true

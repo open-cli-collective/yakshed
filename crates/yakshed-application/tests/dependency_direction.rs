@@ -14,6 +14,7 @@ enum Layer {
     Provider,
     DesktopApi,
     Tauri,
+    Desktop,
     Tools,
 }
 
@@ -193,7 +194,7 @@ impl Graph {
                 ));
             }
 
-            if source != Layer::Tauri
+            if !matches!(source, Layer::Tauri | Layer::Desktop)
                 && let Some(path) = self.find_path(id, |_, target| target.name == "tauri")
             {
                 violations.push(format!(
@@ -213,6 +214,21 @@ impl Graph {
                     }
                 }
             }
+
+            if source != Layer::Desktop
+                && let Some(path) = self.find_path(id, |_, target| {
+                    matches!(
+                        target.name.as_str(),
+                        "provider-codex" | "yakshed-store" | "yakshed-secrets"
+                    )
+                })
+                && !matches!(source, Layer::Provider | Layer::Infra | Layer::Tools)
+            {
+                violations.push(format!(
+                    "non-composition package reaches production graph: {}",
+                    self.display_path(&path)
+                ));
+            }
         }
 
         violations
@@ -227,6 +243,7 @@ fn classify(name: &str, manifest_path: &Path) -> Layer {
         name if name.starts_with("provider-") => Layer::Provider,
         "yakshed-desktop-api" => Layer::DesktopApi,
         "yakshed-tauri" => Layer::Tauri,
+        "yakshed-desktop" => Layer::Desktop,
         _ if manifest_path.starts_with("tools") => Layer::Tools,
         _ => panic!("unclassified workspace package: {name}"),
     }
@@ -243,6 +260,7 @@ fn allows_reachable_layer(source: Layer, target: Layer) -> bool {
             target,
             Layer::DesktopApi | Layer::Application | Layer::Domain
         ),
+        Layer::Desktop => target != Layer::Tools,
         Layer::Tools => target != Layer::Tools,
     }
 }

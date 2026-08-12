@@ -1,10 +1,8 @@
 #[cfg(target_os = "macos")]
-include!("src/roster.rs");
+include!("../yakshed-tauri/src/roster.rs");
 
 #[cfg(target_os = "macos")]
 fn run_tauri_build() {
-    std::env::set_current_dir("../yakshed-desktop")
-        .expect("desktop assembly crate should be present");
     macro_rules! build {
         ($($command:ident),+ $(,)?) => {
             tauri_build::try_build(
