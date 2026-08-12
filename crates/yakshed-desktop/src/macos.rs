@@ -1,9 +1,9 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     fs,
     io::Read,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -74,10 +74,7 @@ async fn compose() -> Result<yakshed_tauri::ShellState, StartupError> {
     );
     let local_backend = local_backend(&paths);
     let broker = Arc::new(build_broker(&config_store.snapshot(), &local_backend)?);
-    let harness = Arc::new(CodexHarness::new(
-        paths.clone(),
-        &config_store.snapshot().config.connections,
-    )?);
+    let harness = Arc::new(CodexHarness::new(paths.clone(), config_store.clone()));
     let cache = Arc::new(CacheStore::open(&paths).map_err(|_| StartupError::persistence())?);
     let artifacts = Arc::new(
         ArtifactStore::new(&paths, MAX_ARTIFACT_BYTES).map_err(|_| StartupError::persistence())?,
@@ -309,58 +306,56 @@ impl ArtifactPort for ProductionArtifacts {
                 yakshed_application::StoreError::NotFound { .. } => ArtifactPortError::NotFound,
                 _ => ArtifactPortError::Failed,
             })?;
-        let mut reader = self
-            .blobs
-            .open(&artifact.digest, command.max_bytes)
-            .map_err(map_artifact_error)?;
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|_| ArtifactPortError::Failed)?;
+        let blobs = self.blobs.clone();
+        let digest = artifact.digest.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            let mut reader = blobs
+                .open(&digest, command.max_bytes)
+                .map_err(map_artifact_error)?;
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .map_err(|_| ArtifactPortError::Failed)?;
+            Ok(bytes)
+        })
+        .await
+        .map_err(|_| ArtifactPortError::Failed)??;
         Ok(OpenArtifactPayload { artifact, bytes })
     }
 }
 
-struct ProviderState {
-    adapter: Arc<CodexAdapter>,
-}
-
 struct CodexHarness {
     paths: AppPaths,
-    providers: Mutex<HashMap<ConnectionId, ProviderState>>,
-    runs: Mutex<HashMap<ProviderRunRef, (ConnectionId, ProviderRunHandle)>>,
-    correlations: Mutex<HashMap<RunId, ProviderRunRef>>,
+    config: Arc<ConfigStore>,
+    run_state: StdMutex<RunState>,
     event_sender: mpsc::Sender<HarnessEvent>,
     events: Mutex<mpsc::Receiver<HarnessEvent>>,
 }
 
+#[derive(Default)]
+struct RunState {
+    runs: HashMap<ProviderRunRef, (Arc<CodexAdapter>, ProviderRunHandle)>,
+    native_refs: HashMap<ProviderRunHandle, ProviderRunRef>,
+    correlations: HashMap<RunId, ProviderRunRef>,
+}
+
 impl CodexHarness {
-    fn new(paths: AppPaths, connections: &[Connection]) -> Result<Self, StartupError> {
+    fn new(paths: AppPaths, config: Arc<ConfigStore>) -> Self {
         let (event_sender, events) = mpsc::channel(128);
-        let mut providers = HashMap::new();
-        for connection in connections {
-            if connection.harness != "codex" {
-                continue;
-            }
-            let (state, stream) =
-                Self::provider(&paths, connection.id).map_err(|_| StartupError::internal())?;
-            Self::forward(stream, event_sender.clone());
-            providers.insert(connection.id, state);
-        }
-        Ok(Self {
+        Self {
             paths,
-            providers: Mutex::new(providers),
-            runs: Mutex::new(HashMap::new()),
-            correlations: Mutex::new(HashMap::new()),
+            config,
+            run_state: StdMutex::new(RunState::default()),
             event_sender,
             events: Mutex::new(events),
-        })
+        }
     }
 
     fn provider(
         paths: &AppPaths,
-        connection_id: ConnectionId,
-    ) -> Result<(ProviderState, ProviderEventStream), HarnessPortError> {
+        connection: &Connection,
+    ) -> Result<(Arc<CodexAdapter>, ProviderEventStream), HarnessPortError> {
+        let connection_id = connection.id;
         let runtime =
             RuntimeHandle::new(format!("codex-{connection_id}")).map_err(map_harness_error)?;
         let spec = CodexRuntimeSpec::local(
@@ -371,7 +366,7 @@ impl CodexHarness {
                 codex_home: paths
                     .data_root
                     .join("codex")
-                    .join(connection_id.to_string()),
+                    .join(connection.provider_state.as_str()),
                 execution_runtime: "local".to_owned(),
             },
             PathBuf::from("codex"),
@@ -379,7 +374,7 @@ impl CodexHarness {
         );
         let adapter = Arc::new(CodexAdapter::new(spec).map_err(map_harness_error)?);
         let stream = adapter.subscribe().map_err(map_harness_error)?;
-        Ok((ProviderState { adapter }, stream))
+        Ok((adapter, stream))
     }
 
     fn forward(mut stream: ProviderEventStream, sender: mpsc::Sender<HarnessEvent>) {
@@ -392,28 +387,27 @@ impl CodexHarness {
         });
     }
 
-    fn run_ref(run: &ProviderRunHandle) -> Result<ProviderRunRef, HarnessPortError> {
-        ProviderRunRef::new("codex", run.to_string())
-            .map_err(|error| HarnessPortError::InvalidInput(error.to_string()))
+    fn run_ref(&self, run: &ProviderRunHandle) -> Result<ProviderRunRef, HarnessPortError> {
+        self.run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .native_refs
+            .get(run)
+            .cloned()
+            .ok_or_else(|| HarnessPortError::NotFound(run.to_string()))
     }
 
     async fn native_run(
         &self,
         run: &ProviderRunRef,
     ) -> Result<(Arc<CodexAdapter>, ProviderRunHandle), HarnessPortError> {
-        let (connection_id, native) = self
-            .runs
+        self.run_state
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runs
             .get(run)
             .cloned()
-            .ok_or_else(|| HarnessPortError::NotFound(run.native_id().to_owned()))?;
-        let providers = self.providers.lock().await;
-        let adapter = providers
-            .get(&connection_id)
-            .map(|state| state.adapter.clone())
-            .ok_or_else(|| HarnessPortError::NotFound(connection_id.to_string()))?;
-        Ok((adapter, native))
+            .ok_or_else(|| HarnessPortError::NotFound(run.native_id().to_owned()))
     }
 }
 
@@ -425,26 +419,40 @@ impl RunHarness for CodexHarness {
         correlation_id: RunId,
         input: String,
     ) -> Result<ProviderRunRef, HarnessPortError> {
-        if let Some(run) = self.correlations.lock().await.get(&correlation_id).cloned() {
+        if let Some(run) = self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .correlations
+            .get(&correlation_id)
+            .cloned()
+        {
             return Ok(run);
         }
-        let mut providers = self.providers.lock().await;
-        if let Entry::Vacant(entry) = providers.entry(connection_id) {
-            let (state, stream) = Self::provider(&self.paths, connection_id)?;
-            Self::forward(stream, self.event_sender.clone());
-            entry.insert(state);
+        let connection = self
+            .config
+            .snapshot()
+            .config
+            .connections
+            .into_iter()
+            .find(|connection| connection.id == connection_id)
+            .ok_or_else(|| HarnessPortError::NotFound(connection_id.to_string()))?;
+        if connection.harness != "codex" {
+            return Err(HarnessPortError::Unsupported(format!(
+                "connection {} uses harness {}",
+                connection.id, connection.harness
+            )));
         }
-        let adapter = providers
-            .get_mut(&connection_id)
-            .expect("provider inserted")
-            .adapter
-            .clone();
-        drop(providers);
+        let (adapter, stream) = Self::provider(&self.paths, &connection)?;
+        Self::forward(stream, self.event_sender.clone());
+        let run = ProviderRunRef::new("codex", correlation_id.to_string())
+            .map_err(|error| HarnessPortError::InvalidInput(error.to_string()))?;
         let session = adapter
             .start_session(
                 &RuntimeHandle::new(format!("codex-{connection_id}")).map_err(map_harness_error)?,
                 StartSessionSpec {
-                    working_directory: run_working_directory(&self.paths, correlation_id)?,
+                    working_directory: run_working_directory(self.paths.clone(), correlation_id)
+                        .await?,
                     title: format!("YakShed run {correlation_id}"),
                 },
             )
@@ -458,15 +466,13 @@ impl RunHarness for CodexHarness {
             )
             .await
             .map_err(map_harness_error)?;
-        let run = Self::run_ref(&native)?;
-        self.runs
+        let mut state = self
+            .run_state
             .lock()
-            .await
-            .insert(run.clone(), (connection_id, native));
-        self.correlations
-            .lock()
-            .await
-            .insert(correlation_id, run.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.native_refs.insert(native.clone(), run.clone());
+        state.runs.insert(run.clone(), (adapter, native));
+        state.correlations.insert(correlation_id, run.clone());
         Ok(run)
     }
 
@@ -475,7 +481,13 @@ impl RunHarness for CodexHarness {
         _connection_id: ConnectionId,
         correlation_id: RunId,
     ) -> Result<Option<ProviderRunRef>, HarnessPortError> {
-        Ok(self.correlations.lock().await.get(&correlation_id).cloned())
+        Ok(self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .correlations
+            .get(&correlation_id)
+            .cloned())
     }
 
     async fn steer(&self, run: &ProviderRunRef, input: String) -> Result<(), HarnessPortError> {
@@ -515,137 +527,154 @@ impl RunHarness for CodexHarness {
     }
 
     async fn next_event(&self) -> Result<Option<RunHarnessEvent>, HarnessPortError> {
-        self.events
-            .lock()
-            .await
-            .recv()
-            .await
-            .map(convert_event)
-            .transpose()
+        match self.events.lock().await.recv().await {
+            Some(event) => self.convert_event(event).map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn reconnect(&self, run: &ProviderRunRef) -> Result<bool, HarnessPortError> {
-        Ok(self.runs.lock().await.contains_key(run))
+        Ok(self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runs
+            .contains_key(run))
     }
 }
 
-fn convert_event(event: HarnessEvent) -> Result<RunHarnessEvent, HarnessPortError> {
-    Ok(match event {
-        HarnessEvent::RunAccepted { run, .. } => RunHarnessEvent::RunAccepted {
-            run: CodexHarness::run_ref(&run)?,
-        },
-        HarnessEvent::MessageDelta { run, chunk, .. } => RunHarnessEvent::MessageDelta {
-            run: CodexHarness::run_ref(&run)?,
-            chunk,
-        },
-        HarnessEvent::MessageCompleted { run, text, .. } => RunHarnessEvent::MessageCompleted {
-            run: CodexHarness::run_ref(&run)?,
-            text,
-        },
-        HarnessEvent::ApprovalRequested {
-            request, summary, ..
-        } => RunHarnessEvent::ApprovalRequested {
-            request: request_ref(&request)?,
-            summary,
-        },
-        HarnessEvent::UserInputRequested {
-            request, prompt, ..
-        } => RunHarnessEvent::UserInputRequested {
-            request: request_ref(&request)?,
-            prompt,
-        },
-        HarnessEvent::FileMutation {
-            run, path, summary, ..
-        } => RunHarnessEvent::FileMutation {
-            run: CodexHarness::run_ref(&run)?,
-            path,
-            summary,
-        },
-        HarnessEvent::CommandOutputDelta {
-            run,
-            command,
-            command_text,
-            chunk,
-            ..
-        } => RunHarnessEvent::CommandOutputDelta {
-            run: CodexHarness::run_ref(&run)?,
-            command: ProviderCommandRef {
-                run: CodexHarness::run_ref(command.run())?,
-                native_id: command.native_id().to_string(),
+impl CodexHarness {
+    fn convert_event(&self, event: HarnessEvent) -> Result<RunHarnessEvent, HarnessPortError> {
+        Ok(match event {
+            HarnessEvent::RunAccepted { run, .. } => RunHarnessEvent::RunAccepted {
+                run: self.run_ref(&run)?,
             },
-            command_text,
-            chunk,
-        },
-        HarnessEvent::CommandOutputCompleted {
-            run,
-            command,
-            command_text,
-            output,
-            ..
-        } => RunHarnessEvent::CommandOutputCompleted {
-            run: CodexHarness::run_ref(&run)?,
-            command: ProviderCommandRef {
-                run: CodexHarness::run_ref(command.run())?,
-                native_id: command.native_id().to_string(),
+            HarnessEvent::MessageDelta { run, chunk, .. } => RunHarnessEvent::MessageDelta {
+                run: self.run_ref(&run)?,
+                chunk,
             },
-            command_text,
-            output,
-        },
-        HarnessEvent::RunTerminal { run, state, .. } => RunHarnessEvent::RunTerminal {
-            run: CodexHarness::run_ref(&run)?,
-            state: match state {
-                HarnessRunTerminal::Completed => RunTerminal::Completed,
-                HarnessRunTerminal::Failed { diagnostic } => RunTerminal::Failed {
-                    diagnostic: diagnostic.sanitized_text().to_owned(),
+            HarnessEvent::MessageCompleted { run, text, .. } => RunHarnessEvent::MessageCompleted {
+                run: self.run_ref(&run)?,
+                text,
+            },
+            HarnessEvent::ApprovalRequested {
+                request, summary, ..
+            } => RunHarnessEvent::ApprovalRequested {
+                request: self.request_ref(&request)?,
+                summary,
+            },
+            HarnessEvent::UserInputRequested {
+                request, prompt, ..
+            } => RunHarnessEvent::UserInputRequested {
+                request: self.request_ref(&request)?,
+                prompt,
+            },
+            HarnessEvent::FileMutation {
+                run, path, summary, ..
+            } => RunHarnessEvent::FileMutation {
+                run: self.run_ref(&run)?,
+                path,
+                summary,
+            },
+            HarnessEvent::CommandOutputDelta {
+                run,
+                command,
+                command_text,
+                chunk,
+                ..
+            } => RunHarnessEvent::CommandOutputDelta {
+                run: self.run_ref(&run)?,
+                command: ProviderCommandRef {
+                    run: self.run_ref(command.run())?,
+                    native_id: command.native_id().to_string(),
                 },
-                HarnessRunTerminal::Interrupted => RunTerminal::Interrupted,
-                HarnessRunTerminal::Crashed { diagnostic } => RunTerminal::Crashed {
-                    diagnostic: diagnostic.sanitized_text().to_owned(),
+                command_text,
+                chunk,
+            },
+            HarnessEvent::CommandOutputCompleted {
+                run,
+                command,
+                command_text,
+                output,
+                ..
+            } => RunHarnessEvent::CommandOutputCompleted {
+                run: self.run_ref(&run)?,
+                command: ProviderCommandRef {
+                    run: self.run_ref(command.run())?,
+                    native_id: command.native_id().to_string(),
+                },
+                command_text,
+                output,
+            },
+            HarnessEvent::RunTerminal { run, state, .. } => RunHarnessEvent::RunTerminal {
+                run: self.run_ref(&run)?,
+                state: match state {
+                    HarnessRunTerminal::Completed => RunTerminal::Completed,
+                    HarnessRunTerminal::Failed { diagnostic } => RunTerminal::Failed {
+                        diagnostic: diagnostic.sanitized_text().to_owned(),
+                    },
+                    HarnessRunTerminal::Interrupted => RunTerminal::Interrupted,
+                    HarnessRunTerminal::Crashed { diagnostic } => RunTerminal::Crashed {
+                        diagnostic: diagnostic.sanitized_text().to_owned(),
+                    },
                 },
             },
-        },
-        HarnessEvent::Unknown {
-            run,
-            item_type,
-            native,
-        } => RunHarnessEvent::Unknown {
-            run: run.as_ref().map(CodexHarness::run_ref).transpose()?,
-            item_type,
-            native: native.sanitized_raw().to_owned(),
-        },
-        HarnessEvent::MalformedNativePayload {
-            run,
-            item_type,
-            native,
-        } => RunHarnessEvent::Malformed {
-            run: run.as_ref().map(CodexHarness::run_ref).transpose()?,
-            item_type,
-            native: native.sanitized_raw().to_owned(),
-        },
-    })
+            HarnessEvent::Unknown {
+                run,
+                item_type,
+                native,
+            } => RunHarnessEvent::Unknown {
+                run: match run.as_ref() {
+                    Some(run) => Some(self.run_ref(run)?),
+                    None => None,
+                },
+                item_type,
+                native: native.sanitized_raw().to_owned(),
+            },
+            HarnessEvent::MalformedNativePayload {
+                run,
+                item_type,
+                native,
+            } => RunHarnessEvent::Malformed {
+                run: match run.as_ref() {
+                    Some(run) => Some(self.run_ref(run)?),
+                    None => None,
+                },
+                item_type,
+                native: native.sanitized_raw().to_owned(),
+            },
+        })
+    }
+
+    fn request_ref(
+        &self,
+        request: &ProviderRequestHandle,
+    ) -> Result<ProviderRequestRef, HarnessPortError> {
+        Ok(ProviderRequestRef {
+            run: self.run_ref(request.run())?,
+            native_id: request.native_id().to_string(),
+        })
+    }
 }
 
-fn request_ref(request: &ProviderRequestHandle) -> Result<ProviderRequestRef, HarnessPortError> {
-    Ok(ProviderRequestRef {
-        run: CodexHarness::run_ref(request.run())?,
-        native_id: request.native_id().to_string(),
-    })
-}
-
-fn run_working_directory(
-    paths: &AppPaths,
+async fn run_working_directory(
+    paths: AppPaths,
     correlation_id: RunId,
 ) -> Result<RuntimePath, HarnessPortError> {
-    use std::os::unix::fs::PermissionsExt;
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::PermissionsExt;
 
-    let path = paths
-        .data_root
-        .join("runs")
-        .join(correlation_id.to_string());
-    fs::create_dir_all(&path).map_err(|error| HarnessPortError::Runtime(error.to_string()))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| HarnessPortError::Runtime(error.to_string()))?;
-    RuntimePath::new(path.to_string_lossy().into_owned()).map_err(map_harness_error)
+        let path = paths
+            .data_root
+            .join("runs")
+            .join(correlation_id.to_string());
+        fs::create_dir_all(&path).map_err(|error| HarnessPortError::Runtime(error.to_string()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| HarnessPortError::Runtime(error.to_string()))?;
+        RuntimePath::new(path.to_string_lossy().into_owned()).map_err(map_harness_error)
+    })
+    .await
+    .map_err(|error| HarnessPortError::Runtime(error.to_string()))?
 }
 
 fn public_connection(connection: Connection) -> PublicConnection {
@@ -730,13 +759,30 @@ fn map_harness_error(error: HarnessError) -> HarnessPortError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yakshed_application::{AppStore, CreateProject, CreateWorkItem, IdGenerator};
+    use yakshed_application::{
+        AppStore, ConfigRevision, CreateProject, CreateWorkItem, IdGenerator,
+    };
     use yakshed_domain::{
         ArtifactId, ArtifactKind, ArtifactProvenance, CredentialBindingRecord, CredentialSlot,
         ProviderStateRootId, SecretLocator, SecretReference,
     };
     use yakshed_harness::{NativePayload, ProviderRunId, ProviderSessionId};
     use yakshed_store::ArtifactMetadata;
+
+    fn test_config(paths: &AppPaths) -> Arc<ConfigStore> {
+        Arc::new(ConfigStore::open(paths.clone(), backend_capabilities()).unwrap())
+    }
+
+    fn connection(id: &str, harness: &str, provider_state: &str) -> Connection {
+        Connection {
+            id: id.parse().unwrap(),
+            name: "test".to_owned(),
+            harness: harness.to_owned(),
+            model_provider: "test".to_owned(),
+            provider_state: ProviderStateRootId::new(provider_state).unwrap(),
+            credentials: vec![],
+        }
+    }
 
     #[tokio::test]
     async fn production_config_accepts_a_secret_backed_connection() {
@@ -852,41 +898,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_provider_run_components_return_a_typed_event_error() {
+    async fn unknown_and_wrong_harness_connections_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let harness = CodexHarness::new(AppPaths::for_test(temp.path()), &[]).unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let config = test_config(&paths);
+        let wrong = connection("0193f26e-7a72-7000-8000-00000000d002", "mock", "mock-test");
+        config
+            .update(
+                ConfigRevision::INITIAL,
+                ConfigChange::PutConnection(wrong.clone()),
+            )
+            .await
+            .unwrap();
+        let harness = CodexHarness::new(paths, config);
+
+        assert!(matches!(
+            harness
+                .start_run(
+                    "0193f26e-7a72-7000-8000-00000000ffff".parse().unwrap(),
+                    SystemIdGenerator.next_run_id(),
+                    "test".to_owned(),
+                )
+                .await,
+            Err(HarnessPortError::NotFound(_))
+        ));
+        assert!(matches!(
+            harness
+                .start_run(wrong.id, SystemIdGenerator.next_run_id(), "test".to_owned(),)
+                .await,
+            Err(HarnessPortError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_native_run_is_retained_under_a_bounded_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let config = test_config(&paths);
+        let harness = CodexHarness::new(paths, config);
+        let codex = connection(
+            "0193f26e-7a72-7000-8000-00000000d003",
+            "codex",
+            "codex-long-run",
+        );
+        let (adapter, _) = CodexHarness::provider(&harness.paths, &codex).unwrap();
         let component = "x".repeat(4096);
-        let run = ProviderRunHandle::new(
+        let native = ProviderRunHandle::new(
             RuntimeHandle::new(component.clone()).unwrap(),
             ProviderSessionId::new(component.clone()).unwrap(),
             ProviderRunId::new(component).unwrap(),
         );
+        assert!(ProviderRunRef::new("codex", native.to_string()).is_err());
+        let run =
+            ProviderRunRef::new("codex", SystemIdGenerator.next_run_id().to_string()).unwrap();
+        {
+            let mut state = harness.run_state.lock().unwrap();
+            state.native_refs.insert(native.clone(), run.clone());
+            state
+                .runs
+                .insert(run.clone(), (adapter.clone(), native.clone()));
+        }
+        assert_eq!(harness.native_run(&run).await.unwrap().1, native);
 
         harness
             .event_sender
             .send(HarnessEvent::RunAccepted {
-                run,
+                run: native,
                 native: NativePayload::sanitized("{}"),
             })
             .await
             .unwrap();
 
-        assert!(matches!(
-            harness.next_event().await,
-            Err(HarnessPortError::InvalidInput(_))
-        ));
+        assert_eq!(
+            harness.next_event().await.unwrap(),
+            Some(RunHarnessEvent::RunAccepted { run })
+        );
     }
 
-    #[test]
-    fn each_run_gets_its_deterministic_private_working_directory() {
+    #[tokio::test]
+    async fn each_run_gets_its_deterministic_private_working_directory() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
         let run_id = SystemIdGenerator.next_run_id();
         let other_run_id = SystemIdGenerator.next_run_id();
-        let directory = run_working_directory(&paths, run_id).unwrap();
-        let other_directory = run_working_directory(&paths, other_run_id).unwrap();
+        let directory = run_working_directory(paths.clone(), run_id).await.unwrap();
+        let other_directory = run_working_directory(paths.clone(), other_run_id)
+            .await
+            .unwrap();
         let expected = paths.data_root.join("runs").join(run_id.to_string());
 
         assert_eq!(directory.as_str(), expected.to_string_lossy());

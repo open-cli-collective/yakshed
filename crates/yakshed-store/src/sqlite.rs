@@ -336,8 +336,11 @@ impl SqliteStore {
         let byte_len = i64::try_from(artifact.byte_len)
             .map_err(|error| StoreError::Conflict(error.to_string()))?;
         self.call(move |worker| {
-            let existing = worker
+            let transaction = worker
                 .connection
+                .transaction()
+                .map_err(map_database_error)?;
+            let existing = transaction
                 .query_row(
                     &format!("{ARTIFACT_SELECT} WHERE id = ?1"),
                     [artifact.id.to_string()],
@@ -355,8 +358,24 @@ impl SqliteStore {
                     )))
                 };
             }
-            worker
-                .connection
+            if let Some(run_id) = artifact.run_id {
+                let owns_run = transaction
+                    .query_row(
+                        "SELECT 1 FROM runs WHERE id = ?1 AND work_item_id = ?2",
+                        params![run_id.to_string(), artifact.work_item_id.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(map_database_error)?
+                    .is_some();
+                if !owns_run {
+                    return Err(StoreError::Conflict(format!(
+                        "run {run_id} does not belong to work item {}",
+                        artifact.work_item_id
+                    )));
+                }
+            }
+            transaction
                 .execute(
                     "INSERT INTO artifacts (
                         id, work_item_id, run_id, kind, digest, byte_len, media_type, provenance
@@ -373,6 +392,7 @@ impl SqliteStore {
                     ],
                 )
                 .map_err(map_database_error)?;
+            transaction.commit().map_err(map_database_error)?;
             Ok(artifact)
         })
         .await

@@ -7,7 +7,8 @@ use yakshed_application::{
     ListWorkItems, NewTimelineItem, PendingApproval, StoreError, TimelineBatch, TransitionRun,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalStatus, AuditEventId, ConnectionId,
+    ApprovalDecision, ApprovalRequestId, ApprovalStatus, ArtifactId, ArtifactKind,
+    ArtifactProvenance, ArtifactRecord, AuditEventId, ConnectionId, ContentDigest,
     NamespacedProviderId, ProjectId, RunId, RunSnapshot, RunStatus, StreamCursor, TimelineBatchId,
     TimelineItemId, UtcTimestamp, WorkItemId, WorkItemStatus,
 };
@@ -469,6 +470,59 @@ async fn duplicate_provider_id_is_a_conflict() {
                 connection_id: connection_a(),
                 work_item_id: work.id,
                 provider_run: Some(provider_id),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn artifact_run_must_belong_to_the_same_work_item() {
+    let context = Context::open().await;
+    let project_id = context.project().await;
+    let work_a = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "A".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let work_b = context
+        .store
+        .create_work_item(CreateWorkItem {
+            id: context.ids.next_work_item_id(),
+            project_id,
+            title: "B".into(),
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let run = context
+        .store
+        .create_run(CreateRun {
+            id: context.ids.next_run_id(),
+            connection_id: connection_a(),
+            work_item_id: work_b.id,
+            provider_run: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        context
+            .store
+            .put_artifact_metadata(ArtifactRecord {
+                id: ArtifactId::new_v7(),
+                work_item_id: work_a.id,
+                run_id: Some(run.id),
+                kind: ArtifactKind::Plan,
+                digest: ContentDigest::new("0".repeat(64)).unwrap(),
+                byte_len: 1,
+                media_type: "text/plain".to_owned(),
+                provenance: ArtifactProvenance::new("test").unwrap(),
             })
             .await,
         Err(StoreError::Conflict(_))
