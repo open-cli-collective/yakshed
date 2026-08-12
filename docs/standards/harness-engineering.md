@@ -66,7 +66,9 @@ the applicable technical standards true. The minimum evidence is:
 
 - **Repository front door:** `AGENTS.md` is a short index, `CLAUDE.md` is only
   its pointer, README describes current capability separately from direction,
-  and obsolete guidance is removed or moved to its owner.
+  obsolete guidance is removed or moved to its owner, and both
+  `scripts/verify_agent_guidance.py --self-test` and
+  `scripts/verify_agent_guidance.py` pass.
 - **Backend changes:** relevant formatting/tests run; the full cheap lane
   remains available; boundary changes have the appropriate contract,
   hermeticity, restart, redaction, or recovery evidence.

@@ -3,12 +3,14 @@ description: Reviews YakShed Tauri configuration, commands, events, capabilities
 model_tier: medium
 effort: high
 file_globs:
-  - "**/tauri.conf.json"
-  - "**/tauri.conf.json5"
-  - "**/tauri.conf.toml"
-  - "src-tauri/**"
-  - "**/capabilities/**"
-  - "**/permissions/**"
+  - "crates/yakshed-desktop/tauri.conf.json"
+  - "crates/yakshed-tauri/Cargo.toml"
+  - "crates/yakshed-tauri/build.rs"
+  - "crates/yakshed-tauri/src/lib.rs"
+  - "crates/yakshed-tauri/src/macos.rs"
+  - "crates/yakshed-tauri/src/roster.rs"
+  - "crates/yakshed-tauri/src/frontend/client.ts"
+  - "crates/yakshed-tauri/tests/**"
   - "crates/yakshed-desktop-api/**"
 applies_when:
   - A change edits Tauri configuration, command/event handlers, the desktop facade, capabilities, permissions, plugins, CSP, sidecars, windows, updater, or frontend/backend DTOs.

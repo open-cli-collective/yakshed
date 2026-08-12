@@ -56,11 +56,12 @@ technical standards. Phase criteria and runbooks apply within their scope.
 
 ## Checks
 
-For a docs-only change, run `git diff --check` and verify every new relative
-Markdown link resolves. For implementation changes, use the smallest relevant
-fast checks first:
+For docs-only changes, run `git diff --check` and verify every new relative
+Markdown link. For implementation changes, use the smallest relevant checks:
 
 ```text
+python3 scripts/verify_agent_guidance.py --self-test
+python3 scripts/verify_agent_guidance.py
 cargo fmt --all -- --check
 cargo test -p <changed-crate> --locked
 python3 scripts/verify_schema_pin.py       # only when pins/schema are touched

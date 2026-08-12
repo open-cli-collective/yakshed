@@ -62,6 +62,8 @@ and longer-lived background supervision. See the
 Run the deterministic backend checks from the repository root:
 
 ```sh
+python3 scripts/verify_agent_guidance.py --self-test
+python3 scripts/verify_agent_guidance.py
 cargo test --workspace --locked
 cargo build -p yakshed-contract-host --locked
 python3 scripts/backend_contract_test.py \
@@ -93,6 +95,8 @@ For a packaged app and clean launch/quit check, use
 The practical full workspace lane is:
 
 ```sh
+python3 scripts/verify_agent_guidance.py --self-test
+python3 scripts/verify_agent_guidance.py
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked

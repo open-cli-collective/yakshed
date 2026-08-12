@@ -87,7 +87,7 @@ external dependency. Use modules for internal organization when another crate wo
 
 ---
 
-## 3. Initial workspace shape
+## 3. Workspace shape
 
 This is a starting point, not a requirement to create every crate before code exists.
 
@@ -131,16 +131,17 @@ crates/
 │   ├── deterministic scripted harness
 │   └── fault injection
 │
-└── yakshed-desktop-api/
+├── yakshed-desktop-api/
     ├── frontend-safe DTOs
     ├── plain Rust command facade
     └── event/snapshot mapping
-
-src-tauri/
-├── Tauri application assembly
-├── #[tauri::command] wrappers
-├── capabilities and permissions
-└── sidecar packaging
+├── yakshed-tauri/
+│   ├── #[tauri::command] wrappers
+│   ├── capabilities and permissions
+│   └── Svelte frontend
+└── yakshed-desktop/
+    ├── production application assembly
+    └── sidecar packaging
 
 tools/
 └── yakshed-contract-host/
@@ -155,7 +156,7 @@ Potential consolidation is acceptable:
 
 - `yakshed-domain` and `yakshed-application` may begin as one crate if dependency direction remains clear.
 - runtime supervision may begin inside `yakshed-harness`.
-- `yakshed-desktop-api` may initially be a plain Rust module under `src-tauri`, provided it does not import Tauri.
+- `yakshed-desktop-api` may be consolidated only if it remains plain Rust and does not import Tauri.
 
 Do not split an implementation into `*-api`, `*-core`, `*-impl`, and `*-types` crates until a concrete dependency problem exists.
 
@@ -178,7 +179,10 @@ yakshed-application
 yakshed-desktop-api
       ▲
       │
-src-tauri
+yakshed-tauri
+      ▲
+      │
+yakshed-desktop
 ```
 
 Infrastructure crates may depend on domain types where useful. The domain does not import infrastructure types.
