@@ -294,7 +294,7 @@ transport_test!(canonical_account_read_reconciles_external_auth_change, {
     ));
 });
 
-transport_test!(native_api_key_account_is_authenticated, {
+transport_test!(mode_b_null_account_without_openai_requirement_is_ready, {
     let test = adapter("mode_b", 1024 * 1024, None);
     test.adapter
         .start_with_environment(
@@ -308,8 +308,36 @@ transport_test!(native_api_key_account_is_authenticated, {
         test.adapter.account_status(&test.runtime).await.unwrap(),
         HarnessAccountStatus::Authenticated {
             email: None,
-            plan: "api_key".to_owned(),
+            plan: "auth_not_required".to_owned(),
         }
+    );
+});
+
+transport_test!(malformed_account_update_preserves_pending_login, {
+    let test = adapter("account_login_malformed_update", 1024 * 1024, None);
+    let first = test
+        .adapter
+        .account_login_start(&test.runtime)
+        .await
+        .unwrap();
+    assert!(matches!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::LoginInProgress { .. }
+    ));
+    assert_eq!(
+        test.adapter
+            .account_login_start(&test.runtime)
+            .await
+            .unwrap(),
+        first
+    );
+    let requests = std::fs::read_to_string(test.runtime_home().join("requests.log")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "account/login/start")
+            .count(),
+        1
     );
 });
 

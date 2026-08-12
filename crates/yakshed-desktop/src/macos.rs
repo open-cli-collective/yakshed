@@ -1055,8 +1055,8 @@ impl CodexHarness {
             }
         };
         let generation = secret.expose(|value| self.credential_generations.hash_one(value));
-        let previous = {
-            let mut state = self
+        let (same_generation, active, cached_adapter) = {
+            let state = self
                 .run_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1064,25 +1064,40 @@ impl CodexHarness {
                 .providers
                 .get(&connection.id)
                 .ok_or_else(|| HarnessPortError::NotFound(connection.id.to_string()))?;
-            if provider.credential_generation == Some(generation) {
-                return Ok(provider.adapter.clone());
-            }
-            if state
-                .runs
-                .values()
-                .any(|(owner, _, _)| *owner == connection.id)
-            {
-                return Err(HarnessPortError::Conflict(
-                    "credential changed while provider runs are active".to_owned(),
-                ));
-            }
-            state
-                .providers
-                .remove(&connection.id)
-                .expect("checked provider")
-                .adapter
+            (
+                provider.credential_generation == Some(generation),
+                state
+                    .runs
+                    .values()
+                    .any(|(owner, _, _)| *owner == connection.id),
+                provider.adapter.clone(),
+            )
         };
-        previous.shutdown().await.map_err(map_harness_error)?;
+        if same_generation
+            && cached_adapter
+                .has_live_credential_environment(runtime)
+                .await
+                .map_err(map_harness_error)?
+        {
+            return Ok(cached_adapter);
+        }
+        if active {
+            return Err(HarnessPortError::Conflict(
+                "credential changed while provider runs are active".to_owned(),
+            ));
+        }
+        let previous = self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .providers
+            .remove(&connection.id)
+            .map_or(cached_adapter, |provider| provider.adapter);
+        if let Err(error) = previous.shutdown().await
+            && !matches!(error, HarnessError::Disconnected)
+        {
+            return Err(map_harness_error(error));
+        }
         let adapter = self.adapter(connection)?;
         adapter
             .start_with_environment(runtime, variable, secret.into_secret())
@@ -2827,6 +2842,35 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(matches!(
+            harness
+                .adapter(&connection)
+                .unwrap()
+                .account_status(&runtime)
+                .await
+                .unwrap(),
+            HarnessAccountStatus::Authenticated { .. }
+        ));
+        harness
+            .start_run(
+                connection.id,
+                SystemIdGenerator.next_run_id(),
+                "retry after crash".to_owned(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    harness.next_event().await.unwrap(),
+                    Some(RunHarnessEvent::RunTerminal { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
         memory
             .put(
                 &locator,
@@ -2867,7 +2911,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .collect::<Vec<_>>(),
-            ["missing", "v1", "v2"]
+            ["missing", "v1", "missing", "v1", "v2"]
         );
     }
 

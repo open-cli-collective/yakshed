@@ -103,10 +103,15 @@ impl CodexRuntimeSpec {
 /// One configured local runtime backed by one lazily started actor.
 pub struct CodexAdapter {
     spec: CodexRuntimeSpec,
-    runtime: AsyncMutex<Option<RuntimeClient>>,
+    runtime: AsyncMutex<Option<OwnedRuntime>>,
     events: Mutex<Option<ProviderEventStream>>,
     event_sender: yakshed_harness::HarnessEventSender,
     process_group: Arc<std::sync::atomic::AtomicU32>,
+}
+
+struct OwnedRuntime {
+    client: RuntimeClient,
+    credential_environment: bool,
 }
 
 impl CodexAdapter {
@@ -163,9 +168,13 @@ impl CodexAdapter {
             });
         }
         let mut runtime = self.runtime.lock().await;
-        if runtime.as_ref().is_some_and(|runtime| !runtime.is_closed()) {
-            return Ok(runtime.as_ref().expect("checked runtime").clone());
+        if runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.client.is_closed())
+        {
+            return Ok(runtime.as_ref().expect("checked runtime").client.clone());
         }
+        let credential_environment = environment.is_some();
         let started = actor::start_runtime(
             self.spec.clone(),
             self.event_sender.clone(),
@@ -173,8 +182,29 @@ impl CodexAdapter {
             environment,
         )
         .await?;
-        *runtime = Some(started.clone());
+        *runtime = Some(OwnedRuntime {
+            client: started.clone(),
+            credential_environment,
+        });
         Ok(started)
+    }
+
+    pub async fn has_live_credential_environment(
+        &self,
+        handle: &RuntimeHandle,
+    ) -> Result<bool, HarnessError> {
+        if handle != &self.spec.handle {
+            return Err(HarnessError::NotFound {
+                entity: "runtime",
+                id: handle.to_string(),
+            });
+        }
+        Ok(self
+            .runtime
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|runtime| runtime.credential_environment && !runtime.client.is_closed()))
     }
 
     pub async fn start_with_environment(
@@ -215,7 +245,7 @@ impl CodexAdapter {
 
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         if let Some(runtime) = self.runtime.lock().await.take() {
-            runtime.shutdown().await?;
+            runtime.client.shutdown().await?;
         }
         Ok(())
     }
@@ -301,6 +331,12 @@ impl HarnessAdapter for CodexAdapter {
     ) -> Result<HarnessAccountStatus, HarnessError> {
         let (runtime, result) = self.account_read(runtime).await?;
         let Some(account) = result.get("account").filter(|account| !account.is_null()) else {
+            if result.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(false) {
+                return Ok(HarnessAccountStatus::Authenticated {
+                    email: None,
+                    plan: "auth_not_required".to_owned(),
+                });
+            }
             return Ok(runtime
                 .account_login_status()
                 .await?

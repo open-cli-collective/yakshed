@@ -863,6 +863,7 @@ async fn handle_frame(
                 diagnostics,
                 "Codex emitted a malformed account/updated notification".to_owned(),
             );
+            return Ok(());
         }
         if let Some(AccountLoginState::Starting { updated, .. }) = account_login {
             *updated = true;
