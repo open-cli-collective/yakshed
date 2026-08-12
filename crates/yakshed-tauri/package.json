@@ -1,0 +1,25 @@
+{
+  "name": "yakshed-tauri-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "npm@11.19.0",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "tauri": "cd ../yakshed-desktop && ../yakshed-tauri/node_modules/.bin/tauri",
+    "package": "cd ../yakshed-desktop && ../yakshed-tauri/node_modules/.bin/tauri build",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "@tauri-apps/cli": "2.11.4",
+    "@types/node": "24.3.0",
+    "svelte": "5.56.8",
+    "svelte-check": "4.7.5",
+    "typescript": "6.0.3",
+    "vite": "8.2.1"
+  }
+}
