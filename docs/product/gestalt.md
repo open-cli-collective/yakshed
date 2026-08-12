@@ -230,3 +230,11 @@ More concretely:
 > **YakShed is the place where software work is organized and supervised; agent harnesses are the workers, conversations are part of the record, and code-related outputs are artifacts of the work rather than the structure of the application.**
 
 The detailed architecture documents define how to preserve that idea safely. The frontend sketch defines how it is expressed visually. When implementation choices are ambiguous, choose the option that makes the user’s work easier to understand, direct, split, inspect, and resume without making YakShed itself responsible for rebuilding the harness beneath it.
+
+## Design reference
+
+The files under [`design/YakShed-UI/`](../../design/YakShed-UI/) are visual
+references for layout, density, theme tokens, and interaction rhythm. They use
+a template DSL and include remote-font references, so they are not application
+code or a literal Svelte implementation. Preserve the product behavior and
+local-first boundary described here when validating or replacing the mock.
