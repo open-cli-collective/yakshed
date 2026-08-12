@@ -1,6 +1,6 @@
 # YakShed: Backend Composition and Testing
 
-> **Status:** normative implementation handoff  
+> **Status:** normative repository standard  
 > **Research snapshot:** 2026-08-09  
 > **Purpose:** turn the architectural boundaries into independently testable Rust deliverables without making Tauri IPC the internal module system
 
