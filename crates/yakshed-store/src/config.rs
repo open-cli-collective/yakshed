@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yakshed_application::{
     AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, ConfigValidationError,
-    SecretBackendCapability, SecretBackendConfigurationError, UiConfig,
+    CredentialCopyReceipt, CredentialCopyState, CredentialMigrationPhase,
+    CredentialMigrationRecord, SecretBackendCapability, SecretBackendConfigurationError, UiConfig,
 };
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
@@ -32,6 +33,8 @@ struct ConfigDto {
     connections: Vec<ConnectionDto>,
     #[serde(default)]
     secret_backends: Vec<SecretBackendDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_migration: Option<CredentialMigrationDto>,
     #[serde(default)]
     ui: UiDto,
 }
@@ -78,6 +81,39 @@ struct SecretBackendDto {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CredentialMigrationDto {
+    source: SecretBackendDto,
+    target: SecretBackendDto,
+    phase: CredentialMigrationPhaseDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    locators: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    receipts: Vec<CredentialCopyReceiptDto>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialMigrationPhaseDto {
+    Copying,
+    CleanupPending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialCopyReceiptDto {
+    locator: String,
+    state: CredentialCopyStateDto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialCopyStateDto {
+    Copying,
+    Copied,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UiDto {
     theme: String,
 }
@@ -105,6 +141,10 @@ impl TryFrom<ConfigDto> for AppConfig {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+            credential_migration: config
+                .credential_migration
+                .map(TryInto::try_into)
+                .transpose()?,
             ui: UiConfig {
                 theme: config.ui.theme,
             },
@@ -118,9 +158,76 @@ impl From<&AppConfig> for ConfigDto {
             schema_version: SCHEMA_VERSION,
             connections: config.connections.iter().map(Into::into).collect(),
             secret_backends: config.secret_backends.iter().map(Into::into).collect(),
+            credential_migration: config.credential_migration.as_ref().map(Into::into),
             ui: UiDto {
                 theme: config.ui.theme.clone(),
             },
+        }
+    }
+}
+
+impl TryFrom<CredentialMigrationDto> for CredentialMigrationRecord {
+    type Error = ValidationError;
+
+    fn try_from(record: CredentialMigrationDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            source: record.source.try_into()?,
+            target: record.target.try_into()?,
+            phase: match record.phase {
+                CredentialMigrationPhaseDto::Copying => CredentialMigrationPhase::Copying,
+                CredentialMigrationPhaseDto::CleanupPending => {
+                    CredentialMigrationPhase::CleanupPending
+                }
+            },
+            locators: record
+                .locators
+                .into_iter()
+                .map(SecretLocator::new)
+                .collect::<Result<_, _>>()?,
+            receipts: record
+                .receipts
+                .into_iter()
+                .map(|receipt| {
+                    Ok(CredentialCopyReceipt {
+                        locator: SecretLocator::new(receipt.locator)?,
+                        state: match receipt.state {
+                            CredentialCopyStateDto::Copying => CredentialCopyState::Copying,
+                            CredentialCopyStateDto::Copied => CredentialCopyState::Copied,
+                        },
+                    })
+                })
+                .collect::<Result<_, ValidationError>>()?,
+        })
+    }
+}
+
+impl From<&CredentialMigrationRecord> for CredentialMigrationDto {
+    fn from(record: &CredentialMigrationRecord) -> Self {
+        Self {
+            source: (&record.source).into(),
+            target: (&record.target).into(),
+            phase: match record.phase {
+                CredentialMigrationPhase::Copying => CredentialMigrationPhaseDto::Copying,
+                CredentialMigrationPhase::CleanupPending => {
+                    CredentialMigrationPhaseDto::CleanupPending
+                }
+            },
+            locators: record
+                .locators
+                .iter()
+                .map(|locator| locator.as_str().to_owned())
+                .collect(),
+            receipts: record
+                .receipts
+                .iter()
+                .map(|receipt| CredentialCopyReceiptDto {
+                    locator: receipt.locator.as_str().to_owned(),
+                    state: match receipt.state {
+                        CredentialCopyState::Copying => CredentialCopyStateDto::Copying,
+                        CredentialCopyState::Copied => CredentialCopyStateDto::Copied,
+                    },
+                })
+                .collect(),
         }
     }
 }
@@ -326,8 +433,8 @@ impl StoreInner {
             });
         }
 
-        let mut config = current.config;
-        apply_change(&mut config, change);
+        let mut config = current.config.clone();
+        apply_change(&mut config, change)?;
         validate_config(&config, self.backend_capabilities)?;
         let revision = current
             .revision
@@ -336,16 +443,44 @@ impl StoreInner {
             .ok_or_else(|| ConfigError::Validation("config revision overflow".to_owned()))?;
 
         #[cfg(test)]
-        {
+        let write_result = {
             let fault = self
                 .next_write_fault
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            write_config_with_hook(&self.config_path, &config, || apply_fault(fault))?;
-        }
+            match fault {
+                Some(WriteFault::AfterCommit) => {
+                    write_config(&self.config_path, &config).and_then(|()| {
+                        Err(ConfigError::Io {
+                            path: self.config_path.clone(),
+                            source: io::Error::other("injected post-commit failure"),
+                        })
+                    })
+                }
+                fault => write_config_with_hook(&self.config_path, &config, || apply_fault(fault)),
+            }
+        };
         #[cfg(not(test))]
-        write_config(&self.config_path, &config)?;
+        let write_result = write_config(&self.config_path, &config);
+
+        if let Err(error) = write_result {
+            if let Ok(observed) = read_config(&self.config_path, self.backend_capabilities) {
+                let observed_revision = if observed == current.config {
+                    current.revision
+                } else {
+                    ConfigRevision::new(revision)
+                };
+                *self
+                    .state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = ConfigSnapshot {
+                    revision: observed_revision,
+                    config: observed,
+                };
+            }
+            return Err(error);
+        }
 
         let snapshot = ConfigSnapshot {
             revision: ConfigRevision::new(revision),
@@ -359,7 +494,7 @@ impl StoreInner {
     }
 }
 
-fn apply_change(config: &mut AppConfig, change: ConfigChange) {
+fn apply_change(config: &mut AppConfig, change: ConfigChange) -> Result<(), ConfigError> {
     match change {
         ConfigChange::PutConnection(connection) => {
             config.connections.retain(|item| item.id != connection.id);
@@ -392,9 +527,106 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
         ConfigChange::RemoveSecretBackend(id) => {
             config.secret_backends.retain(|item| item.id != id);
         }
+        ConfigChange::BeginCredentialMigration(record) => {
+            if config.credential_migration.is_some()
+                || record.phase != CredentialMigrationPhase::Copying
+                || !record.receipts.is_empty()
+            {
+                return Err(ConfigError::InvalidMigrationTransition(
+                    "begin requires an inactive migration and an empty copying record",
+                ));
+            }
+            config.credential_migration = Some(record);
+        }
+        ConfigChange::RecordCredentialCopy { locator, state } => {
+            let record = config.credential_migration.as_mut().ok_or({
+                ConfigError::InvalidMigrationTransition("copy receipt requires an active migration")
+            })?;
+            if record.phase != CredentialMigrationPhase::Copying
+                || !record.locators.contains(&locator)
+            {
+                return Err(ConfigError::InvalidMigrationTransition(
+                    "copy receipt requires the copying phase and a manifest locator",
+                ));
+            }
+            let previous = record
+                .receipts
+                .iter()
+                .find(|receipt| receipt.locator == locator)
+                .map(|receipt| receipt.state);
+            if !matches!(
+                (previous, state),
+                (None, CredentialCopyState::Copying)
+                    | (
+                        Some(CredentialCopyState::Copying),
+                        CredentialCopyState::Copied
+                    )
+            ) {
+                return Err(ConfigError::InvalidMigrationTransition(
+                    "copy receipts may only advance from absent to copying to copied",
+                ));
+            }
+            record.receipts.retain(|receipt| receipt.locator != locator);
+            record
+                .receipts
+                .push(CredentialCopyReceipt { locator, state });
+            record
+                .receipts
+                .sort_by(|left, right| left.locator.cmp(&right.locator));
+        }
+        ConfigChange::CheckpointCredentialMigration => {
+            let record = config.credential_migration.as_mut().ok_or({
+                ConfigError::InvalidMigrationTransition("checkpoint requires an active migration")
+            })?;
+            if record.phase != CredentialMigrationPhase::Copying
+                || !record.locators.iter().all(|locator| {
+                    record.receipts.iter().any(|receipt| {
+                        receipt.locator == *locator && receipt.state == CredentialCopyState::Copied
+                    })
+                })
+            {
+                return Err(ConfigError::InvalidMigrationTransition(
+                    "checkpoint requires a copied receipt for every manifest locator",
+                ));
+            }
+            let from = record.source.id.clone();
+            let to = record.target.clone();
+            for connection in &mut config.connections {
+                for credential in &mut connection.credentials {
+                    if let CredentialBinding::Secret { reference } = &mut credential.binding
+                        && reference.backend_id == from
+                    {
+                        reference.backend_id = to.id.clone();
+                    }
+                }
+            }
+            config
+                .secret_backends
+                .retain(|item| item.id != from && item.id != to.id);
+            config.secret_backends.push(to);
+            config
+                .secret_backends
+                .sort_by(|left, right| left.id.cmp(&right.id));
+            record.phase = CredentialMigrationPhase::CleanupPending;
+        }
+        ConfigChange::FinishCredentialMigration => {
+            if !matches!(
+                config
+                    .credential_migration
+                    .as_ref()
+                    .map(|record| record.phase),
+                Some(CredentialMigrationPhase::CleanupPending)
+            ) {
+                return Err(ConfigError::InvalidMigrationTransition(
+                    "finish requires the cleanup-pending phase",
+                ));
+            }
+            config.credential_migration = None;
+        }
         ConfigChange::SetUiTheme(theme) => config.ui.theme = theme,
         ConfigChange::Reset => *config = AppConfig::default(),
     }
+    Ok(())
 }
 
 fn read_config(
@@ -555,6 +787,8 @@ pub enum ConfigError {
     },
     #[error("invalid config: {0}")]
     Validation(String),
+    #[error("invalid credential migration transition: {0}")]
+    InvalidMigrationTransition(&'static str),
     #[error("invalid secret backend configuration: {0}")]
     SecretBackendConfiguration(#[from] SecretBackendConfigurationError),
     #[error("failed to serialize config: {0}")]
@@ -581,6 +815,7 @@ impl From<PathError> for ConfigError {
 #[cfg(test)]
 enum WriteFault {
     Permission,
+    AfterCommit,
     Slow {
         started: Arc<std::sync::atomic::AtomicBool>,
         finished: Arc<std::sync::atomic::AtomicBool>,
@@ -595,6 +830,7 @@ fn apply_fault(fault: Option<WriteFault>) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "injected temp-file permission failure",
         )),
+        Some(WriteFault::AfterCommit) => unreachable!("handled around the commit"),
         Some(WriteFault::Slow {
             started,
             finished,
@@ -709,6 +945,212 @@ mod tests {
         let CredentialBindingDto::Disabled { slot: _ } = disabled else {
             panic!("disabled binding expected")
         };
+    }
+
+    #[test]
+    fn credential_migration_commands_enforce_phase_and_manifest() {
+        let source = SecretBackend {
+            id: SecretBackendId::new("legacy-local-file").unwrap(),
+            settings: SecretBackendSettings::LocalFile {
+                path: "/tmp/yakshed-migration-test.json".to_owned(),
+            },
+        };
+        let target = SecretBackend {
+            id: SecretBackendId::new("local-os").unwrap(),
+            settings: SecretBackendSettings::LocalOs,
+        };
+        let locator = SecretLocator::new("connection/test/key").unwrap();
+        let migration = |phase| CredentialMigrationRecord {
+            source: source.clone(),
+            target: target.clone(),
+            phase,
+            locators: vec![locator.clone()],
+            receipts: Vec::new(),
+        };
+        let invalid_cleanup = AppConfig {
+            secret_backends: vec![target.clone()],
+            credential_migration: Some(migration(CredentialMigrationPhase::CleanupPending)),
+            ..AppConfig::default()
+        };
+        assert!(matches!(
+            validate_config(
+                &invalid_cleanup,
+                &[SecretBackendCapability::available("local-os")]
+            ),
+            Err(ConfigError::Validation(_))
+        ));
+        let hijacked_target = SecretBackend {
+            id: target.id.clone(),
+            settings: SecretBackendSettings::Memory,
+        };
+        let hijacked_copying = AppConfig {
+            secret_backends: vec![source.clone(), hijacked_target],
+            credential_migration: Some(migration(CredentialMigrationPhase::Copying)),
+            ..AppConfig::default()
+        };
+        assert!(matches!(
+            validate_config(
+                &hijacked_copying,
+                &[
+                    SecretBackendCapability::available("local-file"),
+                    SecretBackendCapability::available("memory"),
+                ]
+            ),
+            Err(ConfigError::Validation(_))
+        ));
+        let rejected = |result| matches!(result, Err(ConfigError::InvalidMigrationTransition(_)));
+        let mut config = AppConfig {
+            secret_backends: vec![source.clone()],
+            ..AppConfig::default()
+        };
+
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::BeginCredentialMigration(migration(
+                CredentialMigrationPhase::CleanupPending,
+            )),
+        )));
+        apply_change(
+            &mut config,
+            ConfigChange::BeginCredentialMigration(migration(CredentialMigrationPhase::Copying)),
+        )
+        .unwrap();
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::BeginCredentialMigration(migration(CredentialMigrationPhase::Copying)),
+        )));
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::RecordCredentialCopy {
+                locator: SecretLocator::new("outside/manifest").unwrap(),
+                state: CredentialCopyState::Copying,
+            },
+        )));
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::RecordCredentialCopy {
+                locator: locator.clone(),
+                state: CredentialCopyState::Copied,
+            },
+        )));
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::CheckpointCredentialMigration,
+        )));
+        apply_change(
+            &mut config,
+            ConfigChange::RecordCredentialCopy {
+                locator: locator.clone(),
+                state: CredentialCopyState::Copying,
+            },
+        )
+        .unwrap();
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::FinishCredentialMigration,
+        )));
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::CheckpointCredentialMigration,
+        )));
+        apply_change(
+            &mut config,
+            ConfigChange::RecordCredentialCopy {
+                locator: locator.clone(),
+                state: CredentialCopyState::Copied,
+            },
+        )
+        .unwrap();
+        apply_change(&mut config, ConfigChange::CheckpointCredentialMigration).unwrap();
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::RecordCredentialCopy {
+                locator,
+                state: CredentialCopyState::Copying,
+            },
+        )));
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::CheckpointCredentialMigration,
+        )));
+        apply_change(&mut config, ConfigChange::FinishCredentialMigration).unwrap();
+        assert!(rejected(apply_change(
+            &mut config,
+            ConfigChange::FinishCredentialMigration,
+        )));
+    }
+
+    #[tokio::test]
+    async fn post_commit_error_adopts_durable_migration_checkpoint() {
+        const CAPABILITIES: &[SecretBackendCapability] = &[
+            SecretBackendCapability::available("local-file"),
+            SecretBackendCapability::available("local-os"),
+        ];
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let store = ConfigStore::open(paths.clone(), CAPABILITIES).unwrap();
+        let source = SecretBackend {
+            id: SecretBackendId::new("legacy-local-file").unwrap(),
+            settings: SecretBackendSettings::LocalFile {
+                path: temp
+                    .path()
+                    .join("secrets.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        };
+        let target = SecretBackend {
+            id: SecretBackendId::new("local-os").unwrap(),
+            settings: SecretBackendSettings::LocalOs,
+        };
+        let snapshot = store
+            .update(
+                ConfigRevision::INITIAL,
+                ConfigChange::PutSecretBackend(source.clone()),
+            )
+            .await
+            .unwrap();
+        let snapshot = store
+            .update(
+                snapshot.revision,
+                ConfigChange::BeginCredentialMigration(CredentialMigrationRecord {
+                    source,
+                    target: target.clone(),
+                    phase: CredentialMigrationPhase::Copying,
+                    locators: Vec::new(),
+                    receipts: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        *store
+            .inner
+            .next_write_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(WriteFault::AfterCommit);
+
+        assert!(matches!(
+            store
+                .update(
+                    snapshot.revision,
+                    ConfigChange::CheckpointCredentialMigration,
+                )
+                .await,
+            Err(ConfigError::Io { .. })
+        ));
+        let in_memory = store.snapshot();
+        assert_eq!(
+            in_memory
+                .config
+                .credential_migration
+                .as_ref()
+                .unwrap()
+                .phase,
+            CredentialMigrationPhase::CleanupPending
+        );
+        assert_eq!(in_memory.config.secret_backends, vec![target]);
+        let reopened = ConfigStore::open(paths, CAPABILITIES).unwrap().snapshot();
+        assert_eq!(reopened.config, in_memory.config);
     }
 
     #[tokio::test]

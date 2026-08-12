@@ -24,7 +24,35 @@ pub use run_supervisor::*;
 pub struct AppConfig {
     pub connections: Vec<Connection>,
     pub secret_backends: Vec<SecretBackend>,
+    pub credential_migration: Option<CredentialMigrationRecord>,
     pub ui: UiConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialMigrationRecord {
+    pub source: SecretBackend,
+    pub target: SecretBackend,
+    pub phase: CredentialMigrationPhase,
+    pub locators: Vec<SecretLocator>,
+    pub receipts: Vec<CredentialCopyReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialMigrationPhase {
+    Copying,
+    CleanupPending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialCopyReceipt {
+    pub locator: SecretLocator,
+    pub state: CredentialCopyState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialCopyState {
+    Copying,
+    Copied,
 }
 
 impl AppConfig {
@@ -86,6 +114,75 @@ impl AppConfig {
                         reference.backend_id
                     )));
                 }
+            }
+        }
+        if let Some(migration) = &self.credential_migration {
+            if !matches!(
+                migration.source.settings,
+                SecretBackendSettings::LocalFile { .. }
+            ) || migration.target.settings != SecretBackendSettings::LocalOs
+                || migration.source.id == migration.target.id
+            {
+                return Err(ConfigValidationError::invalid(
+                    "credential migration backend pair is invalid",
+                ));
+            }
+            let mut receipt_locators = HashSet::new();
+            if migration
+                .receipts
+                .iter()
+                .any(|receipt| !receipt_locators.insert(&receipt.locator))
+            {
+                return Err(ConfigValidationError::invalid(
+                    "credential migration contains duplicate receipts",
+                ));
+            }
+            let manifest = migration.locators.iter().collect::<HashSet<_>>();
+            if manifest.len() != migration.locators.len()
+                || receipt_locators
+                    .iter()
+                    .any(|locator| !manifest.contains(locator))
+            {
+                return Err(ConfigValidationError::invalid(
+                    "credential migration manifest is invalid",
+                ));
+            }
+            let source_configured = self
+                .secret_backends
+                .iter()
+                .any(|backend| backend == &migration.source);
+            let target_configured = self
+                .secret_backends
+                .iter()
+                .any(|backend| backend == &migration.target);
+            if self
+                .secret_backends
+                .iter()
+                .any(|backend| backend.id == migration.target.id && backend != &migration.target)
+            {
+                return Err(ConfigValidationError::invalid(
+                    "credential migration target id is already in use",
+                ));
+            }
+            let all_copied = migration.locators.iter().all(|locator| {
+                migration.receipts.iter().any(|receipt| {
+                    receipt.locator == *locator && receipt.state == CredentialCopyState::Copied
+                })
+            });
+            match migration.phase {
+                CredentialMigrationPhase::Copying if !source_configured => {
+                    return Err(ConfigValidationError::invalid(
+                        "copying credential migration requires its source backend",
+                    ));
+                }
+                CredentialMigrationPhase::CleanupPending
+                    if source_configured || !target_configured || !all_copied =>
+                {
+                    return Err(ConfigValidationError::invalid(
+                        "cleanup credential migration requires its target and a fully copied manifest",
+                    ));
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -153,6 +250,13 @@ pub enum ConfigChange {
     RemoveConnection(ConnectionId),
     PutSecretBackend(SecretBackend),
     RemoveSecretBackend(SecretBackendId),
+    BeginCredentialMigration(CredentialMigrationRecord),
+    RecordCredentialCopy {
+        locator: SecretLocator,
+        state: CredentialCopyState,
+    },
+    CheckpointCredentialMigration,
+    FinishCredentialMigration,
     SetUiTheme(String),
     Reset,
 }
@@ -351,6 +455,26 @@ pub struct PublicConnection {
 pub struct PublicConnectionList {
     pub config_revision: ConfigRevision,
     pub connections: Vec<PublicConnection>,
+    pub credential_migration: CredentialMigrationStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialMigrationStatus {
+    Ready,
+    Pending(CredentialMigrationPendingReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialMigrationPendingReason {
+    Locked,
+    Denied,
+    Unavailable,
+    Collision,
+    MissingSource,
+    SourceInUse,
+    TargetInUse,
+    Failed,
+    CleanupRequired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -396,6 +520,8 @@ pub enum ConfigPortError {
     NotFound,
     #[error("unsupported operation")]
     Unsupported,
+    #[error("credential migration is pending")]
+    MigrationPending,
     #[error("configuration service unavailable")]
     Unavailable,
 }
@@ -420,6 +546,8 @@ pub enum SecretPortError {
     AlreadyExists,
     #[error("secret write outcome is uncertain")]
     UncertainWrite,
+    #[error("credential migration is pending")]
+    MigrationPending,
     #[error("credential operation failed")]
     Failed,
 }

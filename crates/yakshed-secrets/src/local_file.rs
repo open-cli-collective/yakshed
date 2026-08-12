@@ -8,13 +8,15 @@
 //! uncertain outcome and must be reconciled before retrying. Reads wait for a contended file lock;
 //! abandoned mutations stop waiting promptly.
 //! Extended ACLs are rejected via native macOS ACL inspection or Linux POSIX ACL xattrs; YakShed
-//! never removes filesystem ACLs on the user's behalf.
+//! never removes filesystem ACLs on the user's behalf. Purge best-effort overwrites the current
+//! file before unlinking; copy-on-write filesystems and flash media make physical erasure
+//! impossible to guarantee.
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -122,8 +124,38 @@ impl LocalFileBackend {
     /// inode across purge. Manual deletion of both files is safe only with all instances stopped.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub async fn purge(&self) -> Result<(), SecretError> {
-        self.run_abandonable(|state, abandoned| state.purge(abandoned))
+        self.run_abandonable(|state, abandoned| state.purge(abandoned, true))
             .await
+    }
+
+    /// Removes the legacy store after config durably names another backend as canonical.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub async fn purge_after_migration(&self) -> Result<(), SecretError> {
+        self.run_abandonable(|state, abandoned| state.purge(abandoned, false))
+            .await
+    }
+
+    /// Returns validated locators without exposing their values.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub async fn locators(&self) -> Result<Vec<SecretLocator>, SecretError> {
+        self.run_abandonable(|state, abandoned| {
+            state.with_store_lock(Some(abandoned), |path| {
+                let mut locators = state
+                    .load(path)?
+                    .secrets
+                    .into_keys()
+                    .map(|value| {
+                        SecretLocator::new(value).map_err(|_| SecretError::ProtocolViolation {
+                            backend: state.id.clone(),
+                            reason: "invalid locator in local secret store".to_owned(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                locators.sort();
+                Ok(locators)
+            })
+        })
+        .await
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -231,7 +263,7 @@ impl LocalFileState {
         )
     }
 
-    fn purge(&self, abandoned: &AtomicBool) -> Result<(), SecretError> {
+    fn purge(&self, abandoned: &AtomicBool, validate_contents: bool) -> Result<(), SecretError> {
         let initialized = self.initialized()?;
         self.with_process_lock(&initialized, Some(abandoned), || {
             validate_parent(&initialized.path, &self.id)?;
@@ -244,7 +276,12 @@ impl LocalFileState {
                 });
             }
             if initialized.path.exists() {
-                self.load(&initialized.path)?;
+                if validate_contents {
+                    self.load(&initialized.path)?;
+                } else {
+                    validate_store_if_present(&initialized.path, &self.id)?;
+                }
+                best_effort_zero(&initialized.path);
             }
 
             let store_removed = match fs::remove_file(&initialized.path) {
@@ -323,6 +360,39 @@ impl LocalFileState {
         drop(guard);
         result
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn best_effort_zero(path: &Path) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+        || file.rewind().is_err()
+    {
+        return;
+    }
+    let zeros = [0_u8; 4096];
+    let mut remaining = metadata.len();
+    while remaining > 0 {
+        let count = remaining.min(zeros.len() as u64) as usize;
+        if file.write_all(&zeros[..count]).is_err() {
+            return;
+        }
+        remaining -= count as u64;
+    }
+    let _ = file.sync_all();
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

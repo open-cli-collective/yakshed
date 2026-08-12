@@ -219,6 +219,10 @@ impl ResolvedSecret {
         use secrecy::ExposeSecret;
         use_value(self.value.expose_secret())
     }
+
+    pub fn as_secret(&self) -> &SecretString {
+        &self.value
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

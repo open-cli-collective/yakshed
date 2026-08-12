@@ -23,7 +23,13 @@ test.beforeEach(async ({ page }) => {
           case "create_project": return undefined;
           case "list_connections":
             if (sessionStorage.getItem("startup-fail")) throw { code: "persistence_error", message: "persistence startup failed" };
-            return { config_revision: configRevision, connections: connection ? [connection] : [] };
+            return {
+              config_revision: configRevision,
+              connections: connection ? [connection] : [],
+              credential_migration: sessionStorage.getItem("migration-pending")
+                ? { status: "pending", reason: "locked" }
+                : { status: "ready" },
+            };
           case "connection_put":
             connection = args.connection as Record<string, unknown>;
             configRevision += 1;
@@ -140,4 +146,14 @@ test("runs the product loop through approval, input, interrupt, and reconciliati
   await page.reload();
   await expect(page.getByRole("heading", { name: "YakShed could not open." })).toBeVisible();
   await expect(page.getByText("STARTUP FAILED · persistence_error")).toBeVisible();
+});
+
+test("surfaces a locked keychain migration without failing startup", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => sessionStorage.setItem("migration-pending", "1"));
+  await page.reload();
+
+  await expect(page.getByText("CREDENTIAL MIGRATION PENDING")).toBeVisible();
+  await expect(page.getByText(/Keychain migration is locked/)).toBeVisible();
+  await expect(page.getByText("STARTUP FAILED", { exact: false })).toHaveCount(0);
 });

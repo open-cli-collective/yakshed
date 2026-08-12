@@ -7,7 +7,8 @@ use tokio::sync::broadcast;
 pub use yakshed_application::RunOrchestrationError;
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
-    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem, IdGenerator, ListWorkItems,
+    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem,
+    CredentialMigrationPendingReason, CredentialMigrationStatus, IdGenerator, ListWorkItems,
     OpenArtifactCommand, OpenArtifactPayload, PublicCredentialBinding, PublicCredentialSource,
     PutConnectionCommand, RunHarness, RunSupervisor, SecretPort, SecretPortError,
     SetConnectionCredentialCommand, StoreError,
@@ -306,6 +307,30 @@ pub struct ConnectionEnvelope {
 pub struct ConnectionListEnvelope {
     pub config_revision: u64,
     pub connections: Vec<FrontendConnection>,
+    pub credential_migration: FrontendCredentialMigrationStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FrontendCredentialMigrationStatus {
+    Ready,
+    Pending {
+        reason: FrontendCredentialMigrationPendingReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendCredentialMigrationPendingReason {
+    Locked,
+    Denied,
+    Unavailable,
+    Collision,
+    MissingSource,
+    SourceInUse,
+    TargetInUse,
+    Failed,
+    CleanupRequired,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -662,6 +687,42 @@ impl DesktopApi {
             .map_err(map_config_error)?;
         Ok(ConnectionListEnvelope {
             config_revision: list.config_revision.get(),
+            credential_migration: match list.credential_migration {
+                CredentialMigrationStatus::Ready => FrontendCredentialMigrationStatus::Ready,
+                CredentialMigrationStatus::Pending(reason) => {
+                    FrontendCredentialMigrationStatus::Pending {
+                        reason: match reason {
+                            CredentialMigrationPendingReason::Locked => {
+                                FrontendCredentialMigrationPendingReason::Locked
+                            }
+                            CredentialMigrationPendingReason::Denied => {
+                                FrontendCredentialMigrationPendingReason::Denied
+                            }
+                            CredentialMigrationPendingReason::Unavailable => {
+                                FrontendCredentialMigrationPendingReason::Unavailable
+                            }
+                            CredentialMigrationPendingReason::Collision => {
+                                FrontendCredentialMigrationPendingReason::Collision
+                            }
+                            CredentialMigrationPendingReason::MissingSource => {
+                                FrontendCredentialMigrationPendingReason::MissingSource
+                            }
+                            CredentialMigrationPendingReason::SourceInUse => {
+                                FrontendCredentialMigrationPendingReason::SourceInUse
+                            }
+                            CredentialMigrationPendingReason::TargetInUse => {
+                                FrontendCredentialMigrationPendingReason::TargetInUse
+                            }
+                            CredentialMigrationPendingReason::Failed => {
+                                FrontendCredentialMigrationPendingReason::Failed
+                            }
+                            CredentialMigrationPendingReason::CleanupRequired => {
+                                FrontendCredentialMigrationPendingReason::CleanupRequired
+                            }
+                        },
+                    }
+                }
+            },
             connections: list
                 .connections
                 .into_iter()
@@ -1166,6 +1227,9 @@ fn map_config_error(error: ConfigPortError) -> DesktopError {
             DesktopError::conflict("configuration revision conflict")
         }
         ConfigPortError::Validation => DesktopError::invalid_request("configuration is invalid"),
+        ConfigPortError::MigrationPending => {
+            DesktopError::conflict("credential migration is pending")
+        }
         ConfigPortError::NotFound => DesktopError::not_found("configuration entry not found"),
         ConfigPortError::Unsupported | ConfigPortError::Unavailable => {
             DesktopError::unsupported("configuration unavailable")
@@ -1189,6 +1253,9 @@ fn map_secret_error(error: SecretPortError) -> DesktopError {
         }
         SecretPortError::AlreadyExists => DesktopError::conflict("credential already exists"),
         SecretPortError::UncertainWrite => DesktopError::outcome_unknown("secret write uncertain"),
+        SecretPortError::MigrationPending => {
+            DesktopError::conflict("credential migration is pending")
+        }
         SecretPortError::NotSecretBacked => {
             DesktopError::unsupported("credential binding is not secret-backed")
         }
