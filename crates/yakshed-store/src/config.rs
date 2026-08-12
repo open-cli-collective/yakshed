@@ -77,6 +77,8 @@ struct SecretBackendDto {
     account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -323,6 +325,7 @@ impl TryFrom<SecretBackendDto> for SecretBackend {
                 &backend.kind,
                 backend.account,
                 backend.path,
+                backend.executable,
             )?,
         })
     }
@@ -330,16 +333,20 @@ impl TryFrom<SecretBackendDto> for SecretBackend {
 
 impl From<&SecretBackend> for SecretBackendDto {
     fn from(backend: &SecretBackend) -> Self {
-        let (account, path) = match &backend.settings {
-            SecretBackendSettings::OnePasswordCli { account } => (account.clone(), None),
-            SecretBackendSettings::LocalFile { path } => (None, Some(path.clone())),
-            _ => (None, None),
+        let (account, path, executable) = match &backend.settings {
+            SecretBackendSettings::OnePassword {
+                account,
+                executable,
+            } => (Some(account.clone()), None, executable.clone()),
+            SecretBackendSettings::LocalFile { path } => (None, Some(path.clone()), None),
+            _ => (None, None, None),
         };
         Self {
             id: backend.id.as_str().to_owned(),
             kind: backend.kind().to_owned(),
             account,
             path,
+            executable,
         }
     }
 }

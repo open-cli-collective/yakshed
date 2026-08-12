@@ -15,15 +15,26 @@ use yakshed_store::{AppPaths, ConfigError, ConfigStore};
 const BACKEND_CAPABILITIES: &[SecretBackendCapability] = &[
     SecretBackendCapability::available("memory"),
     SecretBackendCapability::available("local-os"),
-    SecretBackendCapability::available("onepassword-cli"),
+    SecretBackendCapability::resolve_only("onepassword")
+        .with_locator_validator(validate_onepassword_test_locator),
     SecretBackendCapability::available("environment"),
     SecretBackendCapability {
         kind: "local-file",
         availability: SecretBackendAvailability::MissingFeature {
             feature: "dev-secrets",
         },
+        access: yakshed_application::SecretBackendAccess::ReadWrite,
+        validate_locator: None,
     },
 ];
+
+fn validate_onepassword_test_locator(locator: &SecretLocator) -> Result<(), &'static str> {
+    locator
+        .as_str()
+        .starts_with("op://")
+        .then_some(())
+        .ok_or("invalid test locator")
+}
 const LOCAL_FILE_CAPABILITIES: &[SecretBackendCapability] =
     &[SecretBackendCapability::available("local-file")];
 
@@ -446,8 +457,9 @@ kind = "local-os"
 
 [[secret_backends]]
 id = "onepassword-work"
-kind = "onepassword-cli"
+kind = "onepassword"
 account = "work"
+executable = "/opt/homebrew/bin/op"
 
 [[connections]]
 id = "0193f26e-7a72-7d42-bf77-0de14c4cc111"
@@ -507,6 +519,91 @@ locator = "connection/0193f26e-7a72-7d42-bf77-0de14c4cc333/fireworks_api_key"
     ));
     let written = fs::read_to_string(paths.config_root.join("config.toml")).unwrap();
     assert!(written.contains("authority = \"codex-app-server\""));
+    assert!(written.contains("executable = \"/opt/homebrew/bin/op\""));
     assert!(!written.contains("delivery"));
     assert_eq!(open(paths).unwrap().snapshot().config, snapshot.config);
+}
+
+#[test]
+fn onepassword_locator_shape_is_validated_when_config_loads() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    let invalid = r#"schema_version = 1
+
+[[secret_backends]]
+id = "onepassword-work"
+kind = "onepassword"
+account = "work"
+
+[[connections]]
+id = "0193f26e-7a72-7d42-bf77-0de14c4cc222"
+name = "Work"
+harness = "claude-code"
+model_provider = "anthropic"
+provider_state = "work-claude"
+
+[[connections.credentials]]
+slot = "anthropic.api_key"
+source = "secret"
+backend = "onepassword-work"
+locator = "vault/item/field"
+"#;
+    fs::write(paths.config_root.join("config.toml"), invalid).unwrap();
+
+    assert!(matches!(open(paths), Err(ConfigError::Validation(_))));
+}
+
+#[tokio::test]
+async fn legacy_onepassword_cli_kind_loads_and_writes_canonically() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    fs::write(
+        paths.config_root.join("config.toml"),
+        r#"schema_version = 1
+
+[[secret_backends]]
+id = "onepassword-work"
+kind = "onepassword-cli"
+account = "work"
+"#,
+    )
+    .unwrap();
+
+    let store = open(paths.clone()).unwrap();
+    store
+        .update(
+            ConfigRevision::INITIAL,
+            ConfigChange::SetUiTheme("system".to_owned()),
+        )
+        .await
+        .unwrap();
+    let written = fs::read_to_string(paths.config_root.join("config.toml")).unwrap();
+    assert!(written.contains("kind = \"onepassword\""));
+    assert!(!written.contains("onepassword-cli"));
+}
+
+#[test]
+fn onepassword_account_is_required_when_config_loads() {
+    for backend in [
+        r#"[[secret_backends]]
+id = "onepassword-work"
+kind = "onepassword""#,
+        r#"[[secret_backends]]
+id = "onepassword-work"
+kind = "onepassword"
+account = " ""#,
+    ] {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        paths.create_config_root().unwrap();
+        fs::write(
+            paths.config_root.join("config.toml"),
+            format!("schema_version = 1\n\n{backend}\n"),
+        )
+        .unwrap();
+
+        assert!(matches!(open(paths), Err(ConfigError::Validation(_))));
+    }
 }

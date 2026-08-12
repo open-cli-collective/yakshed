@@ -114,6 +114,18 @@ impl AppConfig {
                         reference.backend_id
                     )));
                 }
+                if let CredentialBinding::Secret { reference } = &credential.binding
+                    && let Some(backend) = self
+                        .secret_backends
+                        .iter()
+                        .find(|backend| backend.id == reference.backend_id)
+                    && let Some(validate_locator) = backend_capabilities
+                        .iter()
+                        .find(|capability| capability.kind == backend.kind())
+                        .and_then(|capability| capability.validate_locator)
+                {
+                    validate_locator(&reference.locator).map_err(ConfigValidationError::invalid)?;
+                }
             }
         }
         if let Some(migration) = &self.credential_migration {
@@ -358,19 +370,45 @@ impl fmt::Display for SecretBackendConfigurationError {
 
 impl Error for SecretBackendConfigurationError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct SecretBackendCapability {
     pub kind: &'static str,
     pub availability: SecretBackendAvailability,
+    pub access: SecretBackendAccess,
+    pub validate_locator: Option<SecretLocatorValidator>,
 }
+
+pub type SecretLocatorValidator = fn(&SecretLocator) -> Result<(), &'static str>;
 
 impl SecretBackendCapability {
     pub const fn available(kind: &'static str) -> Self {
         Self {
             kind,
             availability: SecretBackendAvailability::Available,
+            access: SecretBackendAccess::ReadWrite,
+            validate_locator: None,
         }
     }
+
+    pub const fn resolve_only(kind: &'static str) -> Self {
+        Self {
+            kind,
+            availability: SecretBackendAvailability::Available,
+            access: SecretBackendAccess::ResolveOnly,
+            validate_locator: None,
+        }
+    }
+
+    pub const fn with_locator_validator(mut self, validator: SecretLocatorValidator) -> Self {
+        self.validate_locator = Some(validator);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretBackendAccess {
+    ReadWrite,
+    ResolveOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,6 +572,8 @@ pub enum SecretPortError {
     BindingNotFound,
     #[error("credential binding is not writeable")]
     NotSecretBacked,
+    #[error("secret backend is resolve-only")]
+    ResolveOnly,
     #[error("secret backend unavailable")]
     BackendUnavailable,
     #[error("secret backend returned locked")]
