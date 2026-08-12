@@ -153,6 +153,11 @@ pub enum ConfigChange {
     RemoveConnection(ConnectionId),
     PutSecretBackend(SecretBackend),
     RemoveSecretBackend(SecretBackendId),
+    /// Atomically rewrites every reference from one backend and replaces its configuration.
+    MigrateSecretBackend {
+        from: SecretBackendId,
+        to: SecretBackend,
+    },
     SetUiTheme(String),
     Reset,
 }
@@ -351,6 +356,22 @@ pub struct PublicConnection {
 pub struct PublicConnectionList {
     pub config_revision: ConfigRevision,
     pub connections: Vec<PublicConnection>,
+    pub credential_migration: CredentialMigrationStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialMigrationStatus {
+    Ready,
+    Pending(CredentialMigrationPendingReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialMigrationPendingReason {
+    Locked,
+    Denied,
+    Unavailable,
+    Failed,
+    CleanupRequired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

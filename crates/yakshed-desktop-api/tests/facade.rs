@@ -1171,6 +1171,7 @@ impl ConfigPort for TestConfigPort {
         let snapshot = self.store.snapshot();
         Ok(yakshed_application::PublicConnectionList {
             config_revision: snapshot.revision,
+            credential_migration: yakshed_application::CredentialMigrationStatus::Ready,
             connections: snapshot
                 .config
                 .connections

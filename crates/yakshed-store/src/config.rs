@@ -392,6 +392,24 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
         ConfigChange::RemoveSecretBackend(id) => {
             config.secret_backends.retain(|item| item.id != id);
         }
+        ConfigChange::MigrateSecretBackend { from, to } => {
+            for connection in &mut config.connections {
+                for credential in &mut connection.credentials {
+                    if let CredentialBinding::Secret { reference } = &mut credential.binding
+                        && reference.backend_id == from
+                    {
+                        reference.backend_id = to.id.clone();
+                    }
+                }
+            }
+            config
+                .secret_backends
+                .retain(|item| item.id != from && item.id != to.id);
+            config.secret_backends.push(to);
+            config
+                .secret_backends
+                .sort_by(|left, right| left.id.cmp(&right.id));
+        }
         ConfigChange::SetUiTheme(theme) => config.ui.theme = theme,
         ConfigChange::Reset => *config = AppConfig::default(),
     }

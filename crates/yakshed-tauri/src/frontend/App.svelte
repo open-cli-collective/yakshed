@@ -4,6 +4,7 @@
     client,
     type Approval,
     type Connection,
+    type CredentialMigrationStatus,
     type DesktopError,
     type FrontendEvent,
     type PendingUserInput,
@@ -23,6 +24,7 @@
   let inputs: PendingUserInput[] = [];
   let connections: Connection[] = [];
   let configRevision = 0;
+  let credentialMigration: CredentialMigrationStatus = { status: "ready" };
   let loading = true;
   let error: DesktopError | null = null;
   let uncertain: string | null = null;
@@ -44,6 +46,7 @@
       const listedConnections = await client.listConnections();
       connections = listedConnections.connections;
       configRevision = listedConnections.config_revision;
+      credentialMigration = listedConnections.credential_migration;
       try {
         await client.createProject(PROJECT_ID, "YakShed");
       } catch (cause) {
@@ -186,7 +189,7 @@
         harness: "codex",
         model_provider: String(data.get("provider")),
         provider_state: `connection-${id}`,
-        credentials: [{ slot: "codex.account", source: "secret", backend: "local-file", locator: `${id}-account` }],
+        credentials: [{ slot: "codex.account", source: "secret", backend: "local-os", locator: `${id}-account` }],
       },
     );
     connections = [...connections, saved.connection];
@@ -258,6 +261,9 @@
     </aside>
 
     <main class="workspace">
+      {#if credentialMigration.status === "pending"}
+        <div class="uncertain" role="status"><strong>CREDENTIAL MIGRATION PENDING</strong><span>Keychain migration is {credentialMigration.reason.replaceAll("_", " ")}. Credentials remain available and migration will retry next launch.</span></div>
+      {/if}
       {#if selected}
         <header class="toolbar">
           <div><span>YakShed</span><b>›</b><strong>{selected.work_item.title}</strong></div>

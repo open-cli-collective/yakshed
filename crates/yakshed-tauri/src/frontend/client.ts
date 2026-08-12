@@ -123,7 +123,14 @@ export interface ConnectionInput {
 
 export interface Connection extends ConnectionInput {}
 export interface ConnectionEnvelope { config_revision: number; connection: Connection }
-export interface ConnectionList { config_revision: number; connections: Connection[] }
+export type CredentialMigrationStatus =
+  | { status: "ready" }
+  | { status: "pending"; reason: "locked" | "denied" | "unavailable" | "failed" | "cleanup_required" };
+export interface ConnectionList {
+  config_revision: number;
+  connections: Connection[];
+  credential_migration: CredentialMigrationStatus;
+}
 export interface SecretWrite { overwritten: boolean }
 export interface Artifact { id: string; kind: string; byte_len: number; work_item_id: string }
 export interface ArtifactList { revision: number; artifacts: Artifact[] }

@@ -12,17 +12,18 @@ use provider_codex::{CodexAdapter, CodexRuntimeKey, CodexRuntimeSpec};
 use tokio::sync::{Mutex, Notify, mpsc};
 use yakshed_application::{
     ArtifactPort, ArtifactPortError, CachePort, CachePortError, ConfigChange,
-    ConfigConnectionSnapshot, ConfigPort, ConfigPortError, ConfigSnapshot, HarnessPortError,
-    HarnessResponse, OpenArtifactCommand, OpenArtifactPayload, ProviderCommandRef,
-    ProviderRequestRef, ProviderRunRef, PublicConnection, PublicConnectionList,
-    PublicCredentialBinding, PublicCredentialSource, PutConnectionCommand, RunHarness,
-    RunHarnessEvent, RunTerminal, SecretPort, SecretPortError, SecretWriteOutcome,
-    SetConnectionCredentialCommand, SystemClock, SystemIdGenerator,
+    ConfigConnectionSnapshot, ConfigPort, ConfigPortError, ConfigSnapshot,
+    CredentialMigrationPendingReason, CredentialMigrationStatus, HarnessPortError, HarnessResponse,
+    OpenArtifactCommand, OpenArtifactPayload, ProviderCommandRef, ProviderRequestRef,
+    ProviderRunRef, PublicConnection, PublicConnectionList, PublicCredentialBinding,
+    PublicCredentialSource, PutConnectionCommand, RunHarness, RunHarnessEvent, RunTerminal,
+    SecretPort, SecretPortError, SecretWriteOutcome, SetConnectionCredentialCommand, SystemClock,
+    SystemIdGenerator,
 };
 use yakshed_desktop_api::{ApiPorts, StartupError};
 use yakshed_domain::{
-    ArtifactRecord, Connection, ConnectionId, CredentialBinding, OperationId, RunId, SecretBackend,
-    SecretBackendId, SecretBackendSettings, WorkItemId,
+    ArtifactRecord, Connection, ConnectionId, CredentialBinding, CredentialSlot, OperationId,
+    RunId, SecretBackend, SecretBackendId, SecretBackendSettings, WorkItemId,
 };
 use yakshed_harness::{
     HarnessAdapter, HarnessError, HarnessEvent, HarnessInput, HarnessRunTerminal,
@@ -32,13 +33,14 @@ use yakshed_harness::{
 use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, LocalFileBackend, LocalOsBackend, NoopSecretAuditSink,
     PutSecretOptions, PutSecretOutcome, SecretAccessContext, SecretAccessPurpose,
-    SecretBackendHandle, backend_capabilities,
+    SecretAdministrator, SecretBackendHandle, SecretError, SecretResolver, backend_capabilities,
 };
 use yakshed_store::{
     AppPaths, ArtifactError, ArtifactStore, CacheStore, ConfigError, ConfigStore, SqliteStore,
 };
 
-const LOCAL_BACKEND_ID: &str = "local-file";
+const LOCAL_BACKEND_ID: &str = "local-os";
+const LEGACY_BACKEND_ID: &str = "local-file";
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const PENDING_EVENT_CAPACITY: usize = 128;
 
@@ -73,7 +75,18 @@ async fn compose() -> Result<yakshed_tauri::ShellState, StartupError> {
         ConfigStore::open(paths.clone(), backend_capabilities())
             .map_err(|_| StartupError::persistence())?,
     );
-    let local_backend = local_backend(&paths);
+    let local_backend = local_backend();
+    let legacy_backend = legacy_backend(&paths);
+    let local_os =
+        LocalOsBackend::from_config(&local_backend).map_err(|_| StartupError::internal())?;
+    let credential_migration = migrate_interim_secrets(
+        &paths,
+        &config_store,
+        &legacy_backend,
+        &local_backend,
+        &local_os,
+    )
+    .await;
     let broker = Arc::new(build_broker(&config_store.snapshot(), &local_backend)?);
     let harness = Arc::new(CodexHarness::new(paths.clone(), config_store.clone()));
     let cache = Arc::new(CacheStore::open(&paths).map_err(|_| StartupError::persistence())?);
@@ -94,6 +107,7 @@ async fn compose() -> Result<yakshed_tauri::ShellState, StartupError> {
             config: Arc::new(ProductionConfig {
                 store: config_store.clone(),
                 local_backend,
+                credential_migration,
             }),
             secrets: Arc::new(ProductionSecrets {
                 store: config_store,
@@ -106,9 +120,16 @@ async fn compose() -> Result<yakshed_tauri::ShellState, StartupError> {
     .await
 }
 
-fn local_backend(paths: &AppPaths) -> SecretBackend {
+fn local_backend() -> SecretBackend {
     SecretBackend {
         id: SecretBackendId::new(LOCAL_BACKEND_ID).expect("constant backend id is valid"),
+        settings: SecretBackendSettings::LocalOs,
+    }
+}
+
+fn legacy_backend(paths: &AppPaths) -> SecretBackend {
+    SecretBackend {
+        id: SecretBackendId::new(LEGACY_BACKEND_ID).expect("constant backend id is valid"),
         settings: SecretBackendSettings::LocalFile {
             path: paths
                 .data_root
@@ -117,6 +138,140 @@ fn local_backend(paths: &AppPaths) -> SecretBackend {
                 .into_owned(),
         },
     }
+}
+
+async fn migrate_interim_secrets<T>(
+    paths: &AppPaths,
+    store: &ConfigStore,
+    legacy_config: &SecretBackend,
+    target_config: &SecretBackend,
+    target: &T,
+) -> CredentialMigrationStatus
+where
+    T: SecretResolver + SecretAdministrator,
+{
+    let path = paths.data_root.join("secrets.json");
+    let exists = match tokio::task::spawn_blocking(move || path.try_exists()).await {
+        Ok(Ok(exists)) => exists,
+        _ => return pending(SecretErrorClass::Failed),
+    };
+    if !exists {
+        return CredentialMigrationStatus::Ready;
+    }
+    let snapshot = store.snapshot();
+    let legacy_configured = snapshot
+        .config
+        .secret_backends
+        .iter()
+        .any(|backend| backend == legacy_config);
+    let target_configured = snapshot
+        .config
+        .secret_backends
+        .iter()
+        .any(|backend| backend == target_config);
+    let mut bound_locators = snapshot
+        .config
+        .connections
+        .iter()
+        .flat_map(|connection| &connection.credentials)
+        .filter_map(|credential| match &credential.binding {
+            CredentialBinding::Secret { reference } if reference.backend_id == legacy_config.id => {
+                Some(reference.locator.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if (!bound_locators.is_empty() && !legacy_configured)
+        || (bound_locators.is_empty() && !target_configured)
+    {
+        return pending(SecretErrorClass::Failed);
+    }
+    let source = match LocalFileBackend::from_config(legacy_config) {
+        Ok(source) => source,
+        Err(_) => return pending(SecretErrorClass::Failed),
+    };
+    let mut locators = match source.locators().await {
+        Ok(locators) => locators,
+        Err(error) => return pending(classify_secret_error(&error)),
+    };
+    locators.append(&mut bound_locators);
+    locators.sort();
+    locators.dedup();
+    let context = SecretAccessContext {
+        connection_id: "0193f26e-7a72-7000-8000-00000000f001"
+            .parse()
+            .expect("constant migration connection id is valid"),
+        slot: CredentialSlot::new("migration").expect("constant migration slot is valid"),
+        purpose: SecretAccessPurpose::ValidateCredential,
+        request_id: OperationId::new("plaintext-migration")
+            .expect("constant migration operation id is valid"),
+    };
+    for locator in &locators {
+        let secret = match source.resolve(locator, &context).await {
+            Ok(secret) => secret,
+            Err(error) => return pending(classify_secret_error(&error)),
+        };
+        if let Err(error) = target
+            .put(locator, secret.as_secret(), PutSecretOptions::OVERWRITE)
+            .await
+        {
+            return pending(classify_secret_error(&error));
+        }
+        let migrated = match target.resolve(locator, &context).await {
+            Ok(migrated) => migrated,
+            Err(error) => return pending(classify_secret_error(&error)),
+        };
+        if !secret.expose(|source| migrated.expose(|target| source == target)) {
+            return pending(SecretErrorClass::Failed);
+        }
+    }
+
+    if legacy_configured
+        && store
+            .update(
+                snapshot.revision,
+                ConfigChange::MigrateSecretBackend {
+                    from: legacy_config.id.clone(),
+                    to: target_config.clone(),
+                },
+            )
+            .await
+            .is_err()
+    {
+        return pending(SecretErrorClass::Failed);
+    }
+    if source.purge().await.is_err() {
+        return CredentialMigrationStatus::Pending(
+            CredentialMigrationPendingReason::CleanupRequired,
+        );
+    }
+    CredentialMigrationStatus::Ready
+}
+
+#[derive(Clone, Copy)]
+enum SecretErrorClass {
+    Locked,
+    Denied,
+    Unavailable,
+    Failed,
+}
+
+fn classify_secret_error(error: &SecretError) -> SecretErrorClass {
+    match error {
+        SecretError::Locked { .. } => SecretErrorClass::Locked,
+        SecretError::Denied { .. } => SecretErrorClass::Denied,
+        SecretError::BackendUnavailable { .. } => SecretErrorClass::Unavailable,
+        _ => SecretErrorClass::Failed,
+    }
+}
+
+fn pending(reason: SecretErrorClass) -> CredentialMigrationStatus {
+    CredentialMigrationStatus::Pending(match reason {
+        SecretErrorClass::Locked => CredentialMigrationPendingReason::Locked,
+        SecretErrorClass::Denied => CredentialMigrationPendingReason::Denied,
+        SecretErrorClass::Unavailable => CredentialMigrationPendingReason::Unavailable,
+        SecretErrorClass::Failed => CredentialMigrationPendingReason::Failed,
+    })
 }
 
 fn build_broker(
@@ -173,6 +328,7 @@ fn build_backend_handles(
 struct ProductionConfig {
     store: Arc<ConfigStore>,
     local_backend: SecretBackend,
+    credential_migration: CredentialMigrationStatus,
 }
 
 #[async_trait]
@@ -223,6 +379,7 @@ impl ConfigPort for ProductionConfig {
         let snapshot = self.store.snapshot();
         Ok(PublicConnectionList {
             config_revision: snapshot.revision,
+            credential_migration: self.credential_migration,
             connections: snapshot
                 .config
                 .connections
@@ -980,13 +1137,14 @@ fn map_harness_error(error: HarnessError) -> HarnessPortError {
 mod tests {
     use super::*;
     use yakshed_application::{
-        AppStore, ConfigRevision, CreateProject, CreateWorkItem, IdGenerator,
+        AppStore, ConfigRevision, CreateProject, CreateWorkItem, IdGenerator, SecretValue,
     };
     use yakshed_domain::{
         ArtifactId, ArtifactKind, ArtifactProvenance, CredentialBindingRecord, CredentialSlot,
         ProviderStateRootId, SecretLocator, SecretReference,
     };
     use yakshed_harness::{NativePayload, ProviderRunId, ProviderSessionId, SanitizedDiagnostic};
+    use yakshed_secrets::{MemorySecretBackend, MemorySecretFault};
     use yakshed_store::ArtifactMetadata;
 
     fn test_config(paths: &AppPaths) -> Arc<ConfigStore> {
@@ -1008,11 +1166,12 @@ mod tests {
     async fn production_config_accepts_a_secret_backed_connection() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
-        let backend = local_backend(&paths);
+        let backend = local_backend();
         let store = Arc::new(ConfigStore::open(paths, backend_capabilities()).unwrap());
         let port = ProductionConfig {
             store,
             local_backend: backend.clone(),
+            credential_migration: CredentialMigrationStatus::Ready,
         };
         let connection = Connection {
             id: "0193f26e-7a72-7000-8000-00000000d001".parse().unwrap(),
@@ -1040,17 +1199,167 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.config.secret_backends, vec![backend]);
+        assert_eq!(snapshot.config.secret_backends[0].kind(), "local-os");
         assert_eq!(snapshot.config.connections.len(), 1);
+    }
+
+    async fn plaintext_fixture(
+        paths: &AppPaths,
+    ) -> (Arc<ConfigStore>, SecretBackend, Vec<SecretLocator>) {
+        paths.create_data_root().unwrap();
+        let legacy = legacy_backend(paths);
+        let locators = vec![
+            SecretLocator::new("connection/one/api-key").unwrap(),
+            SecretLocator::new("connection/two/api-key").unwrap(),
+        ];
+        let connection = Connection {
+            id: "0193f26e-7a72-7000-8000-00000000d101".parse().unwrap(),
+            name: "Legacy".to_owned(),
+            harness: "codex".to_owned(),
+            model_provider: "openai".to_owned(),
+            provider_state: ProviderStateRootId::new("legacy-codex").unwrap(),
+            credentials: locators
+                .iter()
+                .enumerate()
+                .map(|(index, locator)| CredentialBindingRecord {
+                    slot: CredentialSlot::new(format!("provider.key-{index}")).unwrap(),
+                    binding: CredentialBinding::Secret {
+                        reference: SecretReference {
+                            backend_id: legacy.id.clone(),
+                            locator: locator.clone(),
+                        },
+                    },
+                })
+                .collect(),
+        };
+        let store = Arc::new(ConfigStore::open(paths.clone(), backend_capabilities()).unwrap());
+        store
+            .update(
+                ConfigRevision::INITIAL,
+                ConfigChange::PutConnectionWithSecretBackends {
+                    connection,
+                    secret_backends: vec![legacy.clone()],
+                },
+            )
+            .await
+            .unwrap();
+        let source = LocalFileBackend::from_config(&legacy).unwrap();
+        for (index, locator) in locators.iter().enumerate() {
+            source
+                .put(
+                    locator,
+                    SecretValue::new(format!("migration-canary-{index}")).as_secret(),
+                    PutSecretOptions::NO_OVERWRITE,
+                )
+                .await
+                .unwrap();
+        }
+        (store, legacy, locators)
+    }
+
+    fn migration_context() -> SecretAccessContext {
+        SecretAccessContext {
+            connection_id: "0193f26e-7a72-7000-8000-00000000d101".parse().unwrap(),
+            slot: CredentialSlot::new("provider.key-0").unwrap(),
+            purpose: SecretAccessPurpose::ValidateCredential,
+            request_id: OperationId::new("migration-test").unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_migration_rewrites_once_verifies_and_removes_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let (store, legacy, locators) = plaintext_fixture(&paths).await;
+        let target_config = local_backend();
+        let target = MemorySecretBackend::new(target_config.id.clone());
+
+        assert_eq!(
+            migrate_interim_secrets(&paths, &store, &legacy, &target_config, &target).await,
+            CredentialMigrationStatus::Ready
+        );
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.revision, ConfigRevision::new(2));
+        assert_eq!(snapshot.config.secret_backends, vec![target_config.clone()]);
+        assert!(!paths.data_root.join("secrets.json").exists());
+        for (index, locator) in locators.iter().enumerate() {
+            assert!(
+                target
+                    .resolve(locator, &migration_context())
+                    .await
+                    .unwrap()
+                    .expose(|value| value == format!("migration-canary-{index}"))
+            );
+        }
+        let rendered = format!("{:?}", snapshot.config);
+        assert!(!rendered.contains("migration-canary"));
+        assert_eq!(
+            migrate_interim_secrets(&paths, &store, &legacy, &target_config, &target).await,
+            CredentialMigrationStatus::Ready
+        );
+        assert_eq!(store.snapshot().revision, ConfigRevision::new(2));
+    }
+
+    #[tokio::test]
+    async fn plaintext_migration_resumes_after_a_partial_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let (store, legacy, locators) = plaintext_fixture(&paths).await;
+        let target_config = local_backend();
+        let target = MemorySecretBackend::new(target_config.id.clone());
+        target
+            .put(
+                &locators[0],
+                SecretValue::new("migration-canary-0").as_secret(),
+                PutSecretOptions::NO_OVERWRITE,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            migrate_interim_secrets(&paths, &store, &legacy, &target_config, &target).await,
+            CredentialMigrationStatus::Ready
+        );
+        assert!(!paths.data_root.join("secrets.json").exists());
+        assert!(
+            target
+                .resolve(&locators[1], &migration_context())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_keychain_defers_migration_without_losing_plaintext() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let (store, legacy, locators) = plaintext_fixture(&paths).await;
+        let target_config = local_backend();
+        let target = MemorySecretBackend::new(target_config.id.clone());
+        target.plan_faults([MemorySecretFault::Locked]);
+
+        assert_eq!(
+            migrate_interim_secrets(&paths, &store, &legacy, &target_config, &target).await,
+            CredentialMigrationStatus::Pending(CredentialMigrationPendingReason::Locked)
+        );
+        assert!(paths.data_root.join("secrets.json").exists());
+        assert_eq!(store.snapshot().revision, ConfigRevision::new(1));
+        assert!(
+            LocalFileBackend::from_config(&legacy)
+                .unwrap()
+                .resolve(&locators[0], &migration_context())
+                .await
+                .unwrap()
+                .expose(|value| value == "migration-canary-0")
+        );
     }
 
     #[test]
     fn every_production_configured_backend_kind_builds_a_handle() {
         let temp = tempfile::tempdir().unwrap();
-        let local_file = local_backend(&AppPaths::for_test(temp.path()));
-        let local_os = SecretBackend {
-            id: SecretBackendId::new("local-os").unwrap(),
-            settings: SecretBackendSettings::LocalOs,
-        };
+        let local_file = legacy_backend(&AppPaths::for_test(temp.path()));
+        let local_os = local_backend();
         let handles = build_backend_handles(vec![local_file.clone(), local_os.clone()]).unwrap();
 
         assert_eq!(handles.len(), 2);

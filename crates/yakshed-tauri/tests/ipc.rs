@@ -196,6 +196,7 @@ impl ConfigPort for TestConfig {
         let state = self.state.lock().unwrap();
         Ok(PublicConnectionList {
             config_revision: state.0,
+            credential_migration: yakshed_application::CredentialMigrationStatus::Ready,
             connections: state.1.iter().cloned().map(to_public).collect(),
         })
     }

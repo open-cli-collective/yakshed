@@ -7,7 +7,8 @@ use tokio::sync::broadcast;
 pub use yakshed_application::RunOrchestrationError;
 use yakshed_application::{
     AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
-    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem, IdGenerator, ListWorkItems,
+    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem,
+    CredentialMigrationPendingReason, CredentialMigrationStatus, IdGenerator, ListWorkItems,
     OpenArtifactCommand, OpenArtifactPayload, PublicCredentialBinding, PublicCredentialSource,
     PutConnectionCommand, RunHarness, RunSupervisor, SecretPort, SecretPortError,
     SetConnectionCredentialCommand, StoreError,
@@ -306,6 +307,26 @@ pub struct ConnectionEnvelope {
 pub struct ConnectionListEnvelope {
     pub config_revision: u64,
     pub connections: Vec<FrontendConnection>,
+    pub credential_migration: FrontendCredentialMigrationStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FrontendCredentialMigrationStatus {
+    Ready,
+    Pending {
+        reason: FrontendCredentialMigrationPendingReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendCredentialMigrationPendingReason {
+    Locked,
+    Denied,
+    Unavailable,
+    Failed,
+    CleanupRequired,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -662,6 +683,30 @@ impl DesktopApi {
             .map_err(map_config_error)?;
         Ok(ConnectionListEnvelope {
             config_revision: list.config_revision.get(),
+            credential_migration: match list.credential_migration {
+                CredentialMigrationStatus::Ready => FrontendCredentialMigrationStatus::Ready,
+                CredentialMigrationStatus::Pending(reason) => {
+                    FrontendCredentialMigrationStatus::Pending {
+                        reason: match reason {
+                            CredentialMigrationPendingReason::Locked => {
+                                FrontendCredentialMigrationPendingReason::Locked
+                            }
+                            CredentialMigrationPendingReason::Denied => {
+                                FrontendCredentialMigrationPendingReason::Denied
+                            }
+                            CredentialMigrationPendingReason::Unavailable => {
+                                FrontendCredentialMigrationPendingReason::Unavailable
+                            }
+                            CredentialMigrationPendingReason::Failed => {
+                                FrontendCredentialMigrationPendingReason::Failed
+                            }
+                            CredentialMigrationPendingReason::CleanupRequired => {
+                                FrontendCredentialMigrationPendingReason::CleanupRequired
+                            }
+                        },
+                    }
+                }
+            },
             connections: list
                 .connections
                 .into_iter()

@@ -12,7 +12,14 @@ python3 scripts/tauri_app_smoke.py
 
 The smoke launches the real `yakshed-desktop` binary with an isolated home, waits for its real
 SQLite database, requests a normal application quit, and fails if its process group survives.
-The production secret backend is the existing plaintext local-file backend until the keyring phase.
+New secret-backed connections use the macOS Keychain (`local-os`). On first launch after upgrading,
+YakShed copies every entry from the interim `data_root/secrets.json`, verifies each Keychain read,
+rewrites all affected connection bindings in one config revision, then overwrites the file with
+zeroes and removes it. The overwrite is explicitly best-effort: APFS copy-on-write snapshots and
+flash wear levelling prevent any application from guaranteeing physical erasure. A locked, denied,
+or unavailable Keychain leaves the plaintext store and bindings intact, reports migration pending
+in the UI, and retries on the next launch. `local-file` remains available only when explicitly
+configured for development.
 
 Playwright remains the CI S7 gate: it drives the built Svelte surface through the mock invoke/event
 factory because Playwright cannot attach to the platform Wry webview on headless Linux.
