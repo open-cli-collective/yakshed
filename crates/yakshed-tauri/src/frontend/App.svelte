@@ -340,7 +340,7 @@
         <header><div><p class="eyebrow">CONNECTIONS</p><h2>Harness setup</h2></div><button class="icon-button" aria-label="Close connections" onclick={() => settingsOpen = false}>×</button></header>
         <form onsubmit={(event) => void addConnection(event)}>
           <label for="connection-name">Name</label><input id="connection-name" name="name" placeholder="Local Codex" required />
-          <label for="provider">Model provider</label><input id="provider" name="provider" placeholder="codex" required />
+          <label for="provider">Model provider</label><input id="provider" name="provider" placeholder="openai" required />
           <button>Add connection</button>
         </form>
         {#if connections[0]}

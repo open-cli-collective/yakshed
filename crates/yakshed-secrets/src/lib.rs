@@ -250,6 +250,10 @@ impl ResolvedSecret {
     pub fn as_secret(&self) -> &SecretString {
         &self.value
     }
+
+    pub fn into_secret(self) -> SecretString {
+        self.value
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

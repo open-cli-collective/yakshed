@@ -487,7 +487,7 @@ impl fmt::Display for HarnessEvent {
     }
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HarnessError {
     #[error("invalid input: {0}")]
     InvalidInput(String),

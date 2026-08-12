@@ -120,7 +120,7 @@ test("runs the product loop through approval, input, interrupt, and reconciliati
 
   await page.getByRole("button", { name: /Connections/ }).click();
   await page.getByLabel("Name").fill("Scripted mock");
-  await page.getByLabel("Model provider").fill("codex");
+  await page.getByLabel("Model provider").fill("openai");
   await page.getByRole("button", { name: "Add connection" }).click();
   await expect(page.getByText("Codex is not authenticated for this connection.")).toBeVisible();
   await page.getByRole("button", { name: "Sign in with Codex" }).click();
@@ -176,7 +176,7 @@ test("a missing Codex runtime leaves the account status unknown without failing 
   await page.goto("/");
   await page.getByRole("button", { name: /Connections/ }).click();
   await page.getByLabel("Name").fill("Codex unavailable");
-  await page.getByLabel("Model provider").fill("codex");
+  await page.getByLabel("Model provider").fill("openai");
   await page.getByRole("button", { name: "Add connection" }).click();
   await expect(page.getByText("Codex account status is unknown.")).toBeVisible();
   await expect(page.getByText("YakShed could not open.")).not.toBeVisible();

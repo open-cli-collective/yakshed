@@ -20,7 +20,11 @@ initialized = False
 active = None
 boundary_errors = set()
 recorded = {}
-account_state = "none" if SCENARIO.startswith("account_login") else "authenticated"
+account_state = "none" if SCENARIO.startswith("account_") else "authenticated"
+if SCENARIO == "mode_b":
+    account_state = "api_key"
+    assert os.environ["FIREWORKS_API_KEY"] == "YAKSHED_MODE_B_CANARY"
+account_reads = 0
 
 
 def complete_login_after_delay():
@@ -28,6 +32,13 @@ def complete_login_after_delay():
     time.sleep(0.05)
     account_state = "authenticated"
     emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": True, "error": None}})
+
+
+def external_login_after_delay():
+    global account_state
+    time.sleep(0.05)
+    account_state = "authenticated"
+    emit({"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "plus"}})
 
 
 def record_golden(value):
@@ -448,21 +459,34 @@ for line in sys.stdin:
         with open(os.path.join(os.environ["CODEX_HOME"], "requests.log"), "a", encoding="utf-8") as request_log:
             request_log.write(f"{method}\n")
         if method == "account/read":
+            account_reads += 1
             account = None
             if account_state == "authenticated":
                 account = {"type": "chatgpt", "email": "yak@example.test", "planType": "plus"}
             elif account_state == "unknown":
+                account = {"type": "amazonBedrock"}
+            elif account_state == "api_key":
                 account = {"type": "apiKey"}
             emit({"id": request_id, "result": {"account": account, "requiresOpenaiAuth": True}})
         elif method == "account/login/start":
             assert message["params"]["type"] == "chatgpt"
             assert "apiKey" not in message["params"]
+            crash_marker = os.path.join(os.environ["CODEX_HOME"], "login-crashed")
+            if SCENARIO == "account_login_crash_once" and not os.path.exists(crash_marker):
+                open(crash_marker, "w", encoding="utf-8").close()
+                sys.exit(7)
+            if SCENARIO == "account_login_slow_start":
+                time.sleep(0.05)
             emit({"id": request_id, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": "https://chatgpt.com/codex/login-1"}})
             if SCENARIO == "account_login_failure":
                 account_state = "unknown"
                 emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": False, "error": "YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT"}})
             elif SCENARIO == "account_login_delayed":
                 threading.Thread(target=complete_login_after_delay).start()
+            elif SCENARIO == "account_login_external_change":
+                threading.Thread(target=external_login_after_delay).start()
+            elif SCENARIO in ("account_login_missed_completion", "account_login_slow_start", "account_login_crash_once"):
+                account_state = "authenticated"
             else:
                 account_state = "authenticated"
                 emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": True, "error": None}})

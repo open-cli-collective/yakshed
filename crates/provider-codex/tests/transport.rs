@@ -1,6 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use provider_codex::{CodexAdapter, CodexRuntimeKey, CodexRuntimeSpec};
+use secrecy::SecretString;
 use yakshed_domain::ApprovalDecision;
 use yakshed_harness::{
     HarnessAccountStatus, HarnessAdapter, HarnessCredentialDelivery, HarnessError, HarnessEvent,
@@ -105,10 +106,9 @@ macro_rules! transport_test {
 
 #[test]
 fn codex_declares_delegated_account_authentication() {
-    let test = adapter("interruptible", 1024 * 1024, None);
     assert!(
-        test.adapter
-            .credential_requirements()
+        CodexAdapter::credential_requirements_for("openai")
+            .unwrap()
             .iter()
             .any(|requirement| {
                 requirement.slot.as_str() == "codex.account"
@@ -119,6 +119,17 @@ fn codex_declares_delegated_account_authentication() {
                     && requirement.required
             })
     );
+    assert!(matches!(
+        CodexAdapter::credential_requirements_for("fireworks")
+            .unwrap()
+            .as_slice(),
+        [requirement]
+            if requirement.slot.as_str() == "fireworks.api_key"
+                && requirement.delivery == HarnessCredentialDelivery::ProcessEnvironment {
+                    variable: "FIREWORKS_API_KEY".to_owned(),
+                }
+                && requirement.required
+    ));
 }
 
 transport_test!(account_login_status_and_logout_are_sanitized, {
@@ -219,6 +230,88 @@ transport_test!(
         ));
     }
 );
+
+transport_test!(concurrent_login_starts_issue_one_native_request, {
+    let test = adapter("account_login_slow_start", 1024 * 1024, None);
+    let (first, second) = tokio::join!(
+        test.adapter.account_login_start(&test.runtime),
+        test.adapter.account_login_start(&test.runtime),
+    );
+    assert_eq!(first.unwrap(), second.unwrap());
+    let requests = std::fs::read_to_string(test.runtime_home().join("requests.log")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "account/login/start")
+            .count(),
+        1
+    );
+});
+
+transport_test!(canonical_account_read_reconciles_missed_login_completion, {
+    let test = adapter("account_login_missed_completion", 1024 * 1024, None);
+    test.adapter
+        .account_login_start(&test.runtime)
+        .await
+        .unwrap();
+    assert!(matches!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::Authenticated { .. }
+    ));
+});
+
+transport_test!(canonical_account_read_reconciles_external_auth_change, {
+    let test = adapter("account_login_external_change", 1024 * 1024, None);
+    test.adapter
+        .account_login_start(&test.runtime)
+        .await
+        .unwrap();
+    assert!(matches!(
+        wait_for_account(
+            &test,
+            HarnessAccountStatus::Authenticated {
+                email: Some("yak@example.test".to_owned()),
+                plan: "plus".to_owned(),
+            },
+        )
+        .await,
+        HarnessAccountStatus::Authenticated { .. }
+    ));
+});
+
+transport_test!(native_api_key_account_is_authenticated, {
+    let test = adapter("mode_b", 1024 * 1024, None);
+    test.adapter
+        .start_with_environment(
+            &test.runtime,
+            "FIREWORKS_API_KEY".to_owned(),
+            SecretString::from("YAKSHED_MODE_B_CANARY".to_owned()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::Authenticated {
+            email: None,
+            plan: "api_key".to_owned(),
+        }
+    );
+});
+
+transport_test!(runtime_restarts_after_crash_during_login, {
+    let test = adapter("account_login_crash_once", 1024 * 1024, None);
+    assert!(matches!(
+        test.adapter.account_login_start(&test.runtime).await,
+        Err(HarnessError::OutcomeUnknown { .. })
+    ));
+    assert!(matches!(
+        test.adapter
+            .account_login_start(&test.runtime)
+            .await
+            .unwrap(),
+        HarnessAccountStatus::LoginInProgress { .. }
+    ));
+});
 
 transport_test!(run_start_requires_an_authenticated_account, {
     let test = adapter("account_login_success", 1024 * 1024, None);
@@ -550,10 +643,7 @@ transport_test!(
                 ..
             }
         ));
-        assert!(matches!(
-            test.adapter.capabilities(&test.runtime).await,
-            Err(HarnessError::Disconnected)
-        ));
+        test.adapter.capabilities(&test.runtime).await.unwrap();
         assert!(matches!(
             test.adapter.respond_to_request(request, response).await,
             Err(HarnessError::NotFound {
@@ -619,10 +709,7 @@ transport_test!(
                 ..
             }
         ));
-        assert!(matches!(
-            test.adapter.capabilities(&test.runtime).await,
-            Err(HarnessError::Disconnected)
-        ));
+        test.adapter.capabilities(&test.runtime).await.unwrap();
     }
 );
 
@@ -937,8 +1024,5 @@ transport_test!(explicit_shutdown_kills_and_reaps_the_runtime_process, {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
     );
-    assert!(matches!(
-        test.adapter.capabilities(&test.runtime).await,
-        Err(HarnessError::Disconnected)
-    ));
+    test.adapter.capabilities(&test.runtime).await.unwrap();
 });

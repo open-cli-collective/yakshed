@@ -11,8 +11,9 @@ use std::{
 
 use actor::{RequestKind, RuntimeClient};
 use async_trait::async_trait;
+use secrecy::SecretString;
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex as AsyncMutex;
 use yakshed_domain::{ConnectionId, CredentialSlot};
 use yakshed_harness::{
     HarnessAccountStatus, HarnessAdapter, HarnessCapabilities, HarnessCredentialDelivery,
@@ -102,21 +103,36 @@ impl CodexRuntimeSpec {
 /// One configured local runtime backed by one lazily started actor.
 pub struct CodexAdapter {
     spec: CodexRuntimeSpec,
-    runtime: OnceCell<RuntimeClient>,
+    runtime: AsyncMutex<Option<RuntimeClient>>,
     events: Mutex<Option<ProviderEventStream>>,
     event_sender: yakshed_harness::HarnessEventSender,
     process_group: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl CodexAdapter {
-    pub fn declared_credential_requirements() -> Vec<HarnessCredentialRequirement> {
-        vec![HarnessCredentialRequirement {
-            slot: CredentialSlot::new("codex.account").expect("constant slot is valid"),
-            delivery: HarnessCredentialDelivery::Delegated {
-                authority: "codex-app-server".to_owned(),
-            },
+    pub fn credential_requirements_for(
+        model_provider: &str,
+    ) -> Option<Vec<HarnessCredentialRequirement>> {
+        let (slot, delivery) = match model_provider {
+            "openai" => (
+                "codex.account",
+                HarnessCredentialDelivery::Delegated {
+                    authority: "codex-app-server".to_owned(),
+                },
+            ),
+            "fireworks" => (
+                "fireworks.api_key",
+                HarnessCredentialDelivery::ProcessEnvironment {
+                    variable: "FIREWORKS_API_KEY".to_owned(),
+                },
+            ),
+            _ => return None,
+        };
+        Some(vec![HarnessCredentialRequirement {
+            slot: CredentialSlot::new(slot).expect("constant slot is valid"),
+            delivery,
             required: true,
-        }]
+        }])
     }
 
     pub fn new(spec: CodexRuntimeSpec) -> Result<Self, HarnessError> {
@@ -124,29 +140,73 @@ impl CodexAdapter {
         let (event_sender, events) = event_channel();
         Ok(Self {
             spec,
-            runtime: OnceCell::new(),
+            runtime: AsyncMutex::new(None),
             events: Mutex::new(Some(events)),
             event_sender,
             process_group: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
     }
 
-    async fn runtime(&self, handle: &RuntimeHandle) -> Result<&RuntimeClient, HarnessError> {
+    async fn runtime(&self, handle: &RuntimeHandle) -> Result<RuntimeClient, HarnessError> {
+        self.runtime_with_environment(handle, None).await
+    }
+
+    async fn runtime_with_environment(
+        &self,
+        handle: &RuntimeHandle,
+        environment: Option<(String, SecretString)>,
+    ) -> Result<RuntimeClient, HarnessError> {
         if handle != &self.spec.handle {
             return Err(HarnessError::NotFound {
                 entity: "runtime",
                 id: handle.to_string(),
             });
         }
-        self.runtime
-            .get_or_try_init(|| {
-                actor::start_runtime(
-                    self.spec.clone(),
-                    self.event_sender.clone(),
-                    Arc::clone(&self.process_group),
-                )
-            })
+        let mut runtime = self.runtime.lock().await;
+        if runtime.as_ref().is_some_and(|runtime| !runtime.is_closed()) {
+            return Ok(runtime.as_ref().expect("checked runtime").clone());
+        }
+        let started = actor::start_runtime(
+            self.spec.clone(),
+            self.event_sender.clone(),
+            Arc::clone(&self.process_group),
+            environment,
+        )
+        .await?;
+        *runtime = Some(started.clone());
+        Ok(started)
+    }
+
+    pub async fn start_with_environment(
+        &self,
+        runtime: &RuntimeHandle,
+        variable: String,
+        secret: SecretString,
+    ) -> Result<(), HarnessError> {
+        self.runtime_with_environment(runtime, Some((variable, secret)))
             .await
+            .map(|_| ())
+    }
+
+    async fn account_read(
+        &self,
+        handle: &RuntimeHandle,
+    ) -> Result<(RuntimeClient, Value), HarnessError> {
+        let request = |runtime: RuntimeClient| async move {
+            let result = runtime
+                .request(
+                    "account/read",
+                    json!({"refreshToken": false}),
+                    false,
+                    RequestKind::AccountRead,
+                )
+                .await?;
+            Ok::<_, HarnessError>((runtime, result))
+        };
+        match request(self.runtime(handle).await?).await {
+            Err(HarnessError::Disconnected) => request(self.runtime(handle).await?).await,
+            result => result,
+        }
     }
 
     pub async fn diagnostics(&self) -> Result<Vec<String>, HarnessError> {
@@ -154,7 +214,7 @@ impl CodexAdapter {
     }
 
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
-        if let Some(runtime) = self.runtime.get() {
+        if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await?;
         }
         Ok(())
@@ -225,64 +285,52 @@ impl HarnessAdapter for CodexAdapter {
     }
 
     fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement> {
-        Self::declared_credential_requirements()
+        ["openai", "fireworks"]
+            .into_iter()
+            .flat_map(|provider| Self::credential_requirements_for(provider).unwrap())
+            .map(|mut requirement| {
+                requirement.required = false;
+                requirement
+            })
+            .collect()
     }
 
     async fn account_status(
         &self,
         runtime: &RuntimeHandle,
     ) -> Result<HarnessAccountStatus, HarnessError> {
-        let runtime = self.runtime(runtime).await?;
-        if let Some(status) = runtime.account_login_status().await? {
-            return Ok(status);
-        }
-        let result = runtime
-            .request(
-                "account/read",
-                json!({"refreshToken": false}),
-                false,
-                RequestKind::AccountRead,
-            )
-            .await?;
+        let (runtime, result) = self.account_read(runtime).await?;
         let Some(account) = result.get("account").filter(|account| !account.is_null()) else {
-            return Ok(HarnessAccountStatus::NotAuthenticated);
+            return Ok(runtime
+                .account_login_status()
+                .await?
+                .unwrap_or(HarnessAccountStatus::NotAuthenticated));
         };
-        if account.get("type").and_then(Value::as_str) != Some("chatgpt") {
-            return Ok(HarnessAccountStatus::Unknown);
+        match account.get("type").and_then(Value::as_str) {
+            Some("chatgpt") => Ok(HarnessAccountStatus::Authenticated {
+                email: account
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                plan: account
+                    .get("planType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            }),
+            Some("apiKey") => Ok(HarnessAccountStatus::Authenticated {
+                email: None,
+                plan: "api_key".to_owned(),
+            }),
+            _ => Ok(HarnessAccountStatus::Unknown),
         }
-        Ok(HarnessAccountStatus::Authenticated {
-            email: account
-                .get("email")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            plan: account
-                .get("planType")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned(),
-        })
     }
 
     async fn account_login_start(
         &self,
         runtime: &RuntimeHandle,
     ) -> Result<HarnessAccountStatus, HarnessError> {
-        let runtime = self.runtime(runtime).await?;
-        if let Some(status) = runtime.account_login_start_status().await? {
-            return Ok(status);
-        }
-        let result = runtime
-            .request(
-                "account/login/start",
-                json!({"type": "chatgpt", "useHostedLoginSuccessPage": true}),
-                true,
-                RequestKind::AccountLoginStart,
-            )
-            .await?;
-        Ok(HarnessAccountStatus::LoginInProgress {
-            login_id: required_string(&result, "loginId")?.to_owned(),
-            auth_url: required_string(&result, "authUrl")?.to_owned(),
-        })
+        self.runtime(runtime).await?.account_login_start().await
     }
 
     async fn account_logout(&self, runtime: &RuntimeHandle) -> Result<(), HarnessError> {
