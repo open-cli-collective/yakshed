@@ -2,6 +2,46 @@
 
 The WebKit app launch is a local macOS gate because the Linux CI runner has no Wry GUI session.
 
+## Real desktop debug journey
+
+This launcher exercises the real WebView → Tauri IPC → application/store →
+Codex adapter → external-process path. The external process is the shared
+`crates/provider-codex/tests/fake_codex.py`; no production Codex executable,
+Codex account, Keychain entry, or production YakShed state is used.
+
+From the repository root on macOS:
+
+```sh
+cd crates/yakshed-tauri
+npm ci
+cd ../..
+python3 scripts/dev_app.py --self-test
+python3 scripts/dev_app.py --scenario approval
+```
+
+In the app, add a connection named `Codex` with model provider `openai`. The
+fake reports that delegated connection as authenticated. Create a work item,
+start a run, and verify the following approval journey:
+
+1. The approval prompt is pending while the timeline also receives
+   `reader-still-live`.
+2. Approve the request and observe the run complete.
+
+Stop and relaunch for the other bounded scenarios:
+
+```sh
+python3 scripts/dev_app.py --scenario user_input
+python3 scripts/dev_app.py --scenario chunked
+```
+
+For `user_input`, enter `blue`; the fake process asserts that response. For
+`chunked`, inspect the message, file, and command entries in the timeline. The
+launcher prints the worktree, stable per-worktree state root, port, scenario,
+and the cleanup command. State persists across launches; remove only the exact
+printed state root when the fixture is no longer needed. Do not rewrite `HOME`.
+
+## Package and smoke check
+
 ```sh
 cd crates/yakshed-tauri
 npm ci

@@ -11,8 +11,10 @@ file_globs:
   - "crates/provider-*/**/*credential*"
   - "crates/yakshed-desktop-api/**/*credential*"
   - "crates/yakshed-desktop-api/**/*secret*"
-  - "src-tauri/**/*credential*"
-  - "src-tauri/**/*secret*"
+  - "crates/yakshed-desktop/src/macos.rs"
+  - "crates/yakshed-tauri/src/macos.rs"
+  - "crates/yakshed-tauri/src/frontend/client.ts"
+  - "crates/yakshed-tauri/tests/ipc.rs"
   - "docs/standards/working-with-secrets.md"
   - "Cargo.toml"
 applies_when:

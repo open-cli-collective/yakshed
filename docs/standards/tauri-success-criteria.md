@@ -1,9 +1,8 @@
 # Tauri phase — testable success criteria (Fable-authored, pre-phase gate)
 
-Draft for the HANDOFF requirement: "Tauri arrives only after the facade is
-testable without it" + Fable owes authored testable success criteria before
-the phase starts. Each criterion states its empirical check. The phase is done
-when ALL checks pass; nothing here is aspirational.
+This phase gate records the requirement that Tauri arrives only after the
+facade is testable without it. Each criterion states its empirical check. The
+phase is done when ALL checks pass; nothing here is aspirational.
 
 ## Scope of the phase
 

@@ -4,7 +4,7 @@
 > **Binary:** codex-cli 0.147.0 (Homebrew install, aarch64-apple-darwin)
 > **Method:** JSON-schema artifacts generated from the exact binary
 > (`codex app-server generate-json-schema`), plus `--strict-config` probes.
-> Per `HANDOFF.md`, where the binary disagrees with the docs, the binary wins.
+> Where the binary disagrees with the architecture docs, the binary wins.
 
 ## Claims verified against the generated schema
 

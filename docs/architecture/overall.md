@@ -821,17 +821,16 @@ crates/
 │   └── generated schema, reducer, adapter
 ├── provider-mock/
 │   └── scripted runtime, fault fixtures
-└── yakshed-desktop-api/
+├── yakshed-desktop-api/
     └── frontend-safe DTOs, plain Rust facade, event/snapshot mapping
-
-src-tauri/
-└── application assembly and Tauri integration
+├── yakshed-tauri/
+│   └── Tauri commands/events and Svelte frontend
+└── yakshed-desktop/
+    └── production application assembly and packaging
 
 tools/
 └── yakshed-contract-host/
 
-web/
-└── Svelte frontend
 ```
 
 Git/worktree operations may begin as a module inside `yakshed-application` or a small adapter crate;
