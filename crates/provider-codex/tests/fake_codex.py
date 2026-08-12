@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 
 SCENARIO = sys.argv[1]
@@ -20,6 +21,13 @@ active = None
 boundary_errors = set()
 recorded = {}
 account_state = "none" if SCENARIO.startswith("account_login") else "authenticated"
+
+
+def complete_login_after_delay():
+    global account_state
+    time.sleep(0.05)
+    account_state = "authenticated"
+    emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": True, "error": None}})
 
 
 def record_golden(value):
@@ -437,6 +445,8 @@ for line in sys.stdin:
         initialized = True
     else:
         assert initialized, "request arrived before initialized notification"
+        with open(os.path.join(os.environ["CODEX_HOME"], "requests.log"), "a", encoding="utf-8") as request_log:
+            request_log.write(f"{method}\n")
         if method == "account/read":
             account = None
             if account_state == "authenticated":
@@ -447,10 +457,12 @@ for line in sys.stdin:
         elif method == "account/login/start":
             assert message["params"]["type"] == "chatgpt"
             assert "apiKey" not in message["params"]
-            emit({"id": request_id, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": "https://auth.example.test/login-1"}})
+            emit({"id": request_id, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": "https://chatgpt.com/codex/login-1"}})
             if SCENARIO == "account_login_failure":
                 account_state = "unknown"
                 emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": False, "error": "YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT"}})
+            elif SCENARIO == "account_login_delayed":
+                threading.Thread(target=complete_login_after_delay).start()
             else:
                 account_state = "authenticated"
                 emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": True, "error": None}})

@@ -146,17 +146,41 @@ pub enum FrontendAccountStatus {
     Unknown,
 }
 
-impl From<AccountStatus> for FrontendAccountStatus {
-    fn from(status: AccountStatus) -> Self {
-        match status {
+impl TryFrom<AccountStatus> for FrontendAccountStatus {
+    type Error = DesktopError;
+
+    fn try_from(status: AccountStatus) -> Result<Self> {
+        Ok(match status {
             AccountStatus::NotAuthenticated => Self::NotAuthenticated,
-            AccountStatus::LoginInProgress { login_id, auth_url } => {
-                Self::LoginInProgress { login_id, auth_url }
-            }
+            AccountStatus::LoginInProgress { login_id, auth_url } => Self::LoginInProgress {
+                login_id,
+                auth_url: validate_account_auth_url(auth_url)?,
+            },
             AccountStatus::Authenticated { email, plan } => Self::Authenticated { email, plan },
             AccountStatus::Unknown => Self::Unknown,
-        }
+        })
     }
+}
+
+fn validate_account_auth_url(auth_url: String) -> Result<String> {
+    const MAX_AUTH_URL_BYTES: usize = 8 * 1024;
+    if auth_url.len() > MAX_AUTH_URL_BYTES {
+        return Err(invalid_account_auth_url());
+    }
+    let parsed = url::Url::parse(&auth_url).map_err(|_| invalid_account_auth_url())?;
+    if parsed.scheme() != "https"
+        || !matches!(parsed.host_str(), Some("auth.openai.com" | "chatgpt.com"))
+        || parsed.port().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(invalid_account_auth_url());
+    }
+    Ok(auth_url)
+}
+
+fn invalid_account_auth_url() -> DesktopError {
+    DesktopError::invalid_request("provider returned an invalid authentication URL")
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -777,8 +801,8 @@ impl DesktopApi {
         self.run_supervisor
             .account_status(connection_id)
             .await
-            .map(Into::into)
-            .map_err(map_run_error)
+            .map_err(map_run_error)?
+            .try_into()
     }
 
     pub async fn account_login_start(
@@ -788,8 +812,8 @@ impl DesktopApi {
         self.run_supervisor
             .account_login_start(connection_id)
             .await
-            .map(Into::into)
-            .map_err(map_run_error)
+            .map_err(map_run_error)?
+            .try_into()
     }
 
     pub async fn account_logout(&self, connection_id: ConnectionId) -> Result<()> {
@@ -1283,6 +1307,11 @@ fn map_config_error(error: ConfigPortError) -> DesktopError {
             DesktopError::conflict("configuration revision conflict")
         }
         ConfigPortError::Validation => DesktopError::invalid_request("configuration is invalid"),
+        ConfigPortError::CredentialRequirement(remediation) => DesktopError {
+            code: DesktopErrorCode::InvalidRequest,
+            message: "credential requirement is not satisfied",
+            detail: Some(remediation),
+        },
         ConfigPortError::MigrationPending => {
             DesktopError::conflict("credential migration is pending")
         }
@@ -1408,5 +1437,36 @@ fn to_public_connection(connection: Connection) -> PublicConnection {
                 }
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod account_auth_url_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_pinned_https_login_origins() {
+        for auth_url in [
+            "https://chatgpt.com/auth/login?state=opaque",
+            "https://auth.openai.com/oauth/authorize?state=opaque",
+        ] {
+            assert!(validate_account_auth_url(auth_url.to_owned()).is_ok());
+        }
+        for auth_url in [
+            "javascript:alert(1)",
+            "file:///tmp/credential",
+            "https://evil.example/login",
+            "https://chatgpt.com.evil.example/login",
+            "https://chatgpt.com:444/login",
+            "https://user@chatgpt.com/login",
+        ] {
+            let error = validate_account_auth_url(auth_url.to_owned()).unwrap_err();
+            assert_eq!(error.code, DesktopErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "provider returned an invalid authentication URL"
+            );
+            assert!(!format!("{error:?}").contains(auth_url));
+        }
     }
 }

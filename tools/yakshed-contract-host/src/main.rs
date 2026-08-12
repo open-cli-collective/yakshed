@@ -1040,7 +1040,7 @@ fn work_json(item: &WorkItemSnapshot) -> Value {
 fn delivery_json(delivery: &HarnessCredentialDelivery) -> Value {
     match delivery {
         HarnessCredentialDelivery::HarnessManaged => json!({"kind": "harness_managed"}),
-        HarnessCredentialDelivery::Delegated => json!({"kind": "delegated"}),
+        HarnessCredentialDelivery::Delegated { .. } => json!({"kind": "delegated"}),
         HarnessCredentialDelivery::ProcessEnvironment { variable } => {
             json!({"kind": "process_environment", "variable": variable})
         }
@@ -1065,12 +1065,21 @@ fn validate_binding_requirement(
         (binding, delivery),
         (
             CredentialBinding::Delegated { .. },
-            HarnessCredentialDelivery::HarnessManaged | HarnessCredentialDelivery::Delegated
+            HarnessCredentialDelivery::HarnessManaged
         ) | (
             CredentialBinding::Secret { .. },
             HarnessCredentialDelivery::ProcessEnvironment { .. }
         )
     ) {
+        Ok(())
+    } else if let (
+        CredentialBinding::Delegated { authority: bound },
+        HarnessCredentialDelivery::Delegated {
+            authority: declared,
+        },
+    ) = (binding, delivery)
+        && bound == declared
+    {
         Ok(())
     } else {
         Err(HostError::invalid(
@@ -1085,7 +1094,7 @@ fn validate_requested_delivery(
 ) -> Result<(), HostError> {
     match (requested, declared) {
         (DeliveryInput::HarnessManaged, HarnessCredentialDelivery::HarnessManaged) => Ok(()),
-        (DeliveryInput::Delegated, HarnessCredentialDelivery::Delegated) => Ok(()),
+        (DeliveryInput::Delegated, HarnessCredentialDelivery::Delegated { .. }) => Ok(()),
         (
             DeliveryInput::ProcessEnvironment {
                 variable: requested,
@@ -1260,6 +1269,20 @@ impl ConnectionInput {
                         binding: CredentialBinding::Disabled,
                     });
                 }
+            }
+        }
+        for requirement in requirements
+            .iter()
+            .filter(|requirement| requirement.required)
+        {
+            if !credentials.iter().any(|credential| {
+                credential.slot == requirement.slot
+                    && !matches!(&credential.binding, CredentialBinding::Disabled)
+            }) {
+                return Err(HostError::new(
+                    "invalid_input",
+                    "connection is missing a required credential slot",
+                ));
             }
         }
         let connection = Connection {

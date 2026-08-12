@@ -109,6 +109,16 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    pub fn declared_credential_requirements() -> Vec<HarnessCredentialRequirement> {
+        vec![HarnessCredentialRequirement {
+            slot: CredentialSlot::new("codex.account").expect("constant slot is valid"),
+            delivery: HarnessCredentialDelivery::Delegated {
+                authority: "codex-app-server".to_owned(),
+            },
+            required: true,
+        }]
+    }
+
     pub fn new(spec: CodexRuntimeSpec) -> Result<Self, HarnessError> {
         spec.validate()?;
         let (event_sender, events) = event_channel();
@@ -215,19 +225,18 @@ impl HarnessAdapter for CodexAdapter {
     }
 
     fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement> {
-        vec![HarnessCredentialRequirement {
-            slot: CredentialSlot::new("codex.account").expect("constant slot is valid"),
-            delivery: HarnessCredentialDelivery::Delegated,
-        }]
+        Self::declared_credential_requirements()
     }
 
     async fn account_status(
         &self,
         runtime: &RuntimeHandle,
     ) -> Result<HarnessAccountStatus, HarnessError> {
-        let result = self
-            .runtime(runtime)
-            .await?
+        let runtime = self.runtime(runtime).await?;
+        if let Some(status) = runtime.account_login_status().await? {
+            return Ok(status);
+        }
+        let result = runtime
             .request(
                 "account/read",
                 json!({"refreshToken": false}),
@@ -258,9 +267,11 @@ impl HarnessAdapter for CodexAdapter {
         &self,
         runtime: &RuntimeHandle,
     ) -> Result<HarnessAccountStatus, HarnessError> {
-        let result = self
-            .runtime(runtime)
-            .await?
+        let runtime = self.runtime(runtime).await?;
+        if let Some(status) = runtime.account_login_start_status().await? {
+            return Ok(status);
+        }
+        let result = runtime
             .request(
                 "account/login/start",
                 json!({"type": "chatgpt", "useHostedLoginSuccessPage": true}),
@@ -277,7 +288,12 @@ impl HarnessAdapter for CodexAdapter {
     async fn account_logout(&self, runtime: &RuntimeHandle) -> Result<(), HarnessError> {
         self.runtime(runtime)
             .await?
-            .request("account/logout", json!({}), true, RequestKind::EmptyObject)
+            .request(
+                "account/logout",
+                json!({}),
+                true,
+                RequestKind::AccountLogout,
+            )
             .await?;
         Ok(())
     }

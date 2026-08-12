@@ -16,9 +16,9 @@ use tokio::{
 };
 use yakshed_domain::ApprovalDecision;
 use yakshed_harness::{
-    HarnessError, HarnessEvent, HarnessEventSender, HarnessRunTerminal, NativePayload,
-    ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle, ProviderRunId,
-    ProviderSessionId, SanitizedDiagnostic,
+    HarnessAccountStatus, HarnessError, HarnessEvent, HarnessEventSender, HarnessRunTerminal,
+    NativePayload, ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle,
+    ProviderRunId, ProviderSessionId, SanitizedDiagnostic,
 };
 
 use crate::{CodexRuntimeSpec, reducer::Reducer};
@@ -30,6 +30,7 @@ pub enum RequestKind {
     EmptyObject,
     AccountRead,
     AccountLoginStart,
+    AccountLogout,
     ThreadList,
     Session { expected_thread_id: Option<String> },
     StartRun { session_id: ProviderSessionId },
@@ -52,6 +53,8 @@ enum CommandMessage {
     Diagnostics(oneshot::Sender<Vec<String>>),
     RecordDiagnostic(String),
     Health(oneshot::Sender<()>),
+    AccountLoginStatus(oneshot::Sender<Option<HarnessAccountStatus>>),
+    AccountLoginStartStatus(oneshot::Sender<Option<HarnessAccountStatus>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -125,6 +128,26 @@ impl RuntimeClient {
         result.await.map_err(|_| HarnessError::Disconnected)
     }
 
+    pub async fn account_login_status(&self) -> Result<Option<HarnessAccountStatus>, HarnessError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(CommandMessage::AccountLoginStatus(reply))
+            .await
+            .map_err(|_| HarnessError::Disconnected)?;
+        result.await.map_err(|_| HarnessError::Disconnected)
+    }
+
+    pub async fn account_login_start_status(
+        &self,
+    ) -> Result<Option<HarnessAccountStatus>, HarnessError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(CommandMessage::AccountLoginStartStatus(reply))
+            .await
+            .map_err(|_| HarnessError::Disconnected)?;
+        result.await.map_err(|_| HarnessError::Disconnected)
+    }
+
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         let (reply, result) = oneshot::channel();
         self.commands
@@ -152,6 +175,24 @@ struct PendingClient {
     mutation: bool,
     kind: RequestKind,
     reply: oneshot::Sender<Result<Value, HarnessError>>,
+}
+
+#[derive(Clone)]
+enum AccountLoginState {
+    Pending { login_id: String, auth_url: String },
+    Failed,
+}
+
+impl AccountLoginState {
+    fn status(&self) -> HarnessAccountStatus {
+        match self {
+            Self::Pending { login_id, auth_url } => HarnessAccountStatus::LoginInProgress {
+                login_id: login_id.clone(),
+                auth_url: auth_url.clone(),
+            },
+            Self::Failed => HarnessAccountStatus::Unknown,
+        }
+    }
 }
 
 enum ServerRequestKind {
@@ -293,6 +334,7 @@ async fn run_actor(
     let mut runs = HashMap::<(String, String), ProviderRunHandle>::new();
     let mut diagnostics = VecDeque::<String>::new();
     let mut reducer = Reducer::default();
+    let mut account_login = None::<AccountLoginState>;
 
     'actor: loop {
         tokio::select! {
@@ -369,6 +411,21 @@ async fn run_actor(
                     Some(CommandMessage::Health(reply)) => {
                         let _ = reply.send(());
                     }
+                    Some(CommandMessage::AccountLoginStatus(reply)) => {
+                        let _ = reply.send(account_login.as_ref().map(AccountLoginState::status));
+                    }
+                    Some(CommandMessage::AccountLoginStartStatus(reply)) => {
+                        let status = match &account_login {
+                            Some(pending @ AccountLoginState::Pending { .. }) => {
+                                Some(pending.status())
+                            }
+                            Some(AccountLoginState::Failed) | None => {
+                                account_login = None;
+                                None
+                            }
+                        };
+                        let _ = reply.send(status);
+                    }
                     Some(CommandMessage::Shutdown(reply)) => {
                         settle_runtime(
                             &mut pending,
@@ -414,6 +471,7 @@ async fn run_actor(
                             &mut loaded_sessions,
                             &mut runs,
                             &mut reducer,
+                            &mut account_login,
                         ).await.is_err() {
                             child.kill_and_reap().await;
                             settle_runtime(
@@ -603,6 +661,7 @@ async fn handle_frame(
     loaded_sessions: &mut HashSet<String>,
     runs: &mut HashMap<(String, String), ProviderRunHandle>,
     reducer: &mut Reducer,
+    account_login: &mut Option<AccountLoginState>,
 ) -> Result<(), HarnessError> {
     if value.get("method").is_none() {
         let Some(id) = value.get("id").and_then(Value::as_u64) else {
@@ -679,9 +738,21 @@ async fn handle_frame(
                         .await;
                 }
             }
+            RequestKind::AccountLoginStart => {
+                *account_login = Some(AccountLoginState::Pending {
+                    login_id: result["loginId"]
+                        .as_str()
+                        .expect("validated login ID")
+                        .to_owned(),
+                    auth_url: result["authUrl"]
+                        .as_str()
+                        .expect("validated auth URL")
+                        .to_owned(),
+                });
+            }
+            RequestKind::AccountLogout => *account_login = None,
             RequestKind::EmptyObject
             | RequestKind::AccountRead
-            | RequestKind::AccountLoginStart
             | RequestKind::ThreadList
             | RequestKind::TurnSteer { .. } => {}
         }
@@ -694,10 +765,37 @@ async fn handle_frame(
         .and_then(Value::as_str)
         .unwrap_or("codex.unknown")
         .to_owned();
-    if matches!(
-        method.as_str(),
-        "account/login/completed" | "account/updated"
-    ) {
+    if method == "account/login/completed" {
+        let mut safe = value;
+        sanitizer.sanitize_value(&mut safe);
+        let Some((login_id, success)) = account_login_completion(&safe) else {
+            push_diagnostic(
+                diagnostics,
+                "Codex emitted a malformed account/login/completed notification".to_owned(),
+            );
+            return Ok(());
+        };
+        if matches!(
+            account_login,
+            Some(AccountLoginState::Pending { login_id: pending, .. }) if pending == login_id
+        ) {
+            *account_login = if success {
+                None
+            } else {
+                Some(AccountLoginState::Failed)
+            };
+        }
+        return Ok(());
+    }
+    if method == "account/updated" {
+        let mut safe = value;
+        sanitizer.sanitize_value(&mut safe);
+        if !valid_account_updated(&safe) {
+            push_diagnostic(
+                diagnostics,
+                "Codex emitted a malformed account/updated notification".to_owned(),
+            );
+        }
         return Ok(());
     }
     let mut safe_value = value;
@@ -812,7 +910,7 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
         return false;
     };
     match kind {
-        RequestKind::EmptyObject => object.is_empty(),
+        RequestKind::EmptyObject | RequestKind::AccountLogout => object.is_empty(),
         RequestKind::AccountRead => {
             object
                 .get("requiresOpenaiAuth")
@@ -878,6 +976,65 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|turn_id| turn_id == expected_turn_id.as_str()),
     }
+}
+
+fn account_login_completion(value: &Value) -> Option<(&str, bool)> {
+    let params = value.get("params")?.as_object()?;
+    let login_id = params.get("loginId")?.as_str()?;
+    let success = params.get("success")?.as_bool()?;
+    if !params
+        .get("error")
+        .is_none_or(|error| error.is_null() || error.is_string())
+        || !params.get("onboardingEntrypoint").is_none_or(|entrypoint| {
+            entrypoint.is_null() || entrypoint.as_str() == Some("life_sciences")
+        })
+    {
+        return None;
+    }
+    Some((login_id, success))
+}
+
+fn valid_account_updated(value: &Value) -> bool {
+    let Some(params) = value.get("params").and_then(Value::as_object) else {
+        return false;
+    };
+    params.get("authMode").is_none_or(|mode| {
+        mode.is_null()
+            || mode.as_str().is_some_and(|mode| {
+                matches!(
+                    mode,
+                    "apikey"
+                        | "chatgpt"
+                        | "chatgptAuthTokens"
+                        | "headers"
+                        | "agentIdentity"
+                        | "personalAccessToken"
+                        | "bedrockApiKey"
+                )
+            })
+    }) && params.get("planType").is_none_or(|plan| {
+        plan.is_null()
+            || plan.as_str().is_some_and(|plan| {
+                matches!(
+                    plan,
+                    "free"
+                        | "go"
+                        | "plus"
+                        | "pro"
+                        | "prolite"
+                        | "team"
+                        | "self_serve_business_prolite"
+                        | "self_serve_business_usage_based"
+                        | "business"
+                        | "ent26"
+                        | "enterprise_cbp_automation"
+                        | "enterprise_cbp_usage_based"
+                        | "enterprise"
+                        | "edu"
+                        | "unknown"
+                )
+            })
+    })
 }
 
 fn valid_thread(value: &Value) -> bool {

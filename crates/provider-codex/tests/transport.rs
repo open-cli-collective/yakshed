@@ -15,6 +15,12 @@ struct TestAdapter {
     _root: tempfile::TempDir,
 }
 
+impl TestAdapter {
+    fn runtime_home(&self) -> PathBuf {
+        self._root.path().join("codex-home")
+    }
+}
+
 fn adapter(
     scenario: &str,
     max_frame_size: usize,
@@ -69,6 +75,23 @@ async fn next(stream: &mut yakshed_harness::ProviderEventStream) -> HarnessEvent
         .unwrap()
 }
 
+async fn wait_for_account(
+    test: &TestAdapter,
+    expected: HarnessAccountStatus,
+) -> HarnessAccountStatus {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let status = test.adapter.account_status(&test.runtime).await.unwrap();
+            if status == expected {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
 macro_rules! transport_test {
     ($name:ident, $body:block) => {
         #[tokio::test]
@@ -89,7 +112,11 @@ fn codex_declares_delegated_account_authentication() {
             .iter()
             .any(|requirement| {
                 requirement.slot.as_str() == "codex.account"
-                    && requirement.delivery == HarnessCredentialDelivery::Delegated
+                    && requirement.delivery
+                        == HarnessCredentialDelivery::Delegated {
+                            authority: "codex-app-server".to_owned(),
+                        }
+                    && requirement.required
             })
     );
 }
@@ -109,10 +136,17 @@ transport_test!(account_login_status_and_logout_are_sanitized, {
     assert!(matches!(
         login,
         HarnessAccountStatus::LoginInProgress { ref login_id, ref auth_url }
-            if login_id == "login-1" && auth_url == "https://auth.example.test/login-1"
+            if login_id == "login-1" && auth_url == "https://chatgpt.com/codex/login-1"
     ));
     assert_eq!(
-        test.adapter.account_status(&test.runtime).await.unwrap(),
+        wait_for_account(
+            &test,
+            HarnessAccountStatus::Authenticated {
+                email: Some("yak@example.test".to_owned()),
+                plan: "plus".to_owned(),
+            },
+        )
+        .await,
         HarnessAccountStatus::Authenticated {
             email: Some("yak@example.test".to_owned()),
             plan: "plus".to_owned(),
@@ -137,12 +171,54 @@ transport_test!(failed_account_login_becomes_unknown_without_native_error, {
         .await
         .unwrap();
     assert_eq!(
-        test.adapter.account_status(&test.runtime).await.unwrap(),
+        wait_for_account(&test, HarnessAccountStatus::Unknown).await,
         HarnessAccountStatus::Unknown
     );
     let rendered = format!("{:?}", test.adapter.diagnostics().await.unwrap());
     assert!(!rendered.contains("YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT"));
 });
+
+transport_test!(
+    pending_login_survives_status_reload_and_reconciles_completion,
+    {
+        let test = adapter("account_login_delayed", 1024 * 1024, None);
+        let started = test
+            .adapter
+            .account_login_start(&test.runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            test.adapter
+                .account_login_start(&test.runtime)
+                .await
+                .unwrap(),
+            started
+        );
+        assert_eq!(
+            test.adapter.account_status(&test.runtime).await.unwrap(),
+            started
+        );
+        let requests = std::fs::read_to_string(test.runtime_home().join("requests.log")).unwrap();
+        assert_eq!(
+            requests
+                .lines()
+                .filter(|method| *method == "account/login/start")
+                .count(),
+            1
+        );
+        assert!(matches!(
+            wait_for_account(
+                &test,
+                HarnessAccountStatus::Authenticated {
+                    email: Some("yak@example.test".to_owned()),
+                    plan: "plus".to_owned(),
+                },
+            )
+            .await,
+            HarnessAccountStatus::Authenticated { .. }
+        ));
+    }
+);
 
 transport_test!(run_start_requires_an_authenticated_account, {
     let test = adapter("account_login_success", 1024 * 1024, None);

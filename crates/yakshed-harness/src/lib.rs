@@ -28,7 +28,7 @@ pub struct HarnessDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessCredentialDelivery {
     HarnessManaged,
-    Delegated,
+    Delegated { authority: String },
     ProcessEnvironment { variable: String },
 }
 
@@ -37,6 +37,7 @@ pub enum HarnessCredentialDelivery {
 pub struct HarnessCredentialRequirement {
     pub slot: CredentialSlot,
     pub delivery: HarnessCredentialDelivery,
+    pub required: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

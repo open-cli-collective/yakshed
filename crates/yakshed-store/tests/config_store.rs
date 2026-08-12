@@ -607,39 +607,3 @@ account = " ""#,
         assert!(matches!(open(paths), Err(ConfigError::Validation(_))));
     }
 }
-
-#[test]
-fn secret_backed_codex_account_is_rejected_with_migration_guidance() {
-    let temp = tempdir().unwrap();
-    let paths = AppPaths::for_test(temp.path());
-    paths.create_config_root().unwrap();
-    fs::write(
-        paths.config_root.join("config.toml"),
-        r#"schema_version = 1
-
-[[secret_backends]]
-id = "local-os"
-kind = "local-os"
-
-[[connections]]
-id = "0193f26e-7a72-7d42-bf77-0de14c4cc222"
-name = "Codex"
-harness = "codex"
-model_provider = "openai"
-provider_state = "codex-work"
-
-[[connections.credentials]]
-slot = "codex.account"
-source = "secret"
-backend = "local-os"
-locator = "legacy/codex-account"
-"#,
-    )
-    .unwrap();
-
-    let error = match open(paths) {
-        Ok(_) => panic!("secret-backed codex account loaded"),
-        Err(error) => error.to_string(),
-    };
-    assert!(error.contains("codex.account must be delegated to codex-app-server"));
-}

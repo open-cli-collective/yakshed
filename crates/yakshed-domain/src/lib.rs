@@ -663,18 +663,6 @@ impl Connection {
                     credential.slot
                 )));
             }
-            if self.harness == "codex" && credential.slot.as_str() == "codex.account" {
-                match &credential.binding {
-                    CredentialBinding::Delegated { authority }
-                        if authority == "codex-app-server" => {}
-                    _ => {
-                        return Err(ValidationError(
-                            "codex.account must be delegated to codex-app-server; replace the secret-backed binding"
-                                .to_owned(),
-                        ));
-                    }
-                }
-            }
         }
         Ok(())
     }

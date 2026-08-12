@@ -43,7 +43,7 @@ test.beforeEach(async ({ page }) => {
             }
             return account;
           case "account_login_start":
-            account = { state: "login_in_progress", login_id: "login-1", auth_url: "https://auth.example.test/login-1" };
+            account = { state: "login_in_progress", login_id: "login-1", auth_url: "https://chatgpt.com/codex/login-1" };
             return account;
           case "account_logout": account = { state: "not_authenticated" }; return undefined;
           case "list_work_items": return { items: workItem ? [{ work_item: { ...workItem, revision }, revision }] : [], next_after: null };
@@ -124,7 +124,7 @@ test("runs the product loop through approval, input, interrupt, and reconciliati
   await page.getByRole("button", { name: "Add connection" }).click();
   await expect(page.getByText("Codex is not authenticated for this connection.")).toBeVisible();
   await page.getByRole("button", { name: "Sign in with Codex" }).click();
-  await expect(page.getByRole("link", { name: "Continue sign-in" })).toHaveAttribute("href", "https://auth.example.test/login-1");
+  await expect(page.getByRole("link", { name: "Continue sign-in" })).toHaveAttribute("href", "https://chatgpt.com/codex/login-1");
   await page.getByRole("button", { name: "Refresh status" }).click();
   await expect(page.getByText("Signed in as yak@example.test · plus")).toBeVisible();
   await page.getByRole("button", { name: "Close connections" }).click();

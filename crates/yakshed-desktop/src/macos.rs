@@ -26,9 +26,10 @@ use yakshed_domain::{
     RunId, SecretBackend, SecretBackendId, SecretBackendSettings, WorkItemId,
 };
 use yakshed_harness::{
-    HarnessAccountStatus, HarnessAdapter, HarnessError, HarnessEvent, HarnessInput,
-    HarnessRunTerminal, ProviderEventStream, ProviderRequestHandle, ProviderResponse,
-    ProviderRunHandle, RunOptions, RuntimeHandle, RuntimePath, StartSessionSpec,
+    HarnessAccountStatus, HarnessAdapter, HarnessCredentialDelivery, HarnessCredentialRequirement,
+    HarnessError, HarnessEvent, HarnessInput, HarnessRunTerminal, ProviderEventStream,
+    ProviderRequestHandle, ProviderResponse, ProviderRunHandle, RunOptions, RuntimeHandle,
+    RuntimePath, StartSessionSpec,
 };
 use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, LocalFileBackend, LocalOsBackend, NoopSecretAuditSink,
@@ -109,6 +110,8 @@ async fn compose() -> Result<yakshed_tauri::ShellState, StartupError> {
                 store: config_store.clone(),
                 local_backend,
                 credential_migration,
+                harness_id: "codex".to_owned(),
+                credential_requirements: CodexAdapter::declared_credential_requirements(),
             }),
             secrets: Arc::new(ProductionSecrets {
                 store: config_store,
@@ -557,6 +560,8 @@ struct ProductionConfig {
     store: Arc<ConfigStore>,
     local_backend: SecretBackend,
     credential_migration: CredentialMigrationStatus,
+    harness_id: String,
+    credential_requirements: Vec<HarnessCredentialRequirement>,
 }
 
 #[async_trait]
@@ -575,6 +580,11 @@ impl ConfigPort for ProductionConfig {
         ) {
             return Err(ConfigPortError::MigrationPending);
         }
+        validate_credential_requirements(
+            &command.connection,
+            &self.harness_id,
+            &self.credential_requirements,
+        )?;
         let needs_local = command.connection.credentials.iter().any(|binding| {
             matches!(
                 &binding.binding,
@@ -607,6 +617,11 @@ impl ConfigPort for ProductionConfig {
             .into_iter()
             .find(|connection| connection.id == connection_id)
             .ok_or(ConfigPortError::NotFound)?;
+        validate_credential_requirements(
+            &connection,
+            &self.harness_id,
+            &self.credential_requirements,
+        )?;
         Ok(ConfigConnectionSnapshot {
             config_revision: snapshot.revision,
             connection: public_connection(connection),
@@ -615,6 +630,13 @@ impl ConfigPort for ProductionConfig {
 
     async fn list_connections(&self) -> Result<PublicConnectionList, ConfigPortError> {
         let snapshot = self.store.snapshot();
+        for connection in &snapshot.config.connections {
+            validate_credential_requirements(
+                connection,
+                &self.harness_id,
+                &self.credential_requirements,
+            )?;
+        }
         Ok(PublicConnectionList {
             config_revision: snapshot.revision,
             credential_migration: self.credential_migration,
@@ -626,6 +648,68 @@ impl ConfigPort for ProductionConfig {
                 .collect(),
         })
     }
+}
+
+fn validate_credential_requirements(
+    connection: &Connection,
+    harness_id: &str,
+    requirements: &[HarnessCredentialRequirement],
+) -> Result<(), ConfigPortError> {
+    if connection.harness != harness_id {
+        return Err(ConfigPortError::Unsupported);
+    }
+    for requirement in requirements {
+        let binding = connection
+            .credentials
+            .iter()
+            .find(|binding| binding.slot == requirement.slot);
+        if requirement.required && binding.is_none() {
+            return Err(requirement_error(requirement));
+        }
+        let Some(binding) = binding else { continue };
+        let compatible = match (&binding.binding, &requirement.delivery) {
+            (CredentialBinding::Disabled, _) => !requirement.required,
+            (
+                CredentialBinding::Delegated { authority: bound },
+                HarnessCredentialDelivery::Delegated {
+                    authority: declared,
+                },
+            ) => bound == declared,
+            (CredentialBinding::Delegated { .. }, HarnessCredentialDelivery::HarnessManaged)
+            | (
+                CredentialBinding::Secret { .. },
+                HarnessCredentialDelivery::ProcessEnvironment { .. },
+            ) => true,
+            _ => false,
+        };
+        if !compatible {
+            return Err(requirement_error(requirement));
+        }
+    }
+    if connection.credentials.iter().any(|binding| {
+        !requirements
+            .iter()
+            .any(|requirement| requirement.slot == binding.slot)
+    }) {
+        return Err(ConfigPortError::CredentialRequirement(
+            "remove credential slots not declared by the selected harness".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn requirement_error(requirement: &HarnessCredentialRequirement) -> ConfigPortError {
+    let remediation = match &requirement.delivery {
+        HarnessCredentialDelivery::Delegated { authority } => format!(
+            "{} must be delegated to {authority}; replace the secret-backed binding",
+            requirement.slot
+        ),
+        _ => format!(
+            "configure {} as required by the selected harness",
+            requirement.slot
+        ),
+    };
+    ConfigPortError::CredentialRequirement(remediation)
 }
 
 struct ProductionSecrets {
@@ -775,6 +859,8 @@ struct CodexHarness {
     event_sender: mpsc::Sender<HarnessEvent>,
     events: Mutex<mpsc::Receiver<HarnessEvent>>,
     event_ready: Notify,
+    program: PathBuf,
+    args: Vec<String>,
 }
 
 #[derive(Default)]
@@ -802,11 +888,20 @@ impl CodexHarness {
             event_sender,
             events: Mutex::new(events),
             event_ready: Notify::new(),
+            program: PathBuf::from("codex"),
+            args: vec!["app-server".to_owned()],
         }
     }
 
+    #[cfg(test)]
+    fn with_provider_command(mut self, program: PathBuf, args: Vec<String>) -> Self {
+        self.program = program;
+        self.args = args;
+        self
+    }
+
     fn provider(
-        paths: &AppPaths,
+        &self,
         connection: &Connection,
     ) -> Result<(Arc<CodexAdapter>, ProviderEventStream), HarnessPortError> {
         let connection_id = connection.id;
@@ -817,14 +912,15 @@ impl CodexHarness {
             CodexRuntimeKey {
                 connection_id,
                 binary_digest: "runtime-path:codex".to_owned(),
-                codex_home: paths
+                codex_home: self
+                    .paths
                     .data_root
                     .join("codex")
                     .join(connection.provider_state.as_str()),
                 execution_runtime: "local".to_owned(),
             },
-            PathBuf::from("codex"),
-            vec!["app-server".to_owned()],
+            self.program.clone(),
+            self.args.clone(),
         );
         let adapter = Arc::new(CodexAdapter::new(spec).map_err(map_harness_error)?);
         let stream = adapter.subscribe().map_err(map_harness_error)?;
@@ -862,7 +958,7 @@ impl CodexHarness {
             }
             state.providers.remove(&connection.id);
         }
-        let (adapter, stream) = Self::provider(&self.paths, connection)?;
+        let (adapter, stream) = self.provider(connection)?;
         Self::forward(stream, self.event_sender.clone());
         state.providers.insert(
             connection.id,
@@ -1071,6 +1167,15 @@ impl RunHarness for CodexHarness {
             title: format!("YakShed run {correlation_id}"),
         };
         let mut adapter = self.adapter(&connection)?;
+        if !matches!(
+            adapter
+                .account_status(&runtime)
+                .await
+                .map_err(map_harness_error)?,
+            HarnessAccountStatus::Authenticated { .. }
+        ) {
+            return Err(HarnessPortError::NotAuthenticated);
+        }
         let session = match adapter.start_session(&runtime, session_spec.clone()).await {
             Err(HarnessError::Disconnected) if self.evict_idle_adapter(connection_id, &adapter) => {
                 adapter = self.adapter(&connection)?;
@@ -1509,6 +1614,8 @@ mod tests {
             store,
             local_backend: backend.clone(),
             credential_migration: CredentialMigrationStatus::Ready,
+            harness_id: "codex".to_owned(),
+            credential_requirements: CodexAdapter::declared_credential_requirements(),
         };
         let connection = Connection {
             id: "0193f26e-7a72-7000-8000-00000000d001".parse().unwrap(),
@@ -1534,6 +1641,56 @@ mod tests {
 
         assert!(snapshot.config.secret_backends.is_empty());
         assert_eq!(snapshot.config.connections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn production_config_enforces_adapter_owned_codex_requirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let backend = local_backend();
+        let port = ProductionConfig {
+            store: Arc::new(ConfigStore::open(paths, backend_capabilities()).unwrap()),
+            local_backend: backend,
+            credential_migration: CredentialMigrationStatus::Ready,
+            harness_id: "codex".to_owned(),
+            credential_requirements: CodexAdapter::declared_credential_requirements(),
+        };
+        let mut connection = connection(
+            "0193f26e-7a72-7000-8000-00000000d002",
+            "codex",
+            "codex-test",
+        );
+
+        let missing = port
+            .put_connection(PutConnectionCommand {
+                expected_config_revision: ConfigRevision::INITIAL,
+                connection: connection.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, ConfigPortError::CredentialRequirement(_)));
+
+        connection.credentials.push(CredentialBindingRecord {
+            slot: CredentialSlot::new("codex.account").unwrap(),
+            binding: CredentialBinding::Secret {
+                reference: SecretReference {
+                    backend_id: SecretBackendId::new("local-os").unwrap(),
+                    locator: SecretLocator::new("legacy/codex-account").unwrap(),
+                },
+            },
+        });
+        let mismatched = port
+            .put_connection(PutConnectionCommand {
+                expected_config_revision: ConfigRevision::INITIAL,
+                connection,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            mismatched,
+            ConfigPortError::CredentialRequirement(ref remediation)
+                if remediation.contains("codex.account must be delegated to codex-app-server")
+        ));
     }
 
     #[tokio::test]
@@ -1946,6 +2103,8 @@ mod tests {
                 credential_migration: CredentialMigrationStatus::Pending(
                     CredentialMigrationPendingReason::Locked,
                 ),
+                harness_id: "codex".to_owned(),
+                credential_requirements: CodexAdapter::declared_credential_requirements(),
             }
             .put_connection(PutConnectionCommand {
                 expected_config_revision: snapshot.revision,
@@ -2400,6 +2559,55 @@ mod tests {
                 .await,
             Err(HarnessPortError::Unsupported(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_start_sends_no_thread_start_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let config = test_config(&paths);
+        let mut codex = connection(
+            "0193f26e-7a72-7000-8000-00000000d006",
+            "codex",
+            "codex-unauthenticated",
+        );
+        codex.credentials.push(CredentialBindingRecord {
+            slot: CredentialSlot::new("codex.account").unwrap(),
+            binding: CredentialBinding::Delegated {
+                authority: "codex-app-server".to_owned(),
+            },
+        });
+        config
+            .update(
+                ConfigRevision::INITIAL,
+                ConfigChange::PutConnection(codex.clone()),
+            )
+            .await
+            .unwrap();
+        let codex_home = paths
+            .data_root
+            .join("codex")
+            .join(codex.provider_state.as_str());
+        fs::create_dir_all(&codex_home).unwrap();
+        let fake =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../provider-codex/tests/fake_codex.py");
+        let harness = CodexHarness::new(paths, config).with_provider_command(
+            PathBuf::from("python3"),
+            vec![
+                fake.display().to_string(),
+                "account_login_success".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            harness
+                .start_run(codex.id, SystemIdGenerator.next_run_id(), "test".to_owned())
+                .await,
+            Err(HarnessPortError::NotAuthenticated)
+        );
+        let requests = fs::read_to_string(codex_home.join("requests.log")).unwrap();
+        assert!(requests.lines().any(|method| method == "account/read"));
+        assert!(!requests.lines().any(|method| method == "thread/start"));
     }
 
     #[tokio::test]
