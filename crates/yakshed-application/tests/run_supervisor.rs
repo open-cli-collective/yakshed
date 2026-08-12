@@ -452,6 +452,7 @@ impl TestContext {
             .unwrap();
         let harness = MockPort::new_with_options(plans, unknown_interrupt, unknown_start).await;
         let supervisor = RunSupervisor::new(store.clone(), harness.clone(), clock, ids);
+        supervisor.ready().await.unwrap();
         Self {
             _temp: temp,
             store,
@@ -891,7 +892,6 @@ async fn uncertain_start_reconciles_by_correlation_without_duplicate_run() {
     let run = context.store.get_run(run_id).await.unwrap();
     assert_eq!(run.status, RunStatus::OutcomeUnknown);
     assert!(run.provider_id.is_none());
-    tokio::time::sleep(Duration::from_millis(20)).await;
     context.harness.fail_next_lookup();
     assert!(matches!(
         context.supervisor.reconcile_run(run_id).await,
