@@ -4496,9 +4496,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "provider-codex",
- "secrecy",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "yakshed-application",
  "yakshed-desktop-api",

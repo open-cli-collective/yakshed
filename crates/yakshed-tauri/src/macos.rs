@@ -180,13 +180,11 @@ async fn connection_put(
     state: tauri::State<'_, ShellState>,
     expected_config_revision: u64,
     connection: ConnectionInput,
-    ensure_memory_secret_backend: bool,
 ) -> yakshed_desktop_api::Result<ConnectionEnvelope> {
     state
         .connection_put(
             ConfigRevision::new(expected_config_revision),
             connection.into_public()?,
-            ensure_memory_secret_backend,
         )
         .await
 }

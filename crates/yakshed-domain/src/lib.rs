@@ -43,6 +43,16 @@ impl fmt::Display for ConnectionId {
 #[serde(try_from = "String", into = "String")]
 pub struct ArtifactId(Uuid);
 
+impl ArtifactId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn is_v7(self) -> bool {
+        self.0.get_version_num() == 7
+    }
+}
+
 impl FromStr for ArtifactId {
     type Err = ValidationError;
 

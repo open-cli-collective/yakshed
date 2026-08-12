@@ -188,7 +188,6 @@
         provider_state: `connection-${id}`,
         credentials: [{ slot: "codex.account", source: "secret", backend: "local-file", locator: `${id}-account` }],
       },
-      false,
     );
     connections = [...connections, saved.connection];
     configRevision = saved.config_revision;

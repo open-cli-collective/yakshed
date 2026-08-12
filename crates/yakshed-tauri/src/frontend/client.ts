@@ -185,8 +185,8 @@ export const client = {
   reconcileRun: (runId: string) => invoke<Run>("reconcile_run", { runId }),
   resolveApproval: (approvalId: string, decision: "approved" | "denied") => invoke<void>("resolve_approval", { approvalId, decision }),
   respondUserInput: (requestId: string, response: string) => invoke<void>("respond_user_input", { requestId, response }),
-  putConnection: (expectedConfigRevision: number, connection: ConnectionInput, ensureMemorySecretBackend: boolean) =>
-    invoke<ConnectionEnvelope>("connection_put", { expectedConfigRevision, connection, ensureMemorySecretBackend }),
+  putConnection: (expectedConfigRevision: number, connection: ConnectionInput) =>
+    invoke<ConnectionEnvelope>("connection_put", { expectedConfigRevision, connection }),
   getConnection: (id: string) => invoke<ConnectionEnvelope>("connection_get", { id }),
   listConnections: () => invoke<ConnectionList>("list_connections"),
   setCredential: (connectionId: string, slot: string, value: string, overwrite: boolean) =>

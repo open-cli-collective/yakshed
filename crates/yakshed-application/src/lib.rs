@@ -4,7 +4,7 @@ use std::path::Path;
 use std::{collections::HashSet, error::Error, fmt};
 
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use thiserror::Error as ThisError;
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactRecord,
@@ -356,7 +356,6 @@ pub struct PublicConnectionList {
 pub struct PutConnectionCommand {
     pub expected_config_revision: ConfigRevision,
     pub connection: Connection,
-    pub ensure_memory_secret_backend: bool,
 }
 
 pub struct SetConnectionCredentialCommand {
@@ -435,8 +434,8 @@ impl SecretValue {
         }
     }
 
-    pub fn expose(&self) -> &str {
-        self.value.expose_secret()
+    pub fn as_secret(&self) -> &SecretString {
+        &self.value
     }
 }
 

@@ -20,16 +20,17 @@ use yakshed_application::{
     StoreError, StreamCursorState, TimelineBatch, TimelinePage, TransitionRun, WorkItemPage,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ConnectionId,
-    DataRevision, NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus,
-    StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision,
-    UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
+    ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId,
+    ArtifactKind, ArtifactProvenance, ArtifactRecord, ConnectionId, DataRevision,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus, StreamCursor,
+    TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
+    WorkItemId, WorkItemSnapshot, WorkItemStatus,
 };
 
 use crate::AppPaths;
 
 const DATABASE_FILE: &str = "yakshed.sqlite3";
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const MAX_PAGE_SIZE: u32 = 200;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 
@@ -213,6 +214,22 @@ DROP TABLE runs;
 ALTER TABLE runs_v3 RENAME TO runs;
 "#;
 
+const MIGRATE_V3_TO_V4: &str = r#"
+CREATE TABLE artifacts (
+    id TEXT PRIMARY KEY NOT NULL,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+    run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'plan', 'diff', 'file', 'image', 'command_log', 'browser_capture', 'provider_payload'
+    )),
+    digest TEXT NOT NULL,
+    byte_len INTEGER NOT NULL CHECK (byte_len >= 0),
+    media_type TEXT NOT NULL CHECK (length(trim(media_type)) > 0),
+    provenance TEXT NOT NULL CHECK (length(trim(provenance)) > 0)
+);
+CREATE INDEX artifacts_work_item_order ON artifacts(work_item_id, id);
+"#;
+
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
 
 enum Message {
@@ -308,6 +325,99 @@ impl SqliteStore {
             .map_err(|_| StoreError::Closed)?;
         drop(sender);
         result_receiver.await.map_err(|_| StoreError::Closed)?
+    }
+
+    pub async fn put_artifact_metadata(
+        &self,
+        artifact: ArtifactRecord,
+    ) -> Result<ArtifactRecord, StoreError> {
+        validate_app_id("artifact id", artifact.id.is_v7())?;
+        validate_text("artifact media type", &artifact.media_type)?;
+        let byte_len = i64::try_from(artifact.byte_len)
+            .map_err(|error| StoreError::Conflict(error.to_string()))?;
+        self.call(move |worker| {
+            let existing = worker
+                .connection
+                .query_row(
+                    &format!("{ARTIFACT_SELECT} WHERE id = ?1"),
+                    [artifact.id.to_string()],
+                    artifact_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?;
+            if let Some(existing) = existing {
+                return if existing == artifact {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Conflict(format!(
+                        "artifact id already exists with different content: {}",
+                        artifact.id
+                    )))
+                };
+            }
+            worker
+                .connection
+                .execute(
+                    "INSERT INTO artifacts (
+                        id, work_item_id, run_id, kind, digest, byte_len, media_type, provenance
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        artifact.id.to_string(),
+                        artifact.work_item_id.to_string(),
+                        artifact.run_id.map(|id| id.to_string()),
+                        artifact_kind(artifact.kind),
+                        artifact.digest.to_string(),
+                        byte_len,
+                        artifact.media_type,
+                        artifact.provenance.as_str(),
+                    ],
+                )
+                .map_err(map_database_error)?;
+            Ok(artifact)
+        })
+        .await
+    }
+
+    pub async fn list_artifact_metadata(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> Result<Vec<ArtifactRecord>, StoreError> {
+        self.call(move |worker| {
+            let mut statement = worker
+                .connection
+                .prepare(&format!(
+                    "{ARTIFACT_SELECT} WHERE work_item_id = ?1 ORDER BY id"
+                ))
+                .map_err(map_database_error)?;
+            statement
+                .query_map([work_item_id.to_string()], artifact_from_row)
+                .map_err(map_database_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_database_error)
+        })
+        .await
+    }
+
+    pub async fn get_artifact_metadata(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<ArtifactRecord, StoreError> {
+        self.call(move |worker| {
+            worker
+                .connection
+                .query_row(
+                    &format!("{ARTIFACT_SELECT} WHERE id = ?1"),
+                    [artifact_id.to_string()],
+                    artifact_from_row,
+                )
+                .optional()
+                .map_err(map_database_error)?
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "artifact",
+                    id: artifact_id.to_string(),
+                })
+        })
+        .await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -446,6 +556,7 @@ fn migrations() -> Migrations<'static> {
         M::up(MIGRATE_V1_TO_V2)
             .comment("expand run lifecycle statuses and start/reconnect transitions"),
         M::up(MIGRATE_V2_TO_V3).comment("keep recoverable runs and approvals active"),
+        M::up(MIGRATE_V3_TO_V4).comment("persist immutable artifact metadata"),
     ])
 }
 
@@ -636,6 +747,67 @@ fn provider_id(
                 )
             }),
         _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+const ARTIFACT_SELECT: &str = "
+SELECT id, work_item_id, run_id, kind, digest, byte_len, media_type, provenance
+FROM artifacts";
+
+fn artifact_from_row(row: &Row<'_>) -> rusqlite::Result<ArtifactRecord> {
+    let kind: String = row.get(3)?;
+    Ok(ArtifactRecord {
+        id: parse_column(row, 0)?,
+        work_item_id: parse_column(row, 1)?,
+        run_id: row
+            .get::<_, Option<String>>(2)?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        kind: match kind.as_str() {
+            "plan" => ArtifactKind::Plan,
+            "diff" => ArtifactKind::Diff,
+            "file" => ArtifactKind::File,
+            "image" => ArtifactKind::Image,
+            "command_log" => ArtifactKind::CommandLog,
+            "browser_capture" => ArtifactKind::BrowserCapture,
+            "provider_payload" => ArtifactKind::ProviderPayload,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+        digest: parse_column(row, 4)?,
+        byte_len: u64::try_from(row.get::<_, i64>(5)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        media_type: row.get(6)?,
+        provenance: ArtifactProvenance::new(row.get::<_, String>(7)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+    })
+}
+
+const fn artifact_kind(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Plan => "plan",
+        ArtifactKind::Diff => "diff",
+        ArtifactKind::File => "file",
+        ArtifactKind::Image => "image",
+        ArtifactKind::CommandLog => "command_log",
+        ArtifactKind::BrowserCapture => "browser_capture",
+        ArtifactKind::ProviderPayload => "provider_payload",
     }
 }
 

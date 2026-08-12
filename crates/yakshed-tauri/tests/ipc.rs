@@ -631,7 +631,6 @@ async fn malformed_command_payloads_are_rejected_as_invalid_request() {
                     "provider_state": "",
                     "credentials": [],
                 },
-                "ensureMemorySecretBackend": false,
             }),
         )
         .unwrap_err(),
@@ -712,7 +711,6 @@ async fn every_registered_handler_is_invocable_against_a_real_desktop_api() {
                 provider_state: "second-provider".to_owned(),
                 credentials: Vec::new(),
             },
-            "ensureMemorySecretBackend": false
         })
     )
     .unwrap();

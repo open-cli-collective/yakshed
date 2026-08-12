@@ -8,7 +8,6 @@ build = "build.rs"
 [target.'cfg(target_os = "macos")'.dependencies]
 async-trait.workspace = true
 provider-codex.workspace = true
-secrecy.workspace = true
 tauri.workspace = true
 tokio.workspace = true
 yakshed-application.workspace = true
@@ -21,3 +20,6 @@ yakshed-tauri.workspace = true
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 tauri-build.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tempfile.workspace = true

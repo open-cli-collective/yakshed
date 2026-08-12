@@ -7,7 +7,6 @@ use std::{
 
 use async_trait::async_trait;
 use provider_mock::{MockHarness, MockHarnessFault, MockRunPlan, MockScriptStep};
-use secrecy::SecretString;
 use tokio::sync::{Mutex, broadcast};
 use yakshed_application::{
     AppStore, ArtifactPort, ArtifactPortError, BeginApprovalResponse, CachePort, CachePortError,
@@ -967,7 +966,6 @@ impl TestFixture {
             .put_connection(PutConnectionCommand {
                 expected_config_revision: ConfigRevision::INITIAL,
                 connection: test_connection(connection_id),
-                ensure_memory_secret_backend: true,
             })
             .await
             .unwrap();
@@ -1122,8 +1120,7 @@ impl ConfigPort for TestConfigPort {
             .connection
             .credentials
             .iter()
-            .any(|binding| matches!(binding.binding, CredentialBinding::Secret { .. }))
-            || command.ensure_memory_secret_backend;
+            .any(|binding| matches!(binding.binding, CredentialBinding::Secret { .. }));
         let secret_backends = if needs_memory {
             vec![yakshed_domain::SecretBackend {
                 id: SecretBackendId::new("memory").unwrap(),
@@ -1251,7 +1248,7 @@ impl SecretPort for TestSecretPort {
                 std::slice::from_ref(connection),
                 binding,
                 &context,
-                &SecretString::from(command.value.expose()),
+                command.value.as_secret(),
                 PutSecretOptions {
                     overwrite: command.overwrite,
                 },

@@ -130,7 +130,7 @@ async fn accept_run(store: &SqliteStore, ids: &TestIds, run: RunSnapshot) -> Run
 }
 
 #[tokio::test]
-async fn empty_database_migrates_to_v3_before_ready() {
+async fn empty_database_migrates_to_v4_before_ready() {
     let context = Context::open().await;
     let database = context.paths.data_root.join("yakshed.sqlite3");
     context.store.shutdown().await.unwrap();
@@ -149,7 +149,7 @@ async fn empty_database_migrates_to_v3_before_ready() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        3
+        4
     );
     for table in [
         "projects",
@@ -160,6 +160,7 @@ async fn empty_database_migrates_to_v3_before_ready() {
         "approval_requests",
         "projection_cursors",
         "audit_events",
+        "artifacts",
     ] {
         assert!(
             connection
@@ -254,6 +255,7 @@ async fn v2_migration_preserves_run_children() {
             INSERT INTO runs_v1 SELECT * FROM runs;
             DROP TABLE runs;
             ALTER TABLE runs_v1 RENAME TO runs;
+            DROP TABLE artifacts;
             PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -332,7 +334,7 @@ async fn newer_schema_is_rejected_without_modification() {
         SqliteStore::open(paths, Arc::new(FixedClock), Arc::new(TestIds::new())).await,
         Err(StoreError::UnsupportedNewerSchema {
             found: 99,
-            supported: 3
+            supported: 4
         })
     ));
     assert_eq!(fs::read(database).unwrap(), before);
