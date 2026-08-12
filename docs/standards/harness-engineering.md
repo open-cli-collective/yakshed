@@ -78,6 +78,14 @@ the applicable technical standards true. The minimum evidence is:
 - **Desktop/package changes:** Tauri configuration stays narrow and the
   packaged macOS launch/quit smoke passes or its documented local limitation is
   recorded.
+- **Real debug journey:** After `npm ci` in `crates/yakshed-tauri`, run
+  `python3 scripts/dev_app.py --self-test` and
+  `python3 scripts/dev_app.py --scenario approval`. The real WebView, Tauri
+  IPC, application/store, and Codex adapter must reach the fake process:
+  delegated `openai` reports authenticated, `reader-still-live` remains
+  visible during approval, approval completes, `user_input` accepts `blue`,
+  and `chunked` exposes message/file/command timeline entries. This is never a
+  production Codex call; the launcher runbook owns the operator sequence.
 - **Review routing:** changed boundaries receive the applicable repo-local
   reviewer. Tauri and credential matches are required; a known secret path
   that misses a filename glob is reviewed explicitly.

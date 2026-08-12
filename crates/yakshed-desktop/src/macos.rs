@@ -8,6 +8,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(debug_assertions)]
+use std::env;
+
 use async_trait::async_trait;
 use provider_codex::{CodexAdapter, CodexRuntimeKey, CodexRuntimeSpec};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -32,6 +35,8 @@ use yakshed_harness::{
     ProviderRequestHandle, ProviderResponse, ProviderRunHandle, RunOptions, RuntimeHandle,
     RuntimePath, StartSessionSpec,
 };
+#[cfg(debug_assertions)]
+use yakshed_secrets::MemorySecretBackend;
 use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, LocalFileBackend, LocalOsBackend, NoopSecretAuditSink,
     OnePasswordBackend, PutSecretOptions, PutSecretOutcome, SecretAccessContext,
@@ -47,6 +52,127 @@ const LEGACY_BACKEND_ID: &str = "local-file";
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const PENDING_EVENT_CAPACITY: usize = 128;
 
+#[cfg(debug_assertions)]
+const DEV_APP_ROOT_ENV: &str = "YAKSHED_DEV_APP_ROOT";
+#[cfg(debug_assertions)]
+const DEV_APP_CODEX_ENV: &str = "YAKSHED_DEV_APP_CODEX_SCRIPT";
+#[cfg(debug_assertions)]
+const DEV_APP_SCENARIO_ENV: &str = "YAKSHED_DEV_APP_SCENARIO";
+#[cfg(debug_assertions)]
+const DEV_APP_SCENARIOS: &[&str] = &["approval", "user_input", "chunked"];
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Eq, PartialEq)]
+struct DevAppLaunch {
+    root: PathBuf,
+    fake_codex: PathBuf,
+    scenario: String,
+}
+
+#[cfg(debug_assertions)]
+impl DevAppLaunch {
+    fn from_environment() -> Result<Option<Self>, String> {
+        Self::from_values(
+            env::var_os(DEV_APP_ROOT_ENV).map(PathBuf::from),
+            env::var_os(DEV_APP_CODEX_ENV).map(PathBuf::from),
+            env::var(DEV_APP_SCENARIO_ENV).ok(),
+        )
+    }
+
+    fn from_values(
+        root: Option<PathBuf>,
+        fake_codex: Option<PathBuf>,
+        scenario: Option<String>,
+    ) -> Result<Option<Self>, String> {
+        let present = [root.is_some(), fake_codex.is_some(), scenario.is_some()];
+        if !present.into_iter().any(|value| value) {
+            return Ok(None);
+        }
+        if present.into_iter().any(|value| !value) {
+            let missing = [
+                (DEV_APP_ROOT_ENV, root.is_none()),
+                (DEV_APP_CODEX_ENV, fake_codex.is_none()),
+                (DEV_APP_SCENARIO_ENV, scenario.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(name, missing)| missing.then_some(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+            return Err(format!(
+                "debug launcher values must be set together; missing {missing}"
+            ));
+        }
+        Self::new(
+            root.expect("checked debug root"),
+            fake_codex.expect("checked fake Codex script"),
+            scenario.expect("checked debug scenario"),
+        )
+        .map(Some)
+    }
+
+    fn new(root: PathBuf, fake_codex: PathBuf, scenario: String) -> Result<Self, String> {
+        if !root.is_absolute() {
+            return Err(format!("{DEV_APP_ROOT_ENV} must be an absolute directory"));
+        }
+        let root = fs::canonicalize(&root).map_err(|error| {
+            format!("{DEV_APP_ROOT_ENV} must be an existing directory: {error}")
+        })?;
+        if !root.is_dir() {
+            return Err(format!("{DEV_APP_ROOT_ENV} must be a directory"));
+        }
+        let temp_root = fs::canonicalize(env::temp_dir())
+            .map_err(|error| format!("cannot resolve the system temp directory: {error}"))?;
+        if !root.starts_with(&temp_root) {
+            return Err(format!(
+                "{DEV_APP_ROOT_ENV} must remain under the system temp directory"
+            ));
+        }
+        if !fake_codex.is_absolute() || !fake_codex.is_file() {
+            return Err(format!(
+                "{DEV_APP_CODEX_ENV} must be an absolute fake Codex script"
+            ));
+        }
+        let fake_codex = fs::canonicalize(fake_codex)
+            .map_err(|error| format!("cannot resolve {DEV_APP_CODEX_ENV}: {error}"))?;
+        if !DEV_APP_SCENARIOS.contains(&scenario.as_str()) {
+            return Err(format!(
+                "{DEV_APP_SCENARIO_ENV} must be one of: {}",
+                DEV_APP_SCENARIOS.join(", ")
+            ));
+        }
+        Ok(Self {
+            root,
+            fake_codex,
+            scenario,
+        })
+    }
+
+    fn app_paths(&self) -> AppPaths {
+        AppPaths::for_test(&self.root)
+    }
+}
+
+enum DesktopLaunch {
+    Production,
+    #[cfg(debug_assertions)]
+    Isolated(DevAppLaunch),
+}
+
+#[cfg(debug_assertions)]
+fn load_desktop_launch() -> Result<DesktopLaunch, StartupError> {
+    DevAppLaunch::from_environment()
+        .map(|launch| launch.map_or(DesktopLaunch::Production, DesktopLaunch::Isolated))
+        .map_err(|error| {
+            eprintln!("YakShed debug launcher rejected: {error}");
+            StartupError::internal()
+        })
+}
+
+#[cfg(not(debug_assertions))]
+fn load_desktop_launch() -> Result<DesktopLaunch, StartupError> {
+    Ok(DesktopLaunch::Production)
+}
+
 pub fn run() {
     let state = match tauri::async_runtime::block_on(compose()) {
         Ok(state) => state,
@@ -61,7 +187,13 @@ pub fn run() {
 }
 
 async fn compose() -> Result<yakshed_tauri::ShellState, StartupError> {
-    let paths = AppPaths::production().map_err(|_| StartupError::persistence())?;
+    let launch = load_desktop_launch()?;
+    let paths = match &launch {
+        DesktopLaunch::Production => AppPaths::production(),
+        #[cfg(debug_assertions)]
+        DesktopLaunch::Isolated(launch) => Ok(launch.app_paths()),
+    }
+    .map_err(|_| StartupError::persistence())?;
     paths
         .create_data_root()
         .and_then(|()| paths.create_runtime_root())
@@ -78,24 +210,42 @@ async fn compose() -> Result<yakshed_tauri::ShellState, StartupError> {
         ConfigStore::open(paths.clone(), backend_capabilities())
             .map_err(|_| StartupError::persistence())?,
     );
-    let local_backend = local_backend();
-    let legacy_backend = legacy_backend(&paths);
-    let local_os =
-        LocalOsBackend::from_config(&local_backend).map_err(|_| StartupError::internal())?;
-    let credential_migration = migrate_interim_secrets(
-        &paths,
-        &config_store,
-        &legacy_backend,
-        &local_backend,
-        &local_os,
-    )
-    .await;
-    let broker = Arc::new(build_broker(&config_store.snapshot(), &local_backend)?);
-    let harness = Arc::new(CodexHarness::new(
-        paths.clone(),
-        config_store.clone(),
-        Some(broker.clone()),
-    ));
+    let (local_backend, credential_migration, broker) = match &launch {
+        DesktopLaunch::Production => {
+            let local_backend = local_backend();
+            let legacy_backend = legacy_backend(&paths);
+            let local_os = LocalOsBackend::from_config(&local_backend)
+                .map_err(|_| StartupError::internal())?;
+            let credential_migration = migrate_interim_secrets(
+                &paths,
+                &config_store,
+                &legacy_backend,
+                &local_backend,
+                &local_os,
+            )
+            .await;
+            let broker = Arc::new(build_broker(&config_store.snapshot(), &local_backend)?);
+            (local_backend, credential_migration, broker)
+        }
+        #[cfg(debug_assertions)]
+        DesktopLaunch::Isolated(_) => {
+            let local_backend = isolated_backend();
+            let broker = Arc::new(build_isolated_broker(
+                &config_store.snapshot(),
+                &local_backend,
+            )?);
+            (local_backend, CredentialMigrationStatus::Ready, broker)
+        }
+    };
+    let harness = CodexHarness::new(paths.clone(), config_store.clone(), Some(broker.clone()));
+    #[cfg(debug_assertions)]
+    let harness = match &launch {
+        DesktopLaunch::Production => harness,
+        DesktopLaunch::Isolated(launch) => {
+            harness.with_debug_fake_command(&launch.fake_codex, &launch.scenario)
+        }
+    };
+    let harness = Arc::new(harness);
     let cache = Arc::new(CacheStore::open(&paths).map_err(|_| StartupError::persistence())?);
     let artifacts = Arc::new(
         ArtifactStore::new(&paths, MAX_ARTIFACT_BYTES).map_err(|_| StartupError::persistence())?,
@@ -133,6 +283,35 @@ fn local_backend() -> SecretBackend {
         id: SecretBackendId::new(LOCAL_BACKEND_ID).expect("constant backend id is valid"),
         settings: SecretBackendSettings::LocalOs,
     }
+}
+
+#[cfg(debug_assertions)]
+fn isolated_backend() -> SecretBackend {
+    SecretBackend {
+        id: SecretBackendId::new("memory").expect("constant backend id is valid"),
+        settings: SecretBackendSettings::Memory,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn build_isolated_broker(
+    snapshot: &ConfigSnapshot,
+    backend: &SecretBackend,
+) -> Result<CredentialBroker, StartupError> {
+    let memory = Arc::new(MemorySecretBackend::new(backend.id.clone()));
+    CredentialBroker::new(
+        [(
+            backend.id.clone(),
+            SecretBackendHandle {
+                resolver: memory.clone(),
+                administrator: Some(memory),
+            },
+        )],
+        &snapshot.config.connections,
+        Arc::new(NoopSecretAuditSink),
+        Duration::from_secs(5),
+    )
+    .map_err(|_| StartupError::internal())
 }
 
 fn legacy_backend(paths: &AppPaths) -> SecretBackend {
@@ -900,6 +1079,13 @@ impl CodexHarness {
     fn with_provider_command(mut self, program: PathBuf, args: Vec<String>) -> Self {
         self.program = program;
         self.args = args;
+        self
+    }
+
+    #[cfg(debug_assertions)]
+    fn with_debug_fake_command(mut self, script: &Path, scenario: &str) -> Self {
+        self.program = PathBuf::from("python3");
+        self.args = vec![script.to_string_lossy().into_owned(), scenario.to_owned()];
         self
     }
 
@@ -1730,6 +1916,72 @@ mod tests {
             provider_state: ProviderStateRootId::new(provider_state).unwrap(),
             credentials: vec![],
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_launch_selects_isolated_paths_and_fake_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        fs::create_dir(&root).unwrap();
+        let fake = temp.path().join("fake_codex.py");
+        fs::write(&fake, "#!/usr/bin/env python3\n").unwrap();
+        let launch = DevAppLaunch::new(root.clone(), fake.clone(), "chunked".to_owned()).unwrap();
+
+        let paths = launch.app_paths();
+        assert_eq!(paths.data_root, root.canonicalize().unwrap().join("data"));
+        let harness = CodexHarness::new(paths.clone(), test_config(&paths), None)
+            .with_debug_fake_command(&launch.fake_codex, &launch.scenario);
+        assert_eq!(harness.program, PathBuf::from("python3"));
+        assert_eq!(
+            harness.args,
+            vec![
+                fake.canonicalize().unwrap().to_string_lossy().into_owned(),
+                "chunked".to_owned()
+            ]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_launch_rejects_invalid_isolation_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        fs::create_dir(&root).unwrap();
+        let fake = temp.path().join("fake_codex.py");
+        fs::write(&fake, "#!/usr/bin/env python3\n").unwrap();
+
+        assert!(
+            DevAppLaunch::from_values(Some(root.clone()), None, Some("approval".to_owned()),)
+                .is_err()
+        );
+        assert!(
+            DevAppLaunch::new(
+                PathBuf::from("relative-state"),
+                fake.clone(),
+                "approval".to_owned(),
+            )
+            .is_err()
+        );
+        assert!(
+            DevAppLaunch::new(
+                root.clone(),
+                PathBuf::from("fake_codex.py"),
+                "approval".to_owned()
+            )
+            .is_err()
+        );
+        assert!(DevAppLaunch::new(root.clone(), fake.clone(), "unknown".to_owned()).is_err());
+        assert!(DevAppLaunch::new(PathBuf::from("/"), fake, "approval".to_owned()).is_err());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_launch_is_always_production() {
+        assert!(matches!(
+            load_desktop_launch().unwrap(),
+            DesktopLaunch::Production
+        ));
     }
 
     #[tokio::test]

@@ -79,10 +79,11 @@ python3 scripts/backend_contract_test.py \
   --fake-harness scripts/fake_harness.py
 ```
 
-For frontend changes also run `npm ci`, `npm run typecheck`, `npm run build`,
-and `npm run test:e2e` from `crates/yakshed-tauri`. For packaged macOS changes,
-run `npm run package` there, then `python3 scripts/tauri_app_smoke.py` from the
-repository root as documented in the packaging runbook.
+For frontend changes run `npm ci`, `npm run typecheck`, `npm run build`, and
+`npm run test:e2e` in `crates/yakshed-tauri`; packaging uses `npm run package`
+there and `python3 scripts/tauri_app_smoke.py` as documented in the runbook.
+Desktop fake journey: run `python3 scripts/dev_app.py --self-test`, then
+`python3 scripts/dev_app.py --scenario approval`; follow the [desktop debug runbook](docs/runbooks/tauri-packaging.md) for input/chunked observations.
 
 ## UI validation and review routing
 
@@ -94,7 +95,6 @@ reviewers: Rust behavior/tests to `rust/implementation-tests`, ownership or
 standards to `architecture/seams`, Tauri/IPC/CSP/frontend DTOs to
 `tauri/config-ipc`, and credential paths to `security/secret-boundary`.
 
-Those reviewers are scoped by globs, not omniscient. Invoke the secret reviewer
-explicitly when a credential path changes without a matching filename, and do
-not treat a passing unit test as a substitute for the applicable boundary or
-UI check.
+Those reviewers are scoped by globs, not omniscient. Invoke the secret reviewer explicitly
+when a credential path changes without a matching filename; do not treat a passing unit
+test as a substitute for the applicable boundary or UI check.

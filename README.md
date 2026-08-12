@@ -81,13 +81,30 @@ npm run build
 npm run test:e2e
 ```
 
-On macOS, start the desktop shell after installing the UI dependencies:
+On macOS, validate and start the real desktop shell with the deterministic fake
+Codex process after installing the locked UI dependencies:
 
 ```sh
-npm run tauri -- dev
+cd crates/yakshed-tauri
+npm ci
+cd ../..
+python3 scripts/dev_app.py --self-test
+python3 scripts/dev_app.py --scenario approval
 ```
 
-For a packaged app and clean launch/quit check, use
+This is the real WebView → Tauri IPC → application/store → Codex adapter path
+with a fake external process; it never makes a production Codex call. In the
+window, add a `Codex` connection with provider `openai` (the fake reports it as
+authenticated), create a work item, and start a run. With `approval`, the
+timeline must show `reader-still-live` while approval is pending; approve it
+and observe completion. Relaunch with `--scenario user_input` and answer
+`blue`. Relaunch with `--scenario chunked` and inspect the message, file, and
+command timeline entries. The launcher prints the exact preserved state root
+and cleanup command; use the [desktop debug runbook](docs/runbooks/tauri-packaging.md)
+for the full journey and cleanup boundary.
+
+For a normal live Codex development process, use `npm run tauri -- dev` from
+`crates/yakshed-tauri`. For a packaged app and clean launch/quit check, use
 [`docs/runbooks/tauri-packaging.md`](docs/runbooks/tauri-packaging.md).
 
 ## Verification
