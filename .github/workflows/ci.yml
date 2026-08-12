@@ -70,5 +70,6 @@ jobs:
       - run: cargo test -p yakshed-secrets --features keychain-integration --test keychain_integration --locked
       - run: npm run package
         working-directory: crates/yakshed-tauri
+      - run: scripts/sign_and_notarize.sh
       # GitHub-hosted macOS runners do not guarantee the interactive GUI session
       # required by the osascript quit check; tauri_app_smoke.py remains a local gate.
