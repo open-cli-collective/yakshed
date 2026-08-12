@@ -35,9 +35,11 @@ variable:
 ```sh
 xcrun notarytool store-credentials yakshed-notary \
   --apple-id USER@example.com \
-  --team-id TEAMID \
-  --password APP_SPECIFIC_PASSWORD
+  --team-id TEAMID
 ```
+
+Omit `--password`: `notarytool` prompts for the app-specific password
+interactively, keeping it out of argv and shell history.
 
 `notarytool` also supports App Store Connect API keys; use its documented
 `store-credentials` flags if the release account uses that authentication.
