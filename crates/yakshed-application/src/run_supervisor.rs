@@ -1121,18 +1121,14 @@ impl Inner {
                 if matches!(
                     approval.status,
                     ApprovalStatus::Pending | ApprovalStatus::Responding { .. }
-                ) && let Some(native_id) = approval
-                    .provider_id
-                    .value()
-                    .strip_prefix(&format!("{}/", provider_run.native_id()))
-                {
+                ) {
                     restored.approvals.insert(
                         approval.id,
                         (
                             run.id,
                             ProviderRequestRef {
                                 run: provider_run.clone(),
-                                native_id: native_id.to_owned(),
+                                native_id: approval.provider_id.value().to_owned(),
                             },
                         ),
                     );
@@ -1154,22 +1150,16 @@ impl Inner {
                 .list_pending_user_inputs_for_run(run.id, after, 200)
                 .await?;
             for item in page.items {
-                if let Some(native_id) = item
-                    .provider_id
-                    .value()
-                    .strip_prefix(&format!("{}/", provider_run.native_id()))
-                {
-                    restored.user_inputs.insert(
-                        item.id,
-                        (
-                            run.id,
-                            ProviderRequestRef {
-                                run: provider_run.clone(),
-                                native_id: native_id.to_owned(),
-                            },
-                        ),
-                    );
-                }
+                restored.user_inputs.insert(
+                    item.id,
+                    (
+                        run.id,
+                        ProviderRequestRef {
+                            run: provider_run.clone(),
+                            native_id: item.provider_id.value().to_owned(),
+                        },
+                    ),
+                );
             }
             after = page.next_after;
             if after.is_none() {
@@ -1517,7 +1507,7 @@ impl Inner {
             return Ok(());
         }
         let (source_namespace, stream_id) = stream
-            .map(|run| (run.namespace().to_owned(), run.native_id().to_owned()))
+            .map(|run| (run.namespace().to_owned(), run_id.to_string()))
             .unwrap_or_else(|| ("application".to_owned(), run_id.to_string()));
         let cursor = self
             .store
@@ -1797,7 +1787,7 @@ fn request_provider_id(
 ) -> Result<NamespacedProviderId, RunOrchestrationError> {
     NamespacedProviderId::new(
         request.run.namespace().to_owned(),
-        format!("{}/{}", request.run.native_id(), request.native_id),
+        request.native_id.clone(),
     )
     .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))
 }
@@ -1807,7 +1797,7 @@ fn command_provider_id(
 ) -> Result<NamespacedProviderId, RunOrchestrationError> {
     NamespacedProviderId::new(
         command.run.namespace().to_owned(),
-        format!("{}/{}", command.run.native_id(), command.native_id),
+        command.native_id.clone(),
     )
     .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))
 }

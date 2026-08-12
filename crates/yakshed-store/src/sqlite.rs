@@ -30,7 +30,7 @@ use yakshed_domain::{
 use crate::AppPaths;
 
 const DATABASE_FILE: &str = "yakshed.sqlite3";
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const MAX_PAGE_SIZE: u32 = 200;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 
@@ -99,7 +99,7 @@ CREATE TABLE timeline_items (
     CHECK ((provider_namespace IS NULL) = (provider_item_id IS NULL)),
     FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
     UNIQUE (run_id, revision),
-    UNIQUE (connection_id, provider_namespace, provider_item_id)
+    UNIQUE (connection_id, run_id, provider_namespace, provider_item_id)
 );
 
 CREATE TABLE approval_requests (
@@ -117,7 +117,7 @@ CREATE TABLE approval_requests (
     resolved_at_ms INTEGER,
     voided_at_ms INTEGER,
     FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
-    UNIQUE (connection_id, provider_namespace, provider_approval_id),
+    UNIQUE (connection_id, run_id, provider_namespace, provider_approval_id),
     CHECK (
         (status = 'pending' AND decision IS NULL AND response_started_at_ms IS NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
         OR (status = 'responding' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
@@ -139,7 +139,7 @@ CREATE TABLE projection_cursors (
     last_payload_digest TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
-    PRIMARY KEY (connection_id, source_namespace, stream_id)
+    PRIMARY KEY (connection_id, run_id, source_namespace, stream_id)
 );
 
 CREATE TABLE audit_events (
@@ -265,11 +265,82 @@ CREATE TABLE runs_v5 (
     )
 );
 INSERT INTO runs_v5 (
-    id, connection_id, work_item_id, status, created_at_ms, ended_at_ms
+    id, connection_id, work_item_id, status, provider_namespace,
+    provider_runtime_id, provider_session_id, provider_run_id, created_at_ms, ended_at_ms
 )
-SELECT id, connection_id, work_item_id, status, created_at_ms, ended_at_ms FROM runs;
+SELECT
+    id, connection_id, work_item_id, status, provider_namespace,
+    provider_namespace, provider_run_id, provider_run_id, created_at_ms, ended_at_ms
+FROM runs;
 DROP TABLE runs;
 ALTER TABLE runs_v5 RENAME TO runs;
+"#;
+
+const MIGRATE_V5_TO_V6: &str = r#"
+CREATE TABLE timeline_items_v6 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+    body TEXT NOT NULL,
+    provider_namespace TEXT,
+    provider_item_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    CHECK ((provider_namespace IS NULL) = (provider_item_id IS NULL)),
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    UNIQUE (run_id, revision),
+    UNIQUE (connection_id, run_id, provider_namespace, provider_item_id)
+);
+INSERT INTO timeline_items_v6 SELECT * FROM timeline_items;
+DROP TABLE timeline_items;
+ALTER TABLE timeline_items_v6 RENAME TO timeline_items;
+
+CREATE TABLE approval_requests_v6 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    provider_namespace TEXT NOT NULL,
+    provider_approval_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+    summary TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'responding', 'resolved', 'voided')),
+    decision TEXT CHECK (decision IN ('approved', 'denied')),
+    requested_at_ms INTEGER NOT NULL,
+    response_started_at_ms INTEGER,
+    resolved_at_ms INTEGER,
+    voided_at_ms INTEGER,
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    UNIQUE (connection_id, run_id, provider_namespace, provider_approval_id),
+    CHECK (
+        (status = 'pending' AND decision IS NULL AND response_started_at_ms IS NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
+        OR (status = 'responding' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NULL AND voided_at_ms IS NULL)
+        OR (status = 'resolved' AND decision IS NOT NULL AND response_started_at_ms IS NOT NULL AND resolved_at_ms IS NOT NULL AND voided_at_ms IS NULL)
+        OR (status = 'voided' AND resolved_at_ms IS NULL AND voided_at_ms IS NOT NULL
+            AND ((decision IS NULL AND response_started_at_ms IS NULL)
+                 OR (decision IS NOT NULL AND response_started_at_ms IS NOT NULL)))
+    )
+);
+INSERT INTO approval_requests_v6 SELECT * FROM approval_requests;
+DROP TABLE approval_requests;
+ALTER TABLE approval_requests_v6 RENAME TO approval_requests;
+
+CREATE TABLE projection_cursors_v6 (
+    connection_id TEXT NOT NULL,
+    source_namespace TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    cursor INTEGER NOT NULL CHECK (cursor >= 0),
+    last_batch_id TEXT NOT NULL,
+    last_start_cursor INTEGER NOT NULL CHECK (last_start_cursor >= 0),
+    last_payload_digest TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (connection_id, run_id) REFERENCES runs(connection_id, id) ON DELETE CASCADE,
+    PRIMARY KEY (connection_id, run_id, source_namespace, stream_id)
+);
+INSERT INTO projection_cursors_v6 SELECT * FROM projection_cursors;
+DROP TABLE projection_cursors;
+ALTER TABLE projection_cursors_v6 RENAME TO projection_cursors;
 "#;
 
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
@@ -620,6 +691,7 @@ fn migrations() -> Migrations<'static> {
         M::up(MIGRATE_V2_TO_V3).comment("keep recoverable runs and approvals active"),
         M::up(MIGRATE_V3_TO_V4).comment("persist immutable artifact metadata"),
         M::up(MIGRATE_V4_TO_V5).comment("persist lossless provider run identity"),
+        M::up(MIGRATE_V5_TO_V6).comment("scope provider projections by application run"),
     ])
 }
 
@@ -1266,6 +1338,7 @@ struct PersistedStreamCursor {
 fn find_stream_cursor(
     connection: &Connection,
     connection_id: ConnectionId,
+    run_id: RunId,
     source_namespace: &str,
     stream_id: &str,
 ) -> Result<Option<PersistedStreamCursor>, StoreError> {
@@ -1274,8 +1347,13 @@ fn find_stream_cursor(
             "SELECT connection_id, run_id, cursor, last_batch_id, last_start_cursor,
                     last_payload_digest
              FROM projection_cursors
-             WHERE connection_id = ?1 AND source_namespace = ?2 AND stream_id = ?3",
-            params![connection_id.to_string(), source_namespace, stream_id],
+             WHERE connection_id = ?1 AND run_id = ?2 AND source_namespace = ?3 AND stream_id = ?4",
+            params![
+                connection_id.to_string(),
+                run_id.to_string(),
+                source_namespace,
+                stream_id
+            ],
             |row| {
                 let cursor = u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -1906,6 +1984,7 @@ impl AppStore for SqliteStore {
             let cursor = find_stream_cursor(
                 &transaction,
                 batch.connection_id,
+                batch.run_id,
                 &batch.source_namespace,
                 &batch.stream_id,
             )?;
@@ -1992,7 +2071,7 @@ impl AppStore for SqliteStore {
                      (connection_id, source_namespace, stream_id, run_id, cursor, last_batch_id,
                       last_start_cursor, last_payload_digest, updated_at_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(connection_id, source_namespace, stream_id) DO UPDATE SET
+                     ON CONFLICT(connection_id, run_id, source_namespace, stream_id) DO UPDATE SET
                          cursor = excluded.cursor,
                          last_batch_id = excluded.last_batch_id,
                          last_start_cursor = excluded.last_start_cursor,
@@ -2031,6 +2110,7 @@ impl AppStore for SqliteStore {
             let cursor = find_stream_cursor(
                 &worker.connection,
                 query.connection_id,
+                query.run_id,
                 &query.source_namespace,
                 &query.stream_id,
             )?;

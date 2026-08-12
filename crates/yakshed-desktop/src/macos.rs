@@ -460,6 +460,27 @@ impl CodexHarness {
         Ok(run)
     }
 
+    fn evict_idle_adapter(&self, connection_id: ConnectionId, adapter: &Arc<CodexAdapter>) -> bool {
+        let mut state = self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idle = !state
+            .runs
+            .values()
+            .any(|(owner, _, _)| *owner == connection_id);
+        let current = state
+            .providers
+            .get(&connection_id)
+            .is_some_and(|provider| Arc::ptr_eq(&provider.adapter, adapter));
+        if idle && current {
+            state.providers.remove(&connection_id);
+            true
+        } else {
+            false
+        }
+    }
+
     fn native_run(
         &self,
         run: &ProviderRunRef,
@@ -491,7 +512,7 @@ impl CodexHarness {
             .ok_or_else(|| HarnessPortError::NotFound(run.to_string()))
     }
 
-    fn retire_run(&self, native: &ProviderRunHandle) {
+    fn retire_run(&self, native: &ProviderRunHandle, runtime_failed: bool) {
         let mut state = self
             .run_state
             .lock()
@@ -499,8 +520,16 @@ impl CodexHarness {
         let Some(run) = state.native_refs.remove(native) else {
             return;
         };
-        if let Some((_, correlation_id, _)) = state.runs.remove(&run) {
+        if let Some((connection_id, correlation_id, _)) = state.runs.remove(&run) {
             state.correlations.remove(&correlation_id);
+            if runtime_failed
+                && !state
+                    .runs
+                    .values()
+                    .any(|(owner, _, _)| *owner == connection_id)
+            {
+                state.providers.remove(&connection_id);
+            }
         }
     }
 }
@@ -537,18 +566,23 @@ impl RunHarness for CodexHarness {
                 connection.id, connection.harness
             )));
         }
-        let adapter = self.adapter(&connection)?;
-        let session = adapter
-            .start_session(
-                &RuntimeHandle::new(format!("codex-{connection_id}")).map_err(map_harness_error)?,
-                StartSessionSpec {
-                    working_directory: run_working_directory(self.paths.clone(), correlation_id)
-                        .await?,
-                    title: format!("YakShed run {correlation_id}"),
-                },
-            )
-            .await
-            .map_err(map_harness_error)?;
+        let runtime =
+            RuntimeHandle::new(format!("codex-{connection_id}")).map_err(map_harness_error)?;
+        let session_spec = StartSessionSpec {
+            working_directory: run_working_directory(self.paths.clone(), correlation_id).await?,
+            title: format!("YakShed run {correlation_id}"),
+        };
+        let mut adapter = self.adapter(&connection)?;
+        let session = match adapter.start_session(&runtime, session_spec.clone()).await {
+            Err(HarnessError::Disconnected) if self.evict_idle_adapter(connection_id, &adapter) => {
+                adapter = self.adapter(&connection)?;
+                adapter
+                    .start_session(&runtime, session_spec)
+                    .await
+                    .map_err(map_harness_error)?
+            }
+            result => result.map_err(map_harness_error)?,
+        };
         let native = adapter
             .start_run(
                 &session,
@@ -631,6 +665,19 @@ impl RunHarness for CodexHarness {
                 return self.convert_event(event).map(Some);
             }
             let notified = self.event_ready.notified();
+            let pending_full = self
+                .run_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_events
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>()
+                >= PENDING_EVENT_CAPACITY;
+            if pending_full {
+                notified.await;
+                continue;
+            }
             let mut events = self.events.lock().await;
             let event = tokio::select! {
                 biased;
@@ -648,15 +695,6 @@ impl RunHarness for CodexHarness {
             if let Some(native) = event_run(&event)
                 && !state.native_refs.contains_key(native)
             {
-                if state
-                    .pending_events
-                    .values()
-                    .map(VecDeque::len)
-                    .sum::<usize>()
-                    >= PENDING_EVENT_CAPACITY
-                {
-                    return Err(HarnessPortError::Overloaded);
-                }
                 state
                     .pending_events
                     .entry(native.clone())
@@ -682,7 +720,10 @@ impl RunHarness for CodexHarness {
 impl CodexHarness {
     fn convert_event(&self, event: HarnessEvent) -> Result<RunHarnessEvent, HarnessPortError> {
         let terminal = match &event {
-            HarnessEvent::RunTerminal { run, .. } => Some(run.clone()),
+            HarnessEvent::RunTerminal { run, state, .. } => Some((
+                run.clone(),
+                matches!(state, HarnessRunTerminal::Crashed { .. }),
+            )),
             _ => None,
         };
         let converted = match event {
@@ -784,8 +825,8 @@ impl CodexHarness {
                 native: native.sanitized_raw().to_owned(),
             },
         };
-        if let Some(native) = terminal {
-            self.retire_run(&native);
+        if let Some((native, runtime_failed)) = terminal {
+            self.retire_run(&native, runtime_failed);
         }
         Ok(converted)
     }
@@ -927,7 +968,7 @@ mod tests {
         ArtifactId, ArtifactKind, ArtifactProvenance, CredentialBindingRecord, CredentialSlot,
         ProviderStateRootId, SecretLocator, SecretReference,
     };
-    use yakshed_harness::{NativePayload, ProviderRunId, ProviderSessionId};
+    use yakshed_harness::{NativePayload, ProviderRunId, ProviderSessionId, SanitizedDiagnostic};
     use yakshed_store::ArtifactMetadata;
 
     fn test_config(paths: &AppPaths) -> Arc<ConfigStore> {
@@ -1192,6 +1233,129 @@ mod tests {
         let replacement = harness.adapter(&changed).unwrap();
         assert!(!Arc::ptr_eq(&adapter, &replacement));
         assert_eq!(harness.run_state.lock().unwrap().providers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn crash_evicts_idle_adapter_for_the_next_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let harness = CodexHarness::new(paths.clone(), test_config(&paths));
+        let codex = connection(
+            "0193f26e-7a72-7000-8000-00000000d004",
+            "codex",
+            "codex-crash",
+        );
+        let adapter = harness.adapter(&codex).unwrap();
+        let native = ProviderRunHandle::new(
+            RuntimeHandle::new("runtime-crash").unwrap(),
+            ProviderSessionId::new("session-crash").unwrap(),
+            ProviderRunId::new("run-crash").unwrap(),
+        );
+        harness
+            .register_run(codex.id, SystemIdGenerator.next_run_id(), native.clone())
+            .unwrap();
+        harness
+            .event_sender
+            .send(HarnessEvent::RunTerminal {
+                run: native,
+                state: HarnessRunTerminal::Crashed {
+                    diagnostic: SanitizedDiagnostic::sanitized("runtime exited"),
+                },
+                native: NativePayload::sanitized("{}"),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            harness.next_event().await.unwrap(),
+            Some(RunHarnessEvent::RunTerminal {
+                state: RunTerminal::Crashed { .. },
+                ..
+            })
+        ));
+        let replacement = harness.adapter(&codex).unwrap();
+        assert!(!Arc::ptr_eq(&adapter, &replacement));
+    }
+
+    #[tokio::test]
+    async fn pending_capacity_backpressures_without_losing_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let harness = Arc::new(CodexHarness::new(paths.clone(), test_config(&paths)));
+        let codex = connection(
+            "0193f26e-7a72-7000-8000-00000000d005",
+            "codex",
+            "codex-overflow",
+        );
+        let _ = harness.adapter(&codex).unwrap();
+        let native = ProviderRunHandle::new(
+            RuntimeHandle::new("runtime-overflow").unwrap(),
+            ProviderSessionId::new("session-overflow").unwrap(),
+            ProviderRunId::new("run-overflow").unwrap(),
+        );
+        let producer = tokio::spawn({
+            let sender = harness.event_sender.clone();
+            let native = native.clone();
+            async move {
+                for _ in 0..PENDING_EVENT_CAPACITY {
+                    sender
+                        .send(HarnessEvent::MessageDelta {
+                            run: native.clone(),
+                            chunk: "x".to_owned(),
+                            native: NativePayload::sanitized("{}"),
+                        })
+                        .await
+                        .unwrap();
+                }
+                sender
+                    .send(HarnessEvent::RunTerminal {
+                        run: native,
+                        state: HarnessRunTerminal::Completed,
+                        native: NativePayload::sanitized("{}"),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        let first = tokio::spawn({
+            let harness = harness.clone();
+            async move { harness.next_event().await }
+        });
+        loop {
+            let count = harness
+                .run_state
+                .lock()
+                .unwrap()
+                .pending_events
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>();
+            if count == PENDING_EVENT_CAPACITY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        producer.await.unwrap();
+        let run = harness
+            .register_run(codex.id, SystemIdGenerator.next_run_id(), native)
+            .unwrap();
+        assert!(matches!(
+            first.await.unwrap().unwrap(),
+            Some(RunHarnessEvent::MessageDelta { .. })
+        ));
+        for _ in 1..PENDING_EVENT_CAPACITY {
+            assert!(matches!(
+                harness.next_event().await.unwrap(),
+                Some(RunHarnessEvent::MessageDelta { .. })
+            ));
+        }
+        assert_eq!(
+            harness.next_event().await.unwrap(),
+            Some(RunHarnessEvent::RunTerminal {
+                run,
+                state: RunTerminal::Completed,
+            })
+        );
     }
 
     #[tokio::test]
