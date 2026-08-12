@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  YakShed does not enable App Sandbox: the production composition must launch
+  user-installed Codex and op executables. Without App Sandbox, outbound
+  networking, Keychain access, and platform data directories need no
+  entitlement. Hardened runtime is enabled by codesign, so this intentionally
+  empty dictionary grants no runtime exceptions (JIT, unsigned code, or DYLD).
+-->
+<plist version="1.0">
+<dict/>
+</plist>

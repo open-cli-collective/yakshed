@@ -68,6 +68,10 @@ release step.
 entitlements with `codesign`, and either validates a stapled notarization ticket
 or reports the documented missing user credentials before notarization begins.
 
+**Release status**: the ad-hoc hardened-runtime gate is automated locally and in
+CI. Developer ID signing, notarization, and stapling remain user-blocked on the
+certificate and notarization Keychain profile documented in the release runbook.
+
 ## K6. Platform CI lanes
 
 The unchanged Linux cheap lane continues to guard portable code. A macOS lane
@@ -78,6 +82,11 @@ runner can support it reliably.
 **Check**: CI configuration contains both lanes, and the macOS job proves its
 temporary keychain is deleted after the integration test while producing a
 macOS application bundle.
+
+The macOS lane also applies the committed entitlements with an ad-hoc hardened-
+runtime signature and verifies the resulting bundle. GUI launch remains the
+documented local gate because hosted runners do not guarantee an interactive
+session; the Linux cheap lane remains unchanged.
 
 ## K7. Whole-workspace health unchanged
 

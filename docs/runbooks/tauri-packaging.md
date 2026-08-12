@@ -12,6 +12,8 @@ python3 scripts/tauri_app_smoke.py
 
 The smoke launches the real `yakshed-desktop` binary with an isolated home, waits for its real
 SQLite database, requests a normal application quit, and fails if its process group survives.
+For the hardened-runtime signing, notarization, and signed-app launch gate, see
+[macOS release signing](release-signing.md).
 New secret-backed connections use the macOS Keychain (`local-os`). On first launch after upgrading,
 YakShed copies every entry from the interim `data_root/secrets.json`, verifies each Keychain read,
 rewrites all affected connection bindings in one config revision, then overwrites the file with

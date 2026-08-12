@@ -83,6 +83,14 @@ fn hardened_config_is_exact() {
     );
     assert_eq!(config["bundle"]["active"], true);
     assert_eq!(config["bundle"]["targets"], serde_json::json!(["app"]));
+    assert_eq!(config["bundle"]["macOS"]["hardenedRuntime"], true);
+    assert_eq!(
+        config["bundle"]["macOS"]["entitlements"],
+        "Entitlements.plist"
+    );
+    let entitlements = include_str!("../../yakshed-desktop/Entitlements.plist");
+    assert!(entitlements.contains("<dict/>"));
+    assert!(!entitlements.contains("com.apple.security."));
 }
 
 #[test]

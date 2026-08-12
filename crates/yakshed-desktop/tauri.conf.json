@@ -60,6 +60,10 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
-    "icon": ["../../design/YakShed-UI/uploads/pasted-1786202555766-0.png"]
+    "icon": ["../../design/YakShed-UI/uploads/pasted-1786202555766-0.png"],
+    "macOS": {
+      "hardenedRuntime": true,
+      "entitlements": "Entitlements.plist"
+    }
   }
 }
