@@ -248,6 +248,21 @@ transport_test!(concurrent_login_starts_issue_one_native_request, {
     );
 });
 
+transport_test!(account_update_before_login_response_settles_waiters, {
+    let test = adapter("account_login_update_before_response", 1024 * 1024, None);
+    assert!(matches!(
+        test.adapter
+            .account_login_start(&test.runtime)
+            .await
+            .unwrap(),
+        HarnessAccountStatus::LoginInProgress { .. }
+    ));
+    assert!(matches!(
+        test.adapter.account_status(&test.runtime).await.unwrap(),
+        HarnessAccountStatus::Authenticated { .. }
+    ));
+});
+
 transport_test!(canonical_account_read_reconciles_missed_login_completion, {
     let test = adapter("account_login_missed_completion", 1024 * 1024, None);
     test.adapter

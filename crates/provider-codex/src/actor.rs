@@ -195,6 +195,7 @@ enum AccountLoginState {
     Starting {
         waiters: Vec<oneshot::Sender<Result<HarnessAccountStatus, HarnessError>>>,
         completion: Option<(String, bool)>,
+        updated: bool,
     },
     Pending {
         login_id: String,
@@ -459,6 +460,7 @@ async fn run_actor(
                         account_login = Some(AccountLoginState::Starting {
                             waiters: vec![reply],
                             completion: None,
+                            updated: false,
                         });
                         let id = next_id;
                         next_id += 1;
@@ -862,7 +864,11 @@ async fn handle_frame(
                 "Codex emitted a malformed account/updated notification".to_owned(),
             );
         }
-        *account_login = None;
+        if let Some(AccountLoginState::Starting { updated, .. }) = account_login {
+            *updated = true;
+        } else {
+            *account_login = None;
+        }
         return Ok(());
     }
     let mut safe_value = value;
@@ -1001,14 +1007,16 @@ fn settle_login_start(
     let Some(AccountLoginState::Starting {
         waiters,
         completion,
+        updated,
     }) = account_login.take()
     else {
         return;
     };
     if let Ok(HarnessAccountStatus::LoginInProgress { login_id, auth_url }) = &result {
-        *account_login = match completion {
-            Some((completed_id, true)) if completed_id == *login_id => None,
-            Some((completed_id, false)) if completed_id == *login_id => {
+        *account_login = match (updated, completion) {
+            (true, _) => None,
+            (false, Some((completed_id, true))) if completed_id == *login_id => None,
+            (false, Some((completed_id, false))) if completed_id == *login_id => {
                 Some(AccountLoginState::Failed)
             }
             _ => Some(AccountLoginState::Pending {

@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::RandomState},
     fs,
+    hash::BuildHasher,
     io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
@@ -847,6 +848,8 @@ struct CodexHarness {
     paths: AppPaths,
     config: Arc<ConfigStore>,
     broker: Option<Arc<CredentialBroker>>,
+    credential_generations: RandomState,
+    credential_preparation: Mutex<()>,
     run_state: StdMutex<RunState>,
     event_sender: mpsc::Sender<HarnessEvent>,
     events: Mutex<mpsc::Receiver<HarnessEvent>>,
@@ -867,6 +870,7 @@ struct RunState {
 
 struct ProviderState {
     provider_state: String,
+    credential_generation: Option<u64>,
     adapter: Arc<CodexAdapter>,
 }
 
@@ -881,6 +885,8 @@ impl CodexHarness {
             paths,
             config,
             broker,
+            credential_generations: RandomState::new(),
+            credential_preparation: Mutex::new(()),
             run_state: StdMutex::new(RunState::default()),
             event_sender,
             events: Mutex::new(events),
@@ -961,6 +967,7 @@ impl CodexHarness {
             connection.id,
             ProviderState {
                 provider_state: connection.provider_state.to_string(),
+                credential_generation: None,
                 adapter: adapter.clone(),
             },
         );
@@ -999,9 +1006,11 @@ impl CodexHarness {
         &self,
         connection: &Connection,
         correlation_id: RunId,
-        adapter: &CodexAdapter,
+        adapter: Arc<CodexAdapter>,
         runtime: &RuntimeHandle,
-    ) -> Result<(), HarnessPortError> {
+    ) -> Result<Arc<CodexAdapter>, HarnessPortError> {
+        // ponytail: credential rotation is rare; shard this lock by connection if startup contends.
+        let _preparation = self.credential_preparation.lock().await;
         let Some(requirement) =
             CodexAdapter::credential_requirements_for(&connection.model_provider)
                 .and_then(|requirements| requirements.into_iter().next())
@@ -1013,7 +1022,7 @@ impl CodexHarness {
         };
         let HarnessCredentialDelivery::ProcessEnvironment { variable } = requirement.delivery
         else {
-            return Ok(());
+            return Ok(adapter);
         };
         let binding = connection
             .credentials
@@ -1045,10 +1054,50 @@ impl CodexHarness {
                 return Err(HarnessPortError::NotAuthenticated);
             }
         };
+        let generation = secret.expose(|value| self.credential_generations.hash_one(value));
+        let previous = {
+            let mut state = self
+                .run_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let provider = state
+                .providers
+                .get(&connection.id)
+                .ok_or_else(|| HarnessPortError::NotFound(connection.id.to_string()))?;
+            if provider.credential_generation == Some(generation) {
+                return Ok(provider.adapter.clone());
+            }
+            if state
+                .runs
+                .values()
+                .any(|(owner, _, _)| *owner == connection.id)
+            {
+                return Err(HarnessPortError::Conflict(
+                    "credential changed while provider runs are active".to_owned(),
+                ));
+            }
+            state
+                .providers
+                .remove(&connection.id)
+                .expect("checked provider")
+                .adapter
+        };
+        previous.shutdown().await.map_err(map_harness_error)?;
+        let adapter = self.adapter(connection)?;
         adapter
             .start_with_environment(runtime, variable, secret.into_secret())
             .await
-            .map_err(map_harness_error)
+            .map_err(map_harness_error)?;
+        if let Some(provider) = self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .providers
+            .get_mut(&connection.id)
+        {
+            provider.credential_generation = Some(generation);
+        }
+        Ok(adapter)
     }
 
     fn register_run(
@@ -1225,7 +1274,8 @@ impl RunHarness for CodexHarness {
             title: format!("YakShed run {correlation_id}"),
         };
         let mut adapter = self.adapter(&connection)?;
-        self.prepare_mode_b_runtime(&connection, correlation_id, &adapter, &runtime)
+        adapter = self
+            .prepare_mode_b_runtime(&connection, correlation_id, adapter, &runtime)
             .await?;
         if !matches!(
             adapter
@@ -1239,7 +1289,8 @@ impl RunHarness for CodexHarness {
         let session = match adapter.start_session(&runtime, session_spec.clone()).await {
             Err(HarnessError::Disconnected) if self.evict_idle_adapter(connection_id, &adapter) => {
                 adapter = self.adapter(&connection)?;
-                self.prepare_mode_b_runtime(&connection, correlation_id, &adapter, &runtime)
+                adapter = self
+                    .prepare_mode_b_runtime(&connection, correlation_id, adapter, &runtime)
                     .await?;
                 adapter
                     .start_session(&runtime, session_spec)
@@ -2672,7 +2723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode_b_connection_resolves_and_delivers_its_api_key_at_run_start() {
+    async fn mode_b_replaces_credential_free_runtime_and_rotates_between_runs() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
         let config = test_config(&paths);
@@ -2711,7 +2762,7 @@ mod tests {
         memory
             .put(
                 &locator,
-                SecretValue::new("YAKSHED_MODE_B_CANARY").as_secret(),
+                SecretValue::new("YAKSHED_MODE_B_CANARY_V1").as_secret(),
                 PutSecretOptions::NO_OVERWRITE,
             )
             .await
@@ -2722,7 +2773,7 @@ mod tests {
                     backend.id,
                     SecretBackendHandle {
                         resolver: memory.clone(),
-                        administrator: Some(memory),
+                        administrator: Some(memory.clone()),
                     },
                 )],
                 &[connection.clone()],
@@ -2740,19 +2791,84 @@ mod tests {
                 .join(connection.provider_state.as_str()),
         )
         .unwrap();
+        let credential_log = paths
+            .data_root
+            .join("codex")
+            .join(connection.provider_state.as_str())
+            .join("credential-generation.log");
         let harness = CodexHarness::new(paths, config, Some(broker)).with_provider_command(
             PathBuf::from("python3"),
-            vec![fake.display().to_string(), "mode_b".to_owned()],
+            vec![fake.display().to_string(), "mode_b_rotation".to_owned()],
         );
-
-        let result = harness
+        let runtime = RuntimeHandle::new(format!("codex-{}", connection.id)).unwrap();
+        harness
+            .adapter(&connection)
+            .unwrap()
+            .capabilities(&runtime)
+            .await
+            .unwrap();
+        harness
             .start_run(
                 connection.id,
                 SystemIdGenerator.next_run_id(),
                 "test".to_owned(),
             )
-            .await;
-        assert!(result.is_ok(), "{result:?}");
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    harness.next_event().await.unwrap(),
+                    Some(RunHarnessEvent::RunTerminal { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        memory
+            .put(
+                &locator,
+                SecretValue::new("YAKSHED_MODE_B_CANARY_V2").as_secret(),
+                PutSecretOptions::OVERWRITE,
+            )
+            .await
+            .unwrap();
+        harness
+            .start_run(
+                connection.id,
+                SystemIdGenerator.next_run_id(),
+                "test again".to_owned(),
+            )
+            .await
+            .unwrap();
+        memory
+            .put(
+                &locator,
+                SecretValue::new("YAKSHED_MODE_B_CANARY_V3").as_secret(),
+                PutSecretOptions::OVERWRITE,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            harness
+                .start_run(
+                    connection.id,
+                    SystemIdGenerator.next_run_id(),
+                    "conflicting rotation".to_owned(),
+                )
+                .await,
+            Err(HarnessPortError::Conflict(_))
+        ));
+
+        assert_eq!(
+            fs::read_to_string(credential_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["missing", "v1", "v2"]
+        );
     }
 
     #[tokio::test]

@@ -21,9 +21,19 @@ active = None
 boundary_errors = set()
 recorded = {}
 account_state = "none" if SCENARIO.startswith("account_") else "authenticated"
-if SCENARIO == "mode_b":
-    account_state = "api_key"
-    assert os.environ["FIREWORKS_API_KEY"] == "YAKSHED_MODE_B_CANARY"
+if SCENARIO in ("mode_b", "mode_b_rotation"):
+    credential = os.environ.get("FIREWORKS_API_KEY")
+    if SCENARIO == "mode_b":
+        assert credential == "YAKSHED_MODE_B_CANARY"
+    account_state = "api_key" if credential else "none"
+    if SCENARIO == "mode_b_rotation":
+        marker = {
+            None: "missing",
+            "YAKSHED_MODE_B_CANARY_V1": "v1",
+            "YAKSHED_MODE_B_CANARY_V2": "v2",
+        }.get(credential, "unexpected")
+        with open(os.path.join(os.environ["CODEX_HOME"], "credential-generation.log"), "a", encoding="utf-8") as credential_log:
+            credential_log.write(f"{marker}\n")
 account_reads = 0
 
 
@@ -393,6 +403,8 @@ def run_events():
     elif SCENARIO == "oversized":
         os.write(1, ("{\"method\":\"future/huge\",\"padding\":\"" + "x" * 4096 + "\"}\n").encode())
         terminal()
+    elif SCENARIO == "mode_b_rotation":
+        terminal()
 
 
 for line in sys.stdin:
@@ -477,6 +489,9 @@ for line in sys.stdin:
                 sys.exit(7)
             if SCENARIO == "account_login_slow_start":
                 time.sleep(0.05)
+            if SCENARIO == "account_login_update_before_response":
+                account_state = "authenticated"
+                emit({"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "plus"}})
             emit({"id": request_id, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": "https://chatgpt.com/codex/login-1"}})
             if SCENARIO == "account_login_failure":
                 account_state = "unknown"
@@ -485,7 +500,7 @@ for line in sys.stdin:
                 threading.Thread(target=complete_login_after_delay).start()
             elif SCENARIO == "account_login_external_change":
                 threading.Thread(target=external_login_after_delay).start()
-            elif SCENARIO in ("account_login_missed_completion", "account_login_slow_start", "account_login_crash_once"):
+            elif SCENARIO in ("account_login_missed_completion", "account_login_slow_start", "account_login_crash_once", "account_login_update_before_response"):
                 account_state = "authenticated"
             else:
                 account_state = "authenticated"
