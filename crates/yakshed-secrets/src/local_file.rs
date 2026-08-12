@@ -36,13 +36,12 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::{
-    DeleteSecretOutcome, LOCAL_FILE_BACKEND_KIND, PutSecretOptions, PutSecretOutcome,
-    ResolvedSecret, ResolvedSecretSource, SecretAccessContext, SecretAdministrator,
-    SecretBackendDescriptor, SecretBackendId, SecretBackendStatus, SecretError, SecretLocator,
-    SecretReferenceSummary, SecretResolver,
+    DeleteSecretOutcome, PutSecretOptions, PutSecretOutcome, ResolvedSecret, ResolvedSecretSource,
+    SecretAccessContext, SecretAdministrator, SecretBackendDescriptor, SecretBackendId,
+    SecretBackendStatus, SecretError, SecretLocator, SecretReferenceSummary, SecretResolver,
 };
 use crate::{
-    SecretBackend, SecretBackendConfigurationError, SecretBackendSettings,
+    LOCAL_FILE_BACKEND_KIND, SecretBackend, SecretBackendConfigurationError, SecretBackendSettings,
     validate_backend_configuration,
 };
 
@@ -94,6 +93,7 @@ impl LocalFileBackend {
         let SecretBackendSettings::LocalFile { path } = &config.settings else {
             return Err(SecretBackendConfigurationError::WrongKind {
                 backend: config.id.clone(),
+                expected: LOCAL_FILE_BACKEND_KIND,
             });
         };
         validate_backend_configuration(config, crate::backend_capabilities())?;

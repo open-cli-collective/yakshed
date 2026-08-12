@@ -203,6 +203,43 @@ fn build_capabilities_report_local_file_status() {
 }
 
 #[test]
+fn build_capabilities_report_local_os_platform_status() {
+    let local_os = backend_capabilities()
+        .iter()
+        .find(|capability| capability.kind == "local-os")
+        .unwrap();
+    let config = AppConfig {
+        secret_backends: vec![SecretBackend {
+            id: backend_id("local-os"),
+            settings: SecretBackendSettings::LocalOs,
+        }],
+        ..AppConfig::default()
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(local_os.availability, SecretBackendAvailability::Available);
+        assert!(config.validate(backend_capabilities()).is_ok());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(
+            local_os.availability,
+            SecretBackendAvailability::UnsupportedPlatform
+        );
+        assert!(matches!(
+            config.validate(backend_capabilities()),
+            Err(ConfigValidationError::SecretBackend(
+                SecretBackendConfigurationError::UnsupportedPlatform {
+                    kind: "local-os",
+                    ..
+                }
+            ))
+        ));
+    }
+}
+
+#[test]
 fn build_capabilities_gate_memory_backend_configuration() {
     let memory = backend_capabilities()
         .iter()
