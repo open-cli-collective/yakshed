@@ -22,15 +22,15 @@ use yakshed_application::{
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ApprovalStatus, ArtifactId,
     ArtifactKind, ArtifactProvenance, ArtifactRecord, ConnectionId, DataRevision,
-    NamespacedProviderId, ProjectId, ProjectSnapshot, RunId, RunSnapshot, RunStatus, StreamCursor,
-    TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
-    WorkItemId, WorkItemSnapshot, WorkItemStatus,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderRunIdentity, RunId, RunSnapshot,
+    RunStatus, StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot,
+    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot, WorkItemStatus,
 };
 
 use crate::AppPaths;
 
 const DATABASE_FILE: &str = "yakshed.sqlite3";
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const MAX_PAGE_SIZE: u32 = 200;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 
@@ -69,13 +69,21 @@ CREATE TABLE runs (
         status IN ('starting', 'running', 'completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown')
     ),
     provider_namespace TEXT,
+    provider_runtime_id TEXT,
+    provider_session_id TEXT,
     provider_run_id TEXT,
     created_at_ms INTEGER NOT NULL,
     ended_at_ms INTEGER,
-    CHECK ((provider_namespace IS NULL) = (provider_run_id IS NULL)),
+    CHECK (
+        (provider_namespace IS NULL) = (provider_runtime_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_session_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_run_id IS NULL)
+    ),
     CHECK ((status IN ('completed', 'failed', 'interrupted')) = (ended_at_ms IS NOT NULL)),
     UNIQUE (connection_id, id),
-    UNIQUE (connection_id, provider_namespace, provider_run_id)
+    UNIQUE (
+        connection_id, provider_namespace, provider_runtime_id, provider_session_id, provider_run_id
+    )
 );
 
 CREATE TABLE timeline_items (
@@ -228,6 +236,40 @@ CREATE TABLE artifacts (
     provenance TEXT NOT NULL CHECK (length(trim(provenance)) > 0)
 );
 CREATE INDEX artifacts_work_item_order ON artifacts(work_item_id, id);
+"#;
+
+const MIGRATE_V4_TO_V5: &str = r#"
+DROP TABLE IF EXISTS runs_v5;
+CREATE TABLE runs_v5 (
+    id TEXT PRIMARY KEY NOT NULL,
+    connection_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (
+        status IN ('starting', 'running', 'completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown')
+    ),
+    provider_namespace TEXT,
+    provider_runtime_id TEXT,
+    provider_session_id TEXT,
+    provider_run_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    ended_at_ms INTEGER,
+    CHECK (
+        (provider_namespace IS NULL) = (provider_runtime_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_session_id IS NULL)
+        AND (provider_namespace IS NULL) = (provider_run_id IS NULL)
+    ),
+    CHECK ((status IN ('completed', 'failed', 'interrupted')) = (ended_at_ms IS NOT NULL)),
+    UNIQUE (connection_id, id),
+    UNIQUE (
+        connection_id, provider_namespace, provider_runtime_id, provider_session_id, provider_run_id
+    )
+);
+INSERT INTO runs_v5 (
+    id, connection_id, work_item_id, status, created_at_ms, ended_at_ms
+)
+SELECT id, connection_id, work_item_id, status, created_at_ms, ended_at_ms FROM runs;
+DROP TABLE runs;
+ALTER TABLE runs_v5 RENAME TO runs;
 "#;
 
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
@@ -577,6 +619,7 @@ fn migrations() -> Migrations<'static> {
             .comment("expand run lifecycle statuses and start/reconnect transitions"),
         M::up(MIGRATE_V2_TO_V3).comment("keep recoverable runs and approvals active"),
         M::up(MIGRATE_V3_TO_V4).comment("persist immutable artifact metadata"),
+        M::up(MIGRATE_V4_TO_V5).comment("persist lossless provider run identity"),
     ])
 }
 
@@ -770,6 +813,29 @@ fn provider_id(
     }
 }
 
+fn provider_run_identity(
+    namespace: Option<String>,
+    runtime_id: Option<String>,
+    session_id: Option<String>,
+    run_id: Option<String>,
+) -> rusqlite::Result<Option<ProviderRunIdentity>> {
+    match (namespace, runtime_id, session_id, run_id) {
+        (None, None, None, None) => Ok(None),
+        (Some(namespace), Some(runtime_id), Some(session_id), Some(run_id)) => {
+            ProviderRunIdentity::new(namespace, runtime_id, session_id, run_id)
+                .map(Some)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
 const ARTIFACT_SELECT: &str = "
 SELECT id, work_item_id, run_id, kind, digest, byte_len, media_type, provenance
 FROM artifacts";
@@ -911,7 +977,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<ProjectSnapshot> {
 
 const RUN_SELECT: &str = "
 SELECT id, connection_id, work_item_id, status, provider_namespace,
-       provider_run_id, created_at_ms, ended_at_ms
+       provider_runtime_id, provider_session_id, provider_run_id, created_at_ms, ended_at_ms
 FROM runs";
 
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
@@ -920,10 +986,10 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunSnapshot> {
         connection_id: parse_column(row, 1)?,
         work_item_id: parse_column(row, 2)?,
         status: run_status_from_value(&row.get::<_, String>(3)?)?,
-        provider_id: provider_id(row.get(4)?, row.get(5)?)?,
-        created_at: UtcTimestamp::from_unix_millis(row.get(6)?),
+        provider_id: provider_run_identity(row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)?,
+        created_at: UtcTimestamp::from_unix_millis(row.get(8)?),
         ended_at: row
-            .get::<_, Option<i64>>(7)?
+            .get::<_, Option<i64>>(9)?
             .map(UtcTimestamp::from_unix_millis),
     })
 }
@@ -993,21 +1059,24 @@ fn apply_run_transition(
     command: &TransitionRun,
 ) -> Result<RunSnapshot, StoreError> {
     let run = get_run(transaction, command.run_id)?;
-    let (provider_namespace, provider_run_id) =
-        command
-            .provider_id
-            .as_ref()
-            .map_or((None, None), |provider| {
-                (
-                    Some(provider.namespace().to_owned()),
-                    Some(provider.value().to_owned()),
-                )
-            });
+    let (provider_namespace, provider_runtime_id, provider_session_id, provider_run_id) = command
+        .provider_id
+        .as_ref()
+        .map_or((None, None, None, None), |provider| {
+            (
+                Some(provider.namespace().to_owned()),
+                Some(provider.runtime_id().to_owned()),
+                Some(provider.session_id().to_owned()),
+                Some(provider.run_id().to_owned()),
+            )
+        });
     let changed = transaction
         .execute(
             "UPDATE runs SET status = ?2, ended_at_ms = ?3,
                  provider_namespace = COALESCE(?5, provider_namespace),
-                 provider_run_id = COALESCE(?6, provider_run_id)
+                 provider_runtime_id = COALESCE(?6, provider_runtime_id),
+                 provider_session_id = COALESCE(?7, provider_session_id),
+                 provider_run_id = COALESCE(?8, provider_run_id)
              WHERE id = ?1 AND status = ?4",
             params![
                 command.run_id.to_string(),
@@ -1015,6 +1084,8 @@ fn apply_run_transition(
                 ended_at_ms(command.target, command.occurred_at.unix_millis()),
                 run_status_value(command.expected_current),
                 provider_namespace,
+                provider_runtime_id,
+                provider_session_id,
                 provider_run_id,
             ],
         )
@@ -1608,27 +1679,30 @@ impl AppStore for SqliteStore {
                     )));
                 }
             }
-            let (namespace, provider_run_id) =
-                command
-                    .provider_run
-                    .as_ref()
-                    .map_or((None, None), |provider| {
-                        (
-                            Some(provider.namespace().to_owned()),
-                            Some(provider.value().to_owned()),
-                        )
-                    });
+            let (namespace, runtime_id, session_id, provider_run_id) = command
+                .provider_run
+                .as_ref()
+                .map_or((None, None, None, None), |provider| {
+                    (
+                        Some(provider.namespace().to_owned()),
+                        Some(provider.runtime_id().to_owned()),
+                        Some(provider.session_id().to_owned()),
+                        Some(provider.run_id().to_owned()),
+                    )
+                });
             transaction
                 .execute(
                     "INSERT INTO runs
                      (id, connection_id, work_item_id, status, provider_namespace,
-                      provider_run_id, created_at_ms)
-                     VALUES (?1, ?2, ?3, 'starting', ?4, ?5, ?6)",
+                      provider_runtime_id, provider_session_id, provider_run_id, created_at_ms)
+                     VALUES (?1, ?2, ?3, 'starting', ?4, ?5, ?6, ?7, ?8)",
                     params![
                         command.id.to_string(),
                         command.connection_id.to_string(),
                         command.work_item_id.to_string(),
                         namespace,
+                        runtime_id,
+                        session_id,
                         provider_run_id,
                         now.unix_millis()
                     ],
@@ -2553,7 +2627,9 @@ mod tests {
                 run_id: run.id,
                 expected_current: RunStatus::Starting,
                 target: RunStatus::Running,
-                provider_id: Some(NamespacedProviderId::new("mock", "run-1").unwrap()),
+                provider_id: Some(
+                    ProviderRunIdentity::new("mock", "runtime-1", "session-1", "run-1").unwrap(),
+                ),
                 occurred_at: UtcTimestamp::from_unix_millis(42),
                 audit_event_id: ids.next_audit_event_id(),
             })

@@ -9,10 +9,10 @@ use thiserror::Error as ThisError;
 use yakshed_domain::{
     ApprovalDecision, ApprovalRequestId, ApprovalSnapshot, ArtifactId, ArtifactRecord,
     AuditEventId, Connection, ConnectionId, CredentialBinding, CredentialSlot,
-    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderStateRootId, RunId, RunSnapshot,
-    RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings, SecretLocator, StreamCursor,
-    TimelineBatchId, TimelineItemId, TimelineItemSnapshot, TimelineRevision, UtcTimestamp,
-    WorkItemId, WorkItemSnapshot,
+    NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderRunIdentity, ProviderStateRootId,
+    RunId, RunSnapshot, RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings,
+    SecretLocator, StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot,
+    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
 };
 
 mod run_supervisor;
@@ -597,7 +597,7 @@ pub struct CreateRun {
     pub id: RunId,
     pub connection_id: ConnectionId,
     pub work_item_id: WorkItemId,
-    pub provider_run: Option<NamespacedProviderId>,
+    pub provider_run: Option<ProviderRunIdentity>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -605,7 +605,7 @@ pub struct TransitionRun {
     pub run_id: RunId,
     pub expected_current: RunStatus,
     pub target: RunStatus,
-    pub provider_id: Option<NamespacedProviderId>,
+    pub provider_id: Option<ProviderRunIdentity>,
     pub occurred_at: UtcTimestamp,
     pub audit_event_id: AuditEventId,
 }

@@ -17,7 +17,7 @@ use yakshed_application::{
     SystemIdGenerator, TransitionRun,
 };
 use yakshed_domain::{
-    ApprovalDecision, ApprovalStatus, ConnectionId, NamespacedProviderId, RunId, RunStatus,
+    ApprovalDecision, ApprovalStatus, ConnectionId, ProviderRunIdentity, RunId, RunStatus,
     UtcTimestamp, WorkItemId,
 };
 use yakshed_harness::{
@@ -29,6 +29,10 @@ use yakshed_harness::{
 use yakshed_store::{AppPaths, SqliteStore};
 
 const CONNECTION: &str = "0193f26e-7a72-7000-8000-00000000aaa1";
+
+fn provider_run(value: &str) -> ProviderRunIdentity {
+    ProviderRunIdentity::new("mock", "runtime", "session", value).unwrap()
+}
 
 struct FixedClock;
 
@@ -1278,9 +1282,7 @@ async fn startup_reconnect_false_transitions_starting_to_outcome_unknown() {
             id: SystemIdGenerator.next_run_id(),
             connection_id: connection_id(),
             work_item_id: context.work_item_id,
-            provider_run: Some(
-                NamespacedProviderId::new("mock", "run-starting-no-bridge").unwrap(),
-            ),
+            provider_run: Some(provider_run("run-starting-no-bridge")),
         })
         .await
         .unwrap();
@@ -1370,7 +1372,7 @@ async fn startup_reconnect_false_transitions_running_to_disconnected() {
             id: SystemIdGenerator.next_run_id(),
             connection_id: connection_id(),
             work_item_id: context.work_item_id,
-            provider_run: Some(NamespacedProviderId::new("mock", "run-running-no-bridge").unwrap()),
+            provider_run: Some(provider_run("run-running-no-bridge")),
         })
         .await
         .unwrap();
@@ -1380,7 +1382,7 @@ async fn startup_reconnect_false_transitions_running_to_disconnected() {
             run_id: run.id,
             expected_current: RunStatus::Starting,
             target: RunStatus::Running,
-            provider_id: Some(NamespacedProviderId::new("mock", "run-running-no-bridge").unwrap()),
+            provider_id: Some(provider_run("run-running-no-bridge")),
             occurred_at: FixedClock.now(),
             audit_event_id: SystemIdGenerator.next_audit_event_id(),
         })

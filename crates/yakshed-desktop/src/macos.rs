@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::Read,
     path::PathBuf,
@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use provider_codex::{CodexAdapter, CodexRuntimeKey, CodexRuntimeSpec};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use yakshed_application::{
     ArtifactPort, ArtifactPortError, CachePort, CachePortError, ConfigChange,
     ConfigConnectionSnapshot, ConfigPort, ConfigPortError, ConfigSnapshot, HarnessPortError,
@@ -40,6 +40,7 @@ use yakshed_store::{
 
 const LOCAL_BACKEND_ID: &str = "local-file";
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+const PENDING_EVENT_CAPACITY: usize = 128;
 
 pub fn run() {
     let state = match tauri::async_runtime::block_on(compose()) {
@@ -330,13 +331,22 @@ struct CodexHarness {
     run_state: StdMutex<RunState>,
     event_sender: mpsc::Sender<HarnessEvent>,
     events: Mutex<mpsc::Receiver<HarnessEvent>>,
+    event_ready: Notify,
 }
 
 #[derive(Default)]
 struct RunState {
-    runs: HashMap<ProviderRunRef, (Arc<CodexAdapter>, ProviderRunHandle)>,
+    providers: HashMap<ConnectionId, ProviderState>,
+    runs: HashMap<ProviderRunRef, (ConnectionId, RunId, ProviderRunHandle)>,
     native_refs: HashMap<ProviderRunHandle, ProviderRunRef>,
     correlations: HashMap<RunId, ProviderRunRef>,
+    pending_events: HashMap<ProviderRunHandle, VecDeque<HarnessEvent>>,
+    replay_events: VecDeque<HarnessEvent>,
+}
+
+struct ProviderState {
+    provider_state: String,
+    adapter: Arc<CodexAdapter>,
 }
 
 impl CodexHarness {
@@ -348,6 +358,7 @@ impl CodexHarness {
             run_state: StdMutex::new(RunState::default()),
             event_sender,
             events: Mutex::new(events),
+            event_ready: Notify::new(),
         }
     }
 
@@ -387,6 +398,89 @@ impl CodexHarness {
         });
     }
 
+    fn adapter(&self, connection: &Connection) -> Result<Arc<CodexAdapter>, HarnessPortError> {
+        let mut state = self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(provider) = state.providers.get(&connection.id) {
+            if provider.provider_state == connection.provider_state.as_str() {
+                return Ok(provider.adapter.clone());
+            }
+            if state
+                .runs
+                .values()
+                .any(|(connection_id, _, _)| *connection_id == connection.id)
+            {
+                return Err(HarnessPortError::Conflict(format!(
+                    "connection {} changed provider state while active",
+                    connection.id
+                )));
+            }
+            state.providers.remove(&connection.id);
+        }
+        let (adapter, stream) = Self::provider(&self.paths, connection)?;
+        Self::forward(stream, self.event_sender.clone());
+        state.providers.insert(
+            connection.id,
+            ProviderState {
+                provider_state: connection.provider_state.to_string(),
+                adapter: adapter.clone(),
+            },
+        );
+        Ok(adapter)
+    }
+
+    fn register_run(
+        &self,
+        connection_id: ConnectionId,
+        correlation_id: RunId,
+        native: ProviderRunHandle,
+    ) -> Result<ProviderRunRef, HarnessPortError> {
+        let run = ProviderRunRef::from_parts(
+            "codex",
+            native.runtime().as_str(),
+            native.session_id().as_str(),
+            native.native_id().as_str(),
+        )
+        .map_err(|error| HarnessPortError::InvalidInput(error.to_string()))?;
+        let mut state = self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.native_refs.insert(native.clone(), run.clone());
+        state
+            .runs
+            .insert(run.clone(), (connection_id, correlation_id, native.clone()));
+        state.correlations.insert(correlation_id, run.clone());
+        if let Some(events) = state.pending_events.remove(&native) {
+            state.replay_events.extend(events);
+            self.event_ready.notify_one();
+        }
+        Ok(run)
+    }
+
+    fn native_run(
+        &self,
+        run: &ProviderRunRef,
+    ) -> Result<(Arc<CodexAdapter>, ProviderRunHandle), HarnessPortError> {
+        let state = self
+            .run_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (connection_id, _, native) = state
+            .runs
+            .get(run)
+            .cloned()
+            .ok_or_else(|| HarnessPortError::NotFound(run.native_id().to_owned()))?;
+        let adapter = state
+            .providers
+            .get(&connection_id)
+            .map(|provider| provider.adapter.clone())
+            .ok_or_else(|| HarnessPortError::NotFound(connection_id.to_string()))?;
+        Ok((adapter, native))
+    }
+
     fn run_ref(&self, run: &ProviderRunHandle) -> Result<ProviderRunRef, HarnessPortError> {
         self.run_state
             .lock()
@@ -397,17 +491,17 @@ impl CodexHarness {
             .ok_or_else(|| HarnessPortError::NotFound(run.to_string()))
     }
 
-    async fn native_run(
-        &self,
-        run: &ProviderRunRef,
-    ) -> Result<(Arc<CodexAdapter>, ProviderRunHandle), HarnessPortError> {
-        self.run_state
+    fn retire_run(&self, native: &ProviderRunHandle) {
+        let mut state = self
+            .run_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .runs
-            .get(run)
-            .cloned()
-            .ok_or_else(|| HarnessPortError::NotFound(run.native_id().to_owned()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(run) = state.native_refs.remove(native) else {
+            return;
+        };
+        if let Some((_, correlation_id, _)) = state.runs.remove(&run) {
+            state.correlations.remove(&correlation_id);
+        }
     }
 }
 
@@ -443,10 +537,7 @@ impl RunHarness for CodexHarness {
                 connection.id, connection.harness
             )));
         }
-        let (adapter, stream) = Self::provider(&self.paths, &connection)?;
-        Self::forward(stream, self.event_sender.clone());
-        let run = ProviderRunRef::new("codex", correlation_id.to_string())
-            .map_err(|error| HarnessPortError::InvalidInput(error.to_string()))?;
+        let adapter = self.adapter(&connection)?;
         let session = adapter
             .start_session(
                 &RuntimeHandle::new(format!("codex-{connection_id}")).map_err(map_harness_error)?,
@@ -466,32 +557,33 @@ impl RunHarness for CodexHarness {
             )
             .await
             .map_err(map_harness_error)?;
-        let mut state = self
-            .run_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.native_refs.insert(native.clone(), run.clone());
-        state.runs.insert(run.clone(), (adapter, native));
-        state.correlations.insert(correlation_id, run.clone());
-        Ok(run)
+        self.register_run(connection_id, correlation_id, native)
     }
 
     async fn lookup_run(
         &self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         correlation_id: RunId,
     ) -> Result<Option<ProviderRunRef>, HarnessPortError> {
-        Ok(self
+        let state = self
             .run_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let run = state
             .correlations
             .get(&correlation_id)
-            .cloned())
+            .filter(|run| {
+                state
+                    .runs
+                    .get(*run)
+                    .is_some_and(|(owner, _, _)| *owner == connection_id)
+            })
+            .cloned();
+        Ok(run)
     }
 
     async fn steer(&self, run: &ProviderRunRef, input: String) -> Result<(), HarnessPortError> {
-        let (adapter, native) = self.native_run(run).await?;
+        let (adapter, native) = self.native_run(run)?;
         adapter
             .steer(
                 &native,
@@ -502,7 +594,7 @@ impl RunHarness for CodexHarness {
     }
 
     async fn interrupt(&self, run: &ProviderRunRef) -> Result<(), HarnessPortError> {
-        let (adapter, native) = self.native_run(run).await?;
+        let (adapter, native) = self.native_run(run)?;
         adapter.interrupt(&native).await.map_err(map_harness_error)
     }
 
@@ -511,7 +603,7 @@ impl RunHarness for CodexHarness {
         request: ProviderRequestRef,
         response: HarnessResponse,
     ) -> Result<(), HarnessPortError> {
-        let (adapter, native) = self.native_run(&request.run).await?;
+        let (adapter, native) = self.native_run(&request.run)?;
         let request = ProviderRequestHandle::new(
             native,
             request.native_id.parse().map_err(map_harness_error)?,
@@ -527,9 +619,53 @@ impl RunHarness for CodexHarness {
     }
 
     async fn next_event(&self) -> Result<Option<RunHarnessEvent>, HarnessPortError> {
-        match self.events.lock().await.recv().await {
-            Some(event) => self.convert_event(event).map(Some),
-            None => Ok(None),
+        loop {
+            let replay = {
+                self.run_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .replay_events
+                    .pop_front()
+            };
+            if let Some(event) = replay {
+                return self.convert_event(event).map(Some);
+            }
+            let notified = self.event_ready.notified();
+            let mut events = self.events.lock().await;
+            let event = tokio::select! {
+                biased;
+                () = notified => continue,
+                event = events.recv() => event,
+            };
+            drop(events);
+            let Some(event) = event else {
+                return Ok(None);
+            };
+            let mut state = self
+                .run_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(native) = event_run(&event)
+                && !state.native_refs.contains_key(native)
+            {
+                if state
+                    .pending_events
+                    .values()
+                    .map(VecDeque::len)
+                    .sum::<usize>()
+                    >= PENDING_EVENT_CAPACITY
+                {
+                    return Err(HarnessPortError::Overloaded);
+                }
+                state
+                    .pending_events
+                    .entry(native.clone())
+                    .or_default()
+                    .push_back(event);
+                continue;
+            }
+            drop(state);
+            return self.convert_event(event).map(Some);
         }
     }
 
@@ -545,7 +681,11 @@ impl RunHarness for CodexHarness {
 
 impl CodexHarness {
     fn convert_event(&self, event: HarnessEvent) -> Result<RunHarnessEvent, HarnessPortError> {
-        Ok(match event {
+        let terminal = match &event {
+            HarnessEvent::RunTerminal { run, .. } => Some(run.clone()),
+            _ => None,
+        };
+        let converted = match event {
             HarnessEvent::RunAccepted { run, .. } => RunHarnessEvent::RunAccepted {
                 run: self.run_ref(&run)?,
             },
@@ -643,7 +783,11 @@ impl CodexHarness {
                 item_type,
                 native: native.sanitized_raw().to_owned(),
             },
-        })
+        };
+        if let Some(native) = terminal {
+            self.retire_run(&native);
+        }
+        Ok(converted)
     }
 
     fn request_ref(
@@ -654,6 +798,23 @@ impl CodexHarness {
             run: self.run_ref(request.run())?,
             native_id: request.native_id().to_string(),
         })
+    }
+}
+
+fn event_run(event: &HarnessEvent) -> Option<&ProviderRunHandle> {
+    match event {
+        HarnessEvent::RunAccepted { run, .. }
+        | HarnessEvent::MessageDelta { run, .. }
+        | HarnessEvent::MessageCompleted { run, .. }
+        | HarnessEvent::FileMutation { run, .. }
+        | HarnessEvent::CommandOutputDelta { run, .. }
+        | HarnessEvent::CommandOutputCompleted { run, .. }
+        | HarnessEvent::RunTerminal { run, .. } => Some(run),
+        HarnessEvent::ApprovalRequested { request, .. }
+        | HarnessEvent::UserInputRequested { request, .. } => Some(request.run()),
+        HarnessEvent::Unknown { run, .. } | HarnessEvent::MalformedNativePayload { run, .. } => {
+            run.as_ref()
+        }
     }
 }
 
@@ -931,48 +1092,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_native_run_is_retained_under_a_bounded_reference() {
+    async fn early_event_replays_after_lossless_registration_and_terminal_retires_run() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_test(temp.path());
         let config = test_config(&paths);
-        let harness = CodexHarness::new(paths, config);
+        let harness = Arc::new(CodexHarness::new(paths, config));
         let codex = connection(
             "0193f26e-7a72-7000-8000-00000000d003",
             "codex",
             "codex-long-run",
         );
-        let (adapter, _) = CodexHarness::provider(&harness.paths, &codex).unwrap();
+        let adapter = harness.adapter(&codex).unwrap();
+        assert!(Arc::ptr_eq(&adapter, &harness.adapter(&codex).unwrap()));
         let component = "x".repeat(4096);
         let native = ProviderRunHandle::new(
             RuntimeHandle::new(component.clone()).unwrap(),
             ProviderSessionId::new(component.clone()).unwrap(),
-            ProviderRunId::new(component).unwrap(),
+            ProviderRunId::new(component.clone()).unwrap(),
         );
         assert!(ProviderRunRef::new("codex", native.to_string()).is_err());
-        let run =
-            ProviderRunRef::new("codex", SystemIdGenerator.next_run_id().to_string()).unwrap();
-        {
-            let mut state = harness.run_state.lock().unwrap();
-            state.native_refs.insert(native.clone(), run.clone());
-            state
-                .runs
-                .insert(run.clone(), (adapter.clone(), native.clone()));
-        }
-        assert_eq!(harness.native_run(&run).await.unwrap().1, native);
 
         harness
             .event_sender
             .send(HarnessEvent::RunAccepted {
-                run: native,
+                run: native.clone(),
                 native: NativePayload::sanitized("{}"),
             })
             .await
             .unwrap();
+        let waiting = tokio::spawn({
+            let harness = harness.clone();
+            async move { harness.next_event().await }
+        });
+        for _ in 0..100 {
+            let buffered = harness
+                .run_state
+                .lock()
+                .unwrap()
+                .pending_events
+                .contains_key(&native);
+            if buffered {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            harness
+                .run_state
+                .lock()
+                .unwrap()
+                .pending_events
+                .contains_key(&native),
+            "early event was not buffered"
+        );
+        let correlation_id = SystemIdGenerator.next_run_id();
+        let run = harness
+            .register_run(codex.id, correlation_id, native.clone())
+            .unwrap();
 
         assert_eq!(
-            harness.next_event().await.unwrap(),
+            waiting.await.unwrap().unwrap(),
             Some(RunHarnessEvent::RunAccepted { run })
         );
+        let run = harness
+            .lookup_run(codex.id, correlation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.runtime_id(), component);
+        assert_eq!(run.session_id(), component);
+        assert_eq!(run.native_id(), component);
+        assert_eq!(harness.native_run(&run).unwrap().1, native);
+
+        harness
+            .event_sender
+            .send(HarnessEvent::RunTerminal {
+                run: native,
+                state: HarnessRunTerminal::Completed,
+                native: NativePayload::sanitized("{}"),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            harness.next_event().await.unwrap(),
+            Some(RunHarnessEvent::RunTerminal { .. })
+        ));
+        let state = harness.run_state.lock().unwrap();
+        assert_eq!(state.providers.len(), 1);
+        assert!(state.runs.is_empty());
+        assert!(state.native_refs.is_empty());
+        assert!(state.correlations.is_empty());
+        drop(state);
+
+        let changed = connection(
+            "0193f26e-7a72-7000-8000-00000000d003",
+            "codex",
+            "codex-reconfigured",
+        );
+        let replacement = harness.adapter(&changed).unwrap();
+        assert!(!Arc::ptr_eq(&adapter, &replacement));
+        assert_eq!(harness.run_state.lock().unwrap().providers.len(), 1);
     }
 
     #[tokio::test]

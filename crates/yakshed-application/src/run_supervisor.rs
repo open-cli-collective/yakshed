@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 use yakshed_domain::{
-    ApprovalDecision, ApprovalRequestId, ApprovalStatus, ConnectionId, NamespacedProviderId, RunId,
-    RunSnapshot, RunStatus, StreamCursor, TimelineItemId, WorkItemId,
+    ApprovalDecision, ApprovalRequestId, ApprovalStatus, ConnectionId, NamespacedProviderId,
+    ProviderRunIdentity, RunId, RunSnapshot, RunStatus, StreamCursor, TimelineItemId, WorkItemId,
 };
 
 use crate::{
@@ -26,14 +26,27 @@ const MAX_UNCERTAIN_STARTS: usize = 64;
 const STREAM_FAILURE_OPERATION: &str = "stream_disconnected";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ProviderRunRef(NamespacedProviderId);
+pub struct ProviderRunRef(ProviderRunIdentity);
 
 impl ProviderRunRef {
     pub fn new(
         namespace: impl Into<String>,
         native_id: impl Into<String>,
     ) -> Result<Self, RunOrchestrationError> {
-        NamespacedProviderId::new(namespace, native_id)
+        let namespace = namespace.into();
+        let native_id = native_id.into();
+        ProviderRunIdentity::new(&namespace, &namespace, &native_id, &native_id)
+            .map(Self)
+            .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))
+    }
+
+    pub fn from_parts(
+        namespace: impl Into<String>,
+        runtime_id: impl Into<String>,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+    ) -> Result<Self, RunOrchestrationError> {
+        ProviderRunIdentity::new(namespace, runtime_id, session_id, run_id)
             .map(Self)
             .map_err(|error| RunOrchestrationError::InvalidProviderId(error.to_string()))
     }
@@ -43,10 +56,18 @@ impl ProviderRunRef {
     }
 
     pub fn native_id(&self) -> &str {
-        self.0.value()
+        self.0.run_id()
     }
 
-    fn provider_id(&self) -> NamespacedProviderId {
+    pub fn runtime_id(&self) -> &str {
+        self.0.runtime_id()
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.0.session_id()
+    }
+
+    fn provider_id(&self) -> ProviderRunIdentity {
         self.0.clone()
     }
 }
@@ -1453,7 +1474,7 @@ impl Inner {
         run_id: RunId,
         expected_current: RunStatus,
         status: RunStatus,
-        provider_id: Option<NamespacedProviderId>,
+        provider_id: Option<ProviderRunIdentity>,
     ) -> Result<RunSnapshot, StoreError> {
         let snapshot = self
             .store
