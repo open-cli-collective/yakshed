@@ -125,7 +125,7 @@ export interface Connection extends ConnectionInput {}
 export interface ConnectionEnvelope { config_revision: number; connection: Connection }
 export type CredentialMigrationStatus =
   | { status: "ready" }
-  | { status: "pending"; reason: "locked" | "denied" | "unavailable" | "failed" | "cleanup_required" };
+  | { status: "pending"; reason: "locked" | "denied" | "unavailable" | "collision" | "failed" | "cleanup_required" };
 export interface ConnectionList {
   config_revision: number;
   connections: Connection[];

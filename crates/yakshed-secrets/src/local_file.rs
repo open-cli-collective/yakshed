@@ -124,7 +124,14 @@ impl LocalFileBackend {
     /// inode across purge. Manual deletion of both files is safe only with all instances stopped.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub async fn purge(&self) -> Result<(), SecretError> {
-        self.run_abandonable(|state, abandoned| state.purge(abandoned))
+        self.run_abandonable(|state, abandoned| state.purge(abandoned, true))
+            .await
+    }
+
+    /// Removes the legacy store after config durably names another backend as canonical.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub async fn purge_after_migration(&self) -> Result<(), SecretError> {
+        self.run_abandonable(|state, abandoned| state.purge(abandoned, false))
             .await
     }
 
@@ -256,7 +263,7 @@ impl LocalFileState {
         )
     }
 
-    fn purge(&self, abandoned: &AtomicBool) -> Result<(), SecretError> {
+    fn purge(&self, abandoned: &AtomicBool, validate_contents: bool) -> Result<(), SecretError> {
         let initialized = self.initialized()?;
         self.with_process_lock(&initialized, Some(abandoned), || {
             validate_parent(&initialized.path, &self.id)?;
@@ -269,7 +276,11 @@ impl LocalFileState {
                 });
             }
             if initialized.path.exists() {
-                self.load(&initialized.path)?;
+                if validate_contents {
+                    self.load(&initialized.path)?;
+                } else {
+                    validate_store_if_present(&initialized.path, &self.id)?;
+                }
                 best_effort_zero(&initialized.path);
             }
 

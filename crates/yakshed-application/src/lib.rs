@@ -370,6 +370,7 @@ pub enum CredentialMigrationPendingReason {
     Locked,
     Denied,
     Unavailable,
+    Collision,
     Failed,
     CleanupRequired,
 }
