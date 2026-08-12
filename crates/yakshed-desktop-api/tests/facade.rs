@@ -1798,6 +1798,7 @@ fn map_config_store_error(error: yakshed_store::ConfigError) -> ConfigPortError 
             ConfigPortError::Conflict { expected, actual }
         }
         yakshed_store::ConfigError::Validation(_)
+        | yakshed_store::ConfigError::InvalidMigrationTransition(_)
         | yakshed_store::ConfigError::SecretBackendConfiguration(_) => ConfigPortError::Validation,
         yakshed_store::ConfigError::UnsupportedSchema { .. }
         | yakshed_store::ConfigError::Parse(_)

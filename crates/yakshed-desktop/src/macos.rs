@@ -186,6 +186,16 @@ where
                 CredentialMigrationStatus::Ready
             };
         }
+        if snapshot
+            .config
+            .secret_backends
+            .iter()
+            .any(|backend| backend.id == target_config.id && backend != target_config)
+        {
+            return CredentialMigrationStatus::Pending(
+                CredentialMigrationPendingReason::TargetInUse,
+            );
+        }
         if configured_local_file_owns_path(
             &snapshot.config.secret_backends,
             &source_path,
@@ -197,6 +207,33 @@ where
                 CredentialMigrationPendingReason::SourceInUse,
             );
         }
+        let source = match LocalFileBackend::from_config(legacy_config) {
+            Ok(source) => source,
+            Err(_) => return pending(SecretErrorClass::Failed),
+        };
+        let mut locators = if exists {
+            match source.locators().await {
+                Ok(locators) => locators,
+                Err(error) => return pending(classify_secret_error(&error)),
+            }
+        } else {
+            Vec::new()
+        };
+        locators.extend(snapshot.config.connections.iter().flat_map(|connection| {
+            connection
+                .credentials
+                .iter()
+                .filter_map(|credential| match &credential.binding {
+                    CredentialBinding::Secret { reference }
+                        if reference.backend_id == legacy_config.id =>
+                    {
+                        Some(reference.locator.clone())
+                    }
+                    _ => None,
+                })
+        }));
+        locators.sort();
+        locators.dedup();
         snapshot = match store
             .update(
                 snapshot.revision,
@@ -204,6 +241,7 @@ where
                     source: legacy_config.clone(),
                     target: target_config.clone(),
                     phase: CredentialMigrationPhase::Copying,
+                    locators,
                     receipts: Vec::new(),
                 }),
             )
@@ -249,25 +287,16 @@ where
     if !exists {
         return CredentialMigrationStatus::Pending(CredentialMigrationPendingReason::MissingSource);
     }
-    let mut locators = match source.locators().await {
+    let source_locators = match source.locators().await {
         Ok(locators) => locators,
         Err(error) => return pending(classify_secret_error(&error)),
     };
-    locators.extend(snapshot.config.connections.iter().flat_map(|connection| {
-        connection
-            .credentials
-            .iter()
-            .filter_map(|credential| match &credential.binding {
-                CredentialBinding::Secret { reference }
-                    if reference.backend_id == record.source.id =>
-                {
-                    Some(reference.locator.clone())
-                }
-                _ => None,
-            })
-    }));
-    locators.sort();
-    locators.dedup();
+    if source_locators
+        .iter()
+        .any(|locator| !record.locators.contains(locator))
+    {
+        return pending(SecretErrorClass::Failed);
+    }
     let context = SecretAccessContext {
         connection_id: "0193f26e-7a72-7000-8000-00000000f001"
             .parse()
@@ -282,7 +311,7 @@ where
         .iter()
         .map(|receipt| (receipt.locator.clone(), receipt.state))
         .collect::<HashMap<_, _>>();
-    for locator in locators {
+    for locator in record.locators {
         let secret = match source.resolve(&locator, &context).await {
             Ok(secret) => secret,
             Err(SecretError::NotFound { .. }) => {
@@ -1255,9 +1284,9 @@ fn map_config_error(error: ConfigError) -> ConfigPortError {
         ConfigError::Conflict { expected, actual } => {
             ConfigPortError::Conflict { expected, actual }
         }
-        ConfigError::Validation(_) | ConfigError::SecretBackendConfiguration(_) => {
-            ConfigPortError::Validation
-        }
+        ConfigError::Validation(_)
+        | ConfigError::InvalidMigrationTransition(_)
+        | ConfigError::SecretBackendConfiguration(_) => ConfigPortError::Validation,
         ConfigError::UnsupportedSchema { .. }
         | ConfigError::Parse(_)
         | ConfigError::Serialize(_)
@@ -1439,6 +1468,7 @@ mod tests {
         store: &ConfigStore,
         legacy: &SecretBackend,
         target: &SecretBackend,
+        locators: &[SecretLocator],
     ) {
         let snapshot = store.snapshot();
         let snapshot = store
@@ -1448,11 +1478,27 @@ mod tests {
                     source: legacy.clone(),
                     target: target.clone(),
                     phase: CredentialMigrationPhase::Copying,
+                    locators: locators.to_vec(),
                     receipts: Vec::new(),
                 }),
             )
             .await
             .unwrap();
+        let mut snapshot = snapshot;
+        for locator in locators {
+            for state in [CredentialCopyState::Copying, CredentialCopyState::Copied] {
+                snapshot = store
+                    .update(
+                        snapshot.revision,
+                        ConfigChange::RecordCredentialCopy {
+                            locator: locator.clone(),
+                            state,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
         store
             .update(
                 snapshot.revision,
@@ -1521,6 +1567,7 @@ mod tests {
                     source: legacy.clone(),
                     target: target_config.clone(),
                     phase: CredentialMigrationPhase::Copying,
+                    locators: locators.clone(),
                     receipts: Vec::new(),
                 }),
             )
@@ -1604,7 +1651,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        checkpoint_migration(&store, &legacy, &target_config).await;
+        checkpoint_migration(&store, &legacy, &target_config, &locators).await;
         fs::set_permissions(&paths.data_root, fs::Permissions::from_mode(0o500)).unwrap();
 
         assert_eq!(
@@ -1642,7 +1689,7 @@ mod tests {
             )
             .await
             .unwrap();
-        checkpoint_migration(&store, &legacy, &target_config).await;
+        checkpoint_migration(&store, &legacy, &target_config, &locators).await;
 
         assert_eq!(
             migrate_interim_secrets(&paths, &store, &legacy, &target_config, &target).await,
@@ -1730,6 +1777,52 @@ mod tests {
                 .await
                 .unwrap()
                 .expose(|value| value == "migration-canary-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn nonidentical_backend_using_target_id_defers_before_copying() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let (store, legacy, locators) = plaintext_fixture(&paths).await;
+        let target_config = local_backend();
+        let hijacker = SecretBackend {
+            id: target_config.id.clone(),
+            settings: SecretBackendSettings::LocalFile {
+                path: paths
+                    .data_root
+                    .join("other-secrets.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        };
+        let snapshot = store.snapshot();
+        store
+            .update(
+                snapshot.revision,
+                ConfigChange::PutSecretBackend(hijacker.clone()),
+            )
+            .await
+            .unwrap();
+        let target = MemorySecretBackend::new(target_config.id.clone());
+
+        assert_eq!(
+            migrate_interim_secrets(&paths, &store, &legacy, &target_config, &target).await,
+            CredentialMigrationStatus::Pending(CredentialMigrationPendingReason::TargetInUse)
+        );
+        let snapshot = store.snapshot();
+        assert!(snapshot.config.credential_migration.is_none());
+        assert!(snapshot.config.secret_backends.contains(&hijacker));
+        assert!(matches!(
+            target.resolve(&locators[0], &migration_context()).await,
+            Err(SecretError::NotFound { .. })
+        ));
+        assert!(
+            LocalFileBackend::from_config(&legacy)
+                .unwrap()
+                .resolve(&locators[0], &migration_context())
+                .await
+                .is_ok()
         );
     }
 

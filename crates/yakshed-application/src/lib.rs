@@ -33,6 +33,7 @@ pub struct CredentialMigrationRecord {
     pub source: SecretBackend,
     pub target: SecretBackend,
     pub phase: CredentialMigrationPhase,
+    pub locators: Vec<SecretLocator>,
     pub receipts: Vec<CredentialCopyReceipt>,
 }
 
@@ -136,6 +137,16 @@ impl AppConfig {
                     "credential migration contains duplicate receipts",
                 ));
             }
+            let manifest = migration.locators.iter().collect::<HashSet<_>>();
+            if manifest.len() != migration.locators.len()
+                || receipt_locators
+                    .iter()
+                    .any(|locator| !manifest.contains(locator))
+            {
+                return Err(ConfigValidationError::invalid(
+                    "credential migration manifest is invalid",
+                ));
+            }
             let source_configured = self
                 .secret_backends
                 .iter()
@@ -144,6 +155,20 @@ impl AppConfig {
                 .secret_backends
                 .iter()
                 .any(|backend| backend == &migration.target);
+            if self
+                .secret_backends
+                .iter()
+                .any(|backend| backend.id == migration.target.id && backend != &migration.target)
+            {
+                return Err(ConfigValidationError::invalid(
+                    "credential migration target id is already in use",
+                ));
+            }
+            let all_copied = migration.locators.iter().all(|locator| {
+                migration.receipts.iter().any(|receipt| {
+                    receipt.locator == *locator && receipt.state == CredentialCopyState::Copied
+                })
+            });
             match migration.phase {
                 CredentialMigrationPhase::Copying if !source_configured => {
                     return Err(ConfigValidationError::invalid(
@@ -151,10 +176,10 @@ impl AppConfig {
                     ));
                 }
                 CredentialMigrationPhase::CleanupPending
-                    if source_configured || !target_configured =>
+                    if source_configured || !target_configured || !all_copied =>
                 {
                     return Err(ConfigValidationError::invalid(
-                        "cleanup credential migration requires only its target backend",
+                        "cleanup credential migration requires its target and a fully copied manifest",
                     ));
                 }
                 _ => {}
@@ -447,6 +472,7 @@ pub enum CredentialMigrationPendingReason {
     Collision,
     MissingSource,
     SourceInUse,
+    TargetInUse,
     Failed,
     CleanupRequired,
 }
