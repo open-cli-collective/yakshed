@@ -231,8 +231,9 @@ kind = "local-os"
 
 [[secret_backends]]
 id = "onepassword-work"
-kind = "onepassword-cli"
+kind = "onepassword"
 account = "work"
+executable = "/opt/homebrew/bin/op"
 
 [[connections]]
 id = "0193f26e-7a72-7d42-bf77-0de14c4cc111"
@@ -436,11 +437,12 @@ The config locator can be the account portion. The backend owns the physical map
 YakShed v1 MUST NOT silently fall back to memory, plaintext, a sample store, or an encrypted file.
 An encrypted-file backend can be added later as an explicit store with an explicit unlock lifecycle.
 
-### 9.2 `onepassword-cli`
+### 9.2 `onepassword`
 
 Use the official `op` CLI in the first implementation.
 
-- Read with `op read <secret-reference>`.
+- Read with `op read --no-newline --force <secret-reference>`; this is the only
+  secret-bearing command surface in v1.
 - Use `tokio::process::Command`, never a shell.
 - Pass the reference as one argument.
 - Bound stdout and stderr.
@@ -451,7 +453,7 @@ Use the official `op` CLI in the first implementation.
 - Remove stale `OP_SESSION_*` variables from the spawned helper environment so desktop integration can be used.
 - Prefer desktop integration for interactive local use and service accounts for least-privilege automation.
 
-The initial backend SHOULD be read-only. Writing arbitrary 1Password items creates product and policy decisions
+The initial backend is read-only. Writing arbitrary 1Password items creates product and policy decisions
 about vault structure, item ownership, and overwrite semantics that are not required for initial runtime resolution.
 
 A service-account token used to authenticate `op` is itself an access secret. In v1 it may be supplied by a managed

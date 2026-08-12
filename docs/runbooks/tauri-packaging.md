@@ -21,5 +21,15 @@ or unavailable Keychain leaves the plaintext store and bindings intact, reports 
 in the UI, and retries on the next launch. `local-file` remains available only when explicitly
 configured for development.
 
+Explicit `onepassword` backends are resolve-only and use `op read --no-newline --force`
+with `op://vault/item/field` locators. Validate a real CLI installation manually
+without printing the secret:
+
+```sh
+python3 scripts/validate_onepassword.py --reference 'op://vault/item/field'
+```
+
+This gate is intentionally local-only and must use a user-provided reference.
+
 Playwright remains the CI S7 gate: it drives the built Svelte surface through the mock invoke/event
 factory because Playwright cannot attach to the platform Wry webview on headless Linux.

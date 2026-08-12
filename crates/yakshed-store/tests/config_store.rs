@@ -15,13 +15,14 @@ use yakshed_store::{AppPaths, ConfigError, ConfigStore};
 const BACKEND_CAPABILITIES: &[SecretBackendCapability] = &[
     SecretBackendCapability::available("memory"),
     SecretBackendCapability::available("local-os"),
-    SecretBackendCapability::available("onepassword-cli"),
+    SecretBackendCapability::resolve_only("onepassword"),
     SecretBackendCapability::available("environment"),
     SecretBackendCapability {
         kind: "local-file",
         availability: SecretBackendAvailability::MissingFeature {
             feature: "dev-secrets",
         },
+        access: yakshed_application::SecretBackendAccess::ReadWrite,
     },
 ];
 const LOCAL_FILE_CAPABILITIES: &[SecretBackendCapability] =
@@ -446,8 +447,9 @@ kind = "local-os"
 
 [[secret_backends]]
 id = "onepassword-work"
-kind = "onepassword-cli"
+kind = "onepassword"
 account = "work"
+executable = "/opt/homebrew/bin/op"
 
 [[connections]]
 id = "0193f26e-7a72-7d42-bf77-0de14c4cc111"
@@ -507,6 +509,36 @@ locator = "connection/0193f26e-7a72-7d42-bf77-0de14c4cc333/fireworks_api_key"
     ));
     let written = fs::read_to_string(paths.config_root.join("config.toml")).unwrap();
     assert!(written.contains("authority = \"codex-app-server\""));
+    assert!(written.contains("executable = \"/opt/homebrew/bin/op\""));
     assert!(!written.contains("delivery"));
     assert_eq!(open(paths).unwrap().snapshot().config, snapshot.config);
+}
+
+#[test]
+fn onepassword_locator_shape_is_validated_when_config_loads() {
+    let temp = tempdir().unwrap();
+    let paths = AppPaths::for_test(temp.path());
+    paths.create_config_root().unwrap();
+    let invalid = r#"schema_version = 1
+
+[[secret_backends]]
+id = "onepassword-work"
+kind = "onepassword"
+
+[[connections]]
+id = "0193f26e-7a72-7d42-bf77-0de14c4cc222"
+name = "Work"
+harness = "claude-code"
+model_provider = "anthropic"
+provider_state = "work-claude"
+
+[[connections.credentials]]
+slot = "anthropic.api_key"
+source = "secret"
+backend = "onepassword-work"
+locator = "vault/item/field"
+"#;
+    fs::write(paths.config_root.join("config.toml"), invalid).unwrap();
+
+    assert!(matches!(open(paths), Err(ConfigError::Validation(_))));
 }

@@ -7,6 +7,8 @@ mod local_file;
 mod local_os;
 #[cfg(feature = "dev-secrets")]
 mod memory;
+#[cfg(unix)]
+mod onepassword;
 
 use std::{error::Error, fmt, sync::Arc};
 
@@ -15,8 +17,8 @@ use secrecy::SecretString;
 use time::OffsetDateTime;
 use yakshed_application::SecretPortError;
 pub use yakshed_application::{
-    SecretBackendAvailability, SecretBackendCapability, SecretBackendConfigurationError,
-    validate_backend_configuration,
+    SecretBackendAccess, SecretBackendAvailability, SecretBackendCapability,
+    SecretBackendConfigurationError, validate_backend_configuration,
 };
 pub use yakshed_domain::{
     ConnectionId, CredentialSlot, OperationId, SecretBackend, SecretBackendId,
@@ -33,9 +35,12 @@ pub use local_file::LocalFileBackend;
 pub use local_os::LocalOsBackend;
 #[cfg(feature = "dev-secrets")]
 pub use memory::{MemorySecretBackend, MemorySecretFault};
+#[cfg(unix)]
+pub use onepassword::OnePasswordBackend;
 
 pub const LOCAL_FILE_BACKEND_KIND: &str = "local-file";
 pub const LOCAL_OS_BACKEND_KIND: &str = "local-os";
+pub const ONEPASSWORD_BACKEND_KIND: &str = "onepassword";
 
 #[cfg(target_os = "macos")]
 const LOCAL_OS_CAPABILITY: SecretBackendCapability =
@@ -44,41 +49,57 @@ const LOCAL_OS_CAPABILITY: SecretBackendCapability =
 const LOCAL_OS_CAPABILITY: SecretBackendCapability = SecretBackendCapability {
     kind: LOCAL_OS_BACKEND_KIND,
     availability: SecretBackendAvailability::UnsupportedPlatform,
+    access: SecretBackendAccess::ReadWrite,
+};
+#[cfg(unix)]
+const ONEPASSWORD_CAPABILITY: SecretBackendCapability =
+    SecretBackendCapability::resolve_only(ONEPASSWORD_BACKEND_KIND);
+#[cfg(not(unix))]
+const ONEPASSWORD_CAPABILITY: SecretBackendCapability = SecretBackendCapability {
+    kind: ONEPASSWORD_BACKEND_KIND,
+    availability: SecretBackendAvailability::UnsupportedPlatform,
+    access: SecretBackendAccess::ResolveOnly,
 };
 
 #[cfg(all(feature = "dev-secrets", any(target_os = "macos", target_os = "linux")))]
-const BACKEND_CAPABILITIES: [SecretBackendCapability; 3] = [
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 4] = [
     SecretBackendCapability::available("memory"),
     SecretBackendCapability::available(LOCAL_FILE_BACKEND_KIND),
     LOCAL_OS_CAPABILITY,
+    ONEPASSWORD_CAPABILITY,
 ];
 #[cfg(not(feature = "dev-secrets"))]
-const BACKEND_CAPABILITIES: [SecretBackendCapability; 3] = [
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 4] = [
     SecretBackendCapability {
         kind: "memory",
         availability: SecretBackendAvailability::MissingFeature {
             feature: "dev-secrets",
         },
+        access: SecretBackendAccess::ReadWrite,
     },
     SecretBackendCapability {
         kind: LOCAL_FILE_BACKEND_KIND,
         availability: SecretBackendAvailability::MissingFeature {
             feature: "dev-secrets",
         },
+        access: SecretBackendAccess::ReadWrite,
     },
     LOCAL_OS_CAPABILITY,
+    ONEPASSWORD_CAPABILITY,
 ];
 #[cfg(all(
     feature = "dev-secrets",
     not(any(target_os = "macos", target_os = "linux"))
 ))]
-const BACKEND_CAPABILITIES: [SecretBackendCapability; 3] = [
+const BACKEND_CAPABILITIES: [SecretBackendCapability; 4] = [
     SecretBackendCapability::available("memory"),
     SecretBackendCapability {
         kind: LOCAL_FILE_BACKEND_KIND,
         availability: SecretBackendAvailability::UnsupportedPlatform,
+        access: SecretBackendAccess::ReadWrite,
     },
     LOCAL_OS_CAPABILITY,
+    ONEPASSWORD_CAPABILITY,
 ];
 
 pub const fn backend_capabilities() -> &'static [SecretBackendCapability] {

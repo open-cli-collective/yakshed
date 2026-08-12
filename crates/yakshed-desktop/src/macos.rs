@@ -32,8 +32,9 @@ use yakshed_harness::{
 };
 use yakshed_secrets::{
     BrokerCancellation, CredentialBroker, LocalFileBackend, LocalOsBackend, NoopSecretAuditSink,
-    PutSecretOptions, PutSecretOutcome, SecretAccessContext, SecretAccessPurpose,
-    SecretAdministrator, SecretBackendHandle, SecretError, SecretResolver, backend_capabilities,
+    OnePasswordBackend, PutSecretOptions, PutSecretOutcome, SecretAccessContext,
+    SecretAccessPurpose, SecretAdministrator, SecretBackendHandle, SecretError, SecretResolver,
+    backend_capabilities,
 };
 use yakshed_store::{
     AppPaths, ArtifactError, ArtifactStore, CacheStore, ConfigError, ConfigStore, SqliteStore,
@@ -536,6 +537,12 @@ fn build_backend_handles(
                             resolver: backend.clone(),
                             administrator: Some(backend),
                         }
+                    })
+                }
+                SecretBackendSettings::OnePassword { .. } => {
+                    OnePasswordBackend::from_config(&config).map(|backend| SecretBackendHandle {
+                        resolver: Arc::new(backend),
+                        administrator: None,
                     })
                 }
                 _ => return None,
@@ -2110,9 +2117,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let local_file = legacy_backend(&AppPaths::for_test(temp.path()));
         let local_os = local_backend();
-        let handles = build_backend_handles(vec![local_file.clone(), local_os.clone()]).unwrap();
+        let onepassword = SecretBackend {
+            id: SecretBackendId::new("onepassword-work").unwrap(),
+            settings: SecretBackendSettings::OnePassword {
+                account: Some("work".to_owned()),
+                executable: Some("/definitely/absent/op".to_owned()),
+            },
+        };
+        let handles = build_backend_handles(vec![
+            local_file.clone(),
+            local_os.clone(),
+            onepassword.clone(),
+        ])
+        .unwrap();
 
-        assert_eq!(handles.len(), 2);
+        assert_eq!(handles.len(), 3);
         for backend in [local_file, local_os] {
             let (_, handle) = handles
                 .iter()
@@ -2121,6 +2140,12 @@ mod tests {
             assert_eq!(handle.resolver.descriptor().kind, backend.kind());
             assert!(handle.administrator.is_some());
         }
+        let (_, handle) = handles
+            .iter()
+            .find(|(id, _)| id == &onepassword.id)
+            .unwrap();
+        assert_eq!(handle.resolver.descriptor().kind, "onepassword");
+        assert!(handle.administrator.is_none());
     }
 
     #[tokio::test]

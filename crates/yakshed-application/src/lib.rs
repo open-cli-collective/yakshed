@@ -12,7 +12,7 @@ use yakshed_domain::{
     NamespacedProviderId, ProjectId, ProjectSnapshot, ProviderRunIdentity, ProviderStateRootId,
     RunId, RunSnapshot, RunStatus, SecretBackend, SecretBackendId, SecretBackendSettings,
     SecretLocator, StreamCursor, TimelineBatchId, TimelineItemId, TimelineItemSnapshot,
-    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot,
+    TimelineRevision, UtcTimestamp, WorkItemId, WorkItemSnapshot, validate_onepassword_locator,
 };
 
 mod run_supervisor;
@@ -113,6 +113,15 @@ impl AppConfig {
                         "credential references unknown secret backend: {}",
                         reference.backend_id
                     )));
+                }
+                if let CredentialBinding::Secret { reference } = &credential.binding
+                    && self.secret_backends.iter().any(|backend| {
+                        backend.id == reference.backend_id
+                            && matches!(backend.settings, SecretBackendSettings::OnePassword { .. })
+                    })
+                {
+                    validate_onepassword_locator(&reference.locator)
+                        .map_err(|error| ConfigValidationError::invalid(error.to_string()))?;
                 }
             }
         }
@@ -362,6 +371,7 @@ impl Error for SecretBackendConfigurationError {}
 pub struct SecretBackendCapability {
     pub kind: &'static str,
     pub availability: SecretBackendAvailability,
+    pub access: SecretBackendAccess,
 }
 
 impl SecretBackendCapability {
@@ -369,8 +379,23 @@ impl SecretBackendCapability {
         Self {
             kind,
             availability: SecretBackendAvailability::Available,
+            access: SecretBackendAccess::ReadWrite,
         }
     }
+
+    pub const fn resolve_only(kind: &'static str) -> Self {
+        Self {
+            kind,
+            availability: SecretBackendAvailability::Available,
+            access: SecretBackendAccess::ResolveOnly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretBackendAccess {
+    ReadWrite,
+    ResolveOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

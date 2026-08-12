@@ -295,6 +295,7 @@ fn validation_reports_compiled_but_unsupported_platform() {
         config.validate(&[SecretBackendCapability {
             kind: "local-file",
             availability: SecretBackendAvailability::UnsupportedPlatform,
+            access: yakshed_application::SecretBackendAccess::ReadWrite,
         }]),
         Err(ConfigValidationError::SecretBackend(
             SecretBackendConfigurationError::UnsupportedPlatform {

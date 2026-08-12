@@ -923,10 +923,15 @@ impl SecretBackend {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SecretBackendSettings {
     LocalOs,
-    OnePasswordCli { account: Option<String> },
+    OnePassword {
+        account: Option<String>,
+        executable: Option<String>,
+    },
     Environment,
     Memory,
-    LocalFile { path: String },
+    LocalFile {
+        path: String,
+    },
 }
 
 impl SecretBackendSettings {
@@ -934,14 +939,18 @@ impl SecretBackendSettings {
         kind: &str,
         account: Option<String>,
         path: Option<String>,
+        executable: Option<String>,
     ) -> Result<Self, ValidationError> {
-        let settings = match (kind, account, path) {
-            ("local-os", None, None) => Self::LocalOs,
-            ("onepassword-cli", account, None) => Self::OnePasswordCli { account },
-            ("environment", None, None) => Self::Environment,
-            ("memory", None, None) => Self::Memory,
-            ("local-file", None, Some(path)) => Self::LocalFile { path },
-            ("local-file", None, None) => {
+        let settings = match (kind, account, path, executable) {
+            ("local-os", None, None, None) => Self::LocalOs,
+            ("onepassword", account, None, executable) => Self::OnePassword {
+                account,
+                executable,
+            },
+            ("environment", None, None, None) => Self::Environment,
+            ("memory", None, None, None) => Self::Memory,
+            ("local-file", None, Some(path), None) => Self::LocalFile { path },
+            ("local-file", None, None, None) => {
                 return Err(ValidationError(
                     "local-file secret backend requires a path".to_owned(),
                 ));
@@ -959,7 +968,7 @@ impl SecretBackendSettings {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::LocalOs => "local-os",
-            Self::OnePasswordCli { .. } => "onepassword-cli",
+            Self::OnePassword { .. } => "onepassword",
             Self::Environment => "environment",
             Self::Memory => "memory",
             Self::LocalFile { .. } => "local-file",
@@ -968,13 +977,39 @@ impl SecretBackendSettings {
 
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::OnePasswordCli {
-                account: Some(account),
-            } => require_nonempty("secret backend account", account),
+            Self::OnePassword {
+                account,
+                executable,
+            } => {
+                if let Some(account) = account {
+                    require_nonempty("secret backend account", account)?;
+                }
+                if let Some(executable) = executable {
+                    require_nonempty("secret backend executable", executable)?;
+                }
+                Ok(())
+            }
             Self::LocalFile { path } => require_nonempty("secret backend path", path),
             _ => Ok(()),
         }
     }
+}
+
+pub fn validate_onepassword_locator(locator: &SecretLocator) -> Result<(), ValidationError> {
+    let Some(reference) = locator.as_str().strip_prefix("op://") else {
+        return Err(ValidationError(
+            "onepassword locator must start with op://".to_owned(),
+        ));
+    };
+    if reference.split('/').count() != 3
+        || reference.split('/').any(|component| component.is_empty())
+        || reference.contains(['?', '#'])
+    {
+        return Err(ValidationError(
+            "onepassword locator must be op://vault/item/field".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_nonempty(field: &'static str, value: &str) -> Result<(), ValidationError> {

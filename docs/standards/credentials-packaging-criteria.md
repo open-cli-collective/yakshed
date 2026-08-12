@@ -37,13 +37,13 @@ plaintext file no longer exists, and a second launch is an idempotent no-op.
 
 ## K3. 1Password CLI backend
 
-`onepassword-cli` uses the `op` executable through the existing secret backend
+`onepassword` uses the `op` executable through the existing secret backend
 contract. Absence or unusability is a typed unavailable capability and never a
 desktop startup error.
 
-**Check**: hermetic fake-`op` tests cover put, resolve, delete, typed absence,
-malformed output, and canary redaction without requiring 1Password or network
-access.
+**Check**: hermetic fake-`op` tests cover resolve, the declared resolve-only
+capability, typed absence and locked states, timeout cleanup, malformed output,
+and canary redaction without requiring 1Password or network access.
 
 ## K4. Delegated Codex authentication
 
