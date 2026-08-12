@@ -174,6 +174,8 @@ pub enum HarnessPortError {
     Conflict(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("connection is not authenticated")]
+    NotAuthenticated,
     #[error("runtime overloaded")]
     Overloaded,
     #[error("runtime disconnected")]
@@ -196,8 +198,31 @@ pub enum HarnessResponse {
     UserInput(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AccountStatus {
+    NotAuthenticated,
+    LoginInProgress { login_id: String, auth_url: String },
+    Authenticated { email: Option<String>, plan: String },
+    Unknown,
+}
+
 #[async_trait]
 pub trait RunHarness: Send + Sync {
+    async fn account_status(
+        &self,
+        _connection_id: ConnectionId,
+    ) -> Result<AccountStatus, HarnessPortError> {
+        Err(HarnessPortError::Unsupported("account status".to_owned()))
+    }
+    async fn account_login_start(
+        &self,
+        _connection_id: ConnectionId,
+    ) -> Result<AccountStatus, HarnessPortError> {
+        Err(HarnessPortError::Unsupported("account login".to_owned()))
+    }
+    async fn account_logout(&self, _connection_id: ConnectionId) -> Result<(), HarnessPortError> {
+        Err(HarnessPortError::Unsupported("account logout".to_owned()))
+    }
     async fn start_run(
         &self,
         connection_id: ConnectionId,
@@ -383,6 +408,42 @@ impl State {
 }
 
 impl RunSupervisor {
+    pub async fn account_status(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<AccountStatus, RunOrchestrationError> {
+        self.0.await_startup().await?;
+        self.0
+            .harness
+            .account_status(connection_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn account_login_start(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<AccountStatus, RunOrchestrationError> {
+        self.0.await_startup().await?;
+        self.0
+            .harness
+            .account_login_start(connection_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn account_logout(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<(), RunOrchestrationError> {
+        self.0.await_startup().await?;
+        self.0
+            .harness
+            .account_logout(connection_id)
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn new(
         store: Arc<dyn AppStore>,
         harness: Arc<dyn RunHarness>,

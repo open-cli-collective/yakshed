@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -16,9 +17,9 @@ use tokio::{
 };
 use yakshed_domain::ApprovalDecision;
 use yakshed_harness::{
-    HarnessError, HarnessEvent, HarnessEventSender, HarnessRunTerminal, NativePayload,
-    ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle, ProviderRunId,
-    ProviderSessionId, SanitizedDiagnostic,
+    HarnessAccountStatus, HarnessError, HarnessEvent, HarnessEventSender, HarnessRunTerminal,
+    NativePayload, ProviderRequestHandle, ProviderRequestId, ProviderResponse, ProviderRunHandle,
+    ProviderRunId, ProviderSessionId, SanitizedDiagnostic,
 };
 
 use crate::{CodexRuntimeSpec, reducer::Reducer};
@@ -28,6 +29,9 @@ const DIAGNOSTIC_CAPACITY: usize = 32;
 
 pub enum RequestKind {
     EmptyObject,
+    AccountRead,
+    AccountLoginStart,
+    AccountLogout,
     ThreadList,
     Session { expected_thread_id: Option<String> },
     StartRun { session_id: ProviderSessionId },
@@ -50,14 +54,21 @@ enum CommandMessage {
     Diagnostics(oneshot::Sender<Vec<String>>),
     RecordDiagnostic(String),
     Health(oneshot::Sender<()>),
+    AccountLoginStatus(oneshot::Sender<Option<HarnessAccountStatus>>),
+    AccountLoginStart(oneshot::Sender<Result<HarnessAccountStatus, HarnessError>>),
     Shutdown(oneshot::Sender<()>),
 }
 
+#[derive(Clone)]
 pub struct RuntimeClient {
     commands: mpsc::Sender<CommandMessage>,
 }
 
 impl RuntimeClient {
+    pub fn is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     pub async fn request(
         &self,
         method: &'static str,
@@ -123,6 +134,26 @@ impl RuntimeClient {
         result.await.map_err(|_| HarnessError::Disconnected)
     }
 
+    pub async fn account_login_status(&self) -> Result<Option<HarnessAccountStatus>, HarnessError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(CommandMessage::AccountLoginStatus(reply))
+            .await
+            .map_err(|_| HarnessError::Disconnected)?;
+        result.await.map_err(|_| HarnessError::Disconnected)
+    }
+
+    pub async fn account_login_start(&self) -> Result<HarnessAccountStatus, HarnessError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(CommandMessage::AccountLoginStart(reply))
+            .await
+            .map_err(|_| HarnessError::Disconnected)?;
+        result.await.map_err(|_| HarnessError::OutcomeUnknown {
+            operation: "account/login/start",
+        })?
+    }
+
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         let (reply, result) = oneshot::channel();
         self.commands
@@ -137,10 +168,18 @@ pub async fn start_runtime(
     spec: CodexRuntimeSpec,
     events: HarnessEventSender,
     process_group: Arc<AtomicU32>,
+    environment: Option<(String, SecretString)>,
 ) -> Result<RuntimeClient, HarnessError> {
     let (commands, command_rx) = mpsc::channel(ACTOR_CAPACITY);
     let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(run_actor(spec, events, command_rx, ready_tx, process_group));
+    tokio::spawn(run_actor(
+        spec,
+        events,
+        command_rx,
+        ready_tx,
+        process_group,
+        environment,
+    ));
     ready_rx.await.map_err(|_| HarnessError::Disconnected)??;
     Ok(RuntimeClient { commands })
 }
@@ -149,7 +188,33 @@ struct PendingClient {
     method: &'static str,
     mutation: bool,
     kind: RequestKind,
-    reply: oneshot::Sender<Result<Value, HarnessError>>,
+    reply: Option<oneshot::Sender<Result<Value, HarnessError>>>,
+}
+
+enum AccountLoginState {
+    Starting {
+        waiters: Vec<oneshot::Sender<Result<HarnessAccountStatus, HarnessError>>>,
+        completion: Option<(String, bool)>,
+        updated: bool,
+    },
+    Pending {
+        login_id: String,
+        auth_url: String,
+    },
+    Failed,
+}
+
+impl AccountLoginState {
+    fn status(&self) -> Option<HarnessAccountStatus> {
+        match self {
+            Self::Starting { .. } => None,
+            Self::Pending { login_id, auth_url } => Some(HarnessAccountStatus::LoginInProgress {
+                login_id: login_id.clone(),
+                auth_url: auth_url.clone(),
+            }),
+            Self::Failed => Some(HarnessAccountStatus::Unknown),
+        }
+    }
 }
 
 enum ServerRequestKind {
@@ -171,12 +236,18 @@ enum Inbound {
     Eof,
 }
 
-struct Sanitizer(Vec<String>);
+struct Sanitizer {
+    redactions: Vec<String>,
+    environment: Option<(String, SecretString)>,
+}
 
 impl Sanitizer {
     fn sanitize(&self, mut value: String) -> String {
-        for secret in &self.0 {
+        for secret in &self.redactions {
             value = value.replace(secret, "[REDACTED]");
+        }
+        if let Some((_, secret)) = &self.environment {
+            value = value.replace(secret.expose_secret(), "[REDACTED]");
         }
         value
     }
@@ -206,9 +277,13 @@ async fn run_actor(
     mut commands: mpsc::Receiver<CommandMessage>,
     ready: oneshot::Sender<Result<(), HarnessError>>,
     process_group: Arc<AtomicU32>,
+    environment: Option<(String, SecretString)>,
 ) {
-    let sanitizer = Sanitizer(spec.redactions.clone());
-    let spawned = spawn_child(&spec, Arc::clone(&process_group)).await;
+    let sanitizer = Sanitizer {
+        redactions: spec.redactions.clone(),
+        environment,
+    };
+    let spawned = spawn_child(&spec, &sanitizer, Arc::clone(&process_group)).await;
     let (mut child, mut stdin, inbound) = match spawned {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -291,6 +366,7 @@ async fn run_actor(
     let mut runs = HashMap::<(String, String), ProviderRunHandle>::new();
     let mut diagnostics = VecDeque::<String>::new();
     let mut reducer = Reducer::default();
+    let mut account_login = None::<AccountLoginState>;
 
     'actor: loop {
         tokio::select! {
@@ -328,7 +404,7 @@ async fn run_actor(
                             ).await;
                             break 'actor;
                         } else {
-                            pending.insert(id, PendingClient { method, mutation, kind, reply });
+                            pending.insert(id, PendingClient { method, mutation, kind, reply: Some(reply) });
                         }
                     }
                     Some(CommandMessage::Respond { request, response, reply }) => {
@@ -366,6 +442,58 @@ async fn run_actor(
                     }
                     Some(CommandMessage::Health(reply)) => {
                         let _ = reply.send(());
+                    }
+                    Some(CommandMessage::AccountLoginStatus(reply)) => {
+                        let _ = reply.send(account_login.as_ref().and_then(AccountLoginState::status));
+                    }
+                    Some(CommandMessage::AccountLoginStart(reply)) => {
+                        if let Some(AccountLoginState::Starting { waiters, .. }) = &mut account_login {
+                            waiters.push(reply);
+                            continue 'actor;
+                        }
+                        if let Some(status) = account_login.as_ref().and_then(AccountLoginState::status)
+                            && !matches!(account_login, Some(AccountLoginState::Failed))
+                        {
+                            let _ = reply.send(Ok(status));
+                            continue 'actor;
+                        }
+                        account_login = Some(AccountLoginState::Starting {
+                            waiters: vec![reply],
+                            completion: None,
+                            updated: false,
+                        });
+                        let id = next_id;
+                        next_id += 1;
+                        let frame = json!({
+                            "id": id,
+                            "method": "account/login/start",
+                            "params": {"type": "chatgpt", "useHostedLoginSuccessPage": true},
+                        });
+                        if write_frame(&mut stdin, &frame).await.is_err() {
+                            settle_login_start(
+                                &mut account_login,
+                                Err(HarnessError::OutcomeUnknown {
+                                    operation: "account/login/start",
+                                }),
+                            );
+                            child.kill_and_reap().await;
+                            settle_runtime(
+                                &mut pending,
+                                &mut server_requests,
+                                &mut runs,
+                                &mut reducer,
+                                &events,
+                                &sanitizer,
+                                Settlement::Crashed,
+                            ).await;
+                            break 'actor;
+                        }
+                        pending.insert(id, PendingClient {
+                            method: "account/login/start",
+                            mutation: true,
+                            kind: RequestKind::AccountLoginStart,
+                            reply: None,
+                        });
                     }
                     Some(CommandMessage::Shutdown(reply)) => {
                         settle_runtime(
@@ -412,6 +540,7 @@ async fn run_actor(
                             &mut loaded_sessions,
                             &mut runs,
                             &mut reducer,
+                            &mut account_login,
                         ).await.is_err() {
                             child.kill_and_reap().await;
                             settle_runtime(
@@ -601,6 +730,7 @@ async fn handle_frame(
     loaded_sessions: &mut HashSet<String>,
     runs: &mut HashMap<(String, String), ProviderRunHandle>,
     reducer: &mut Reducer,
+    account_login: &mut Option<AccountLoginState>,
 ) -> Result<(), HarnessError> {
     if value.get("method").is_none() {
         let Some(id) = value.get("id").and_then(Value::as_u64) else {
@@ -614,20 +744,20 @@ async fn handle_frame(
         {
             let error = classify_protocol_error(error, sanitizer);
             push_diagnostic(diagnostics, error.to_string());
-            let _ = pending_request.reply.send(Err(error));
+            complete_client_request(pending_request, Err(error), account_login);
             return Ok(());
         }
         let Some(mut result) = value.get("result").cloned() else {
             push_diagnostic(diagnostics, sanitizer.sanitize(raw));
             let error = malformed_ack_error(&pending_request);
-            let _ = pending_request.reply.send(Err(error));
+            complete_client_request(pending_request, Err(error), account_login);
             return Ok(());
         };
         sanitizer.sanitize_value(&mut result);
         if value.get("error").is_some() || !valid_response_result(&pending_request.kind, &result) {
             push_diagnostic(diagnostics, sanitizer.sanitize(raw));
             let error = malformed_ack_error(&pending_request);
-            let _ = pending_request.reply.send(Err(error));
+            complete_client_request(pending_request, Err(error), account_login);
             return Ok(());
         }
         match &pending_request.kind {
@@ -646,11 +776,15 @@ async fn handle_frame(
                                 "session resume returned mismatched thread id: expected {expected}, got {thread_id}"
                             ),
                         );
-                        let _ = pending_request.reply.send(Err(HarnessError::Protocol {
-                            diagnostic: SanitizedDiagnostic::sanitized(
-                                "session resume returned mismatched thread id",
-                            ),
-                        }));
+                        complete_client_request(
+                            pending_request,
+                            Err(HarnessError::Protocol {
+                                diagnostic: SanitizedDiagnostic::sanitized(
+                                    "session resume returned mismatched thread id",
+                                ),
+                            }),
+                            account_login,
+                        );
                         return Ok(());
                     }
                     loaded_sessions.insert(thread_id.to_owned());
@@ -677,9 +811,15 @@ async fn handle_frame(
                         .await;
                 }
             }
-            RequestKind::EmptyObject | RequestKind::ThreadList | RequestKind::TurnSteer { .. } => {}
+            RequestKind::AccountRead if !result["account"].is_null() => *account_login = None,
+            RequestKind::AccountLogout => *account_login = None,
+            RequestKind::EmptyObject
+            | RequestKind::AccountLoginStart
+            | RequestKind::AccountRead
+            | RequestKind::ThreadList
+            | RequestKind::TurnSteer { .. } => {}
         }
-        let _ = pending_request.reply.send(Ok(result));
+        complete_client_request(pending_request, Ok(result), account_login);
         return Ok(());
     }
 
@@ -688,6 +828,50 @@ async fn handle_frame(
         .and_then(Value::as_str)
         .unwrap_or("codex.unknown")
         .to_owned();
+    if method == "account/login/completed" {
+        let mut safe = value;
+        sanitizer.sanitize_value(&mut safe);
+        let Some((login_id, success)) = account_login_completion(&safe) else {
+            push_diagnostic(
+                diagnostics,
+                "Codex emitted a malformed account/login/completed notification".to_owned(),
+            );
+            *account_login = None;
+            return Ok(());
+        };
+        if let Some(AccountLoginState::Starting { completion, .. }) = account_login {
+            *completion = Some((login_id.to_owned(), success));
+            return Ok(());
+        }
+        if matches!(
+            account_login,
+            Some(AccountLoginState::Pending { login_id: pending, .. }) if pending == login_id
+        ) {
+            *account_login = if success {
+                None
+            } else {
+                Some(AccountLoginState::Failed)
+            };
+        }
+        return Ok(());
+    }
+    if method == "account/updated" {
+        let mut safe = value;
+        sanitizer.sanitize_value(&mut safe);
+        if !valid_account_updated(&safe) {
+            push_diagnostic(
+                diagnostics,
+                "Codex emitted a malformed account/updated notification".to_owned(),
+            );
+            return Ok(());
+        }
+        if let Some(AccountLoginState::Starting { updated, .. }) = account_login {
+            *updated = true;
+        } else {
+            *account_login = None;
+        }
+        return Ok(());
+    }
     let mut safe_value = value;
     sanitizer.sanitize_value(&mut safe_value);
     let run = run_for_message(&safe_value, runs);
@@ -795,12 +979,86 @@ fn malformed_ack_error(pending: &PendingClient) -> HarnessError {
     }
 }
 
+fn complete_client_request(
+    pending: PendingClient,
+    result: Result<Value, HarnessError>,
+    account_login: &mut Option<AccountLoginState>,
+) {
+    if matches!(pending.kind, RequestKind::AccountLoginStart) {
+        let status = result.map(|result| HarnessAccountStatus::LoginInProgress {
+            login_id: result["loginId"]
+                .as_str()
+                .expect("validated login ID")
+                .to_owned(),
+            auth_url: result["authUrl"]
+                .as_str()
+                .expect("validated auth URL")
+                .to_owned(),
+        });
+        settle_login_start(account_login, status);
+    } else if let Some(reply) = pending.reply {
+        let _ = reply.send(result);
+    }
+}
+
+fn settle_login_start(
+    account_login: &mut Option<AccountLoginState>,
+    result: Result<HarnessAccountStatus, HarnessError>,
+) {
+    let Some(AccountLoginState::Starting {
+        waiters,
+        completion,
+        updated,
+    }) = account_login.take()
+    else {
+        return;
+    };
+    if let Ok(HarnessAccountStatus::LoginInProgress { login_id, auth_url }) = &result {
+        *account_login = match (updated, completion) {
+            (true, _) => None,
+            (false, Some((completed_id, true))) if completed_id == *login_id => None,
+            (false, Some((completed_id, false))) if completed_id == *login_id => {
+                Some(AccountLoginState::Failed)
+            }
+            _ => Some(AccountLoginState::Pending {
+                login_id: login_id.clone(),
+                auth_url: auth_url.clone(),
+            }),
+        };
+    }
+    for waiter in waiters {
+        let _ = waiter.send(result.clone());
+    }
+}
+
 fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
     let Some(object) = result.as_object() else {
         return false;
     };
     match kind {
-        RequestKind::EmptyObject => object.is_empty(),
+        RequestKind::EmptyObject | RequestKind::AccountLogout => object.is_empty(),
+        RequestKind::AccountRead => {
+            object
+                .get("requiresOpenaiAuth")
+                .and_then(Value::as_bool)
+                .is_some()
+                && object.get("account").is_none_or(|account| {
+                    account.is_null()
+                        || account.as_object().is_some_and(|account| {
+                            account
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| {
+                                    matches!(kind, "apiKey" | "chatgpt" | "amazonBedrock")
+                                })
+                        })
+                })
+        }
+        RequestKind::AccountLoginStart => {
+            object.get("type").and_then(Value::as_str) == Some("chatgpt")
+                && object.get("loginId").and_then(Value::as_str).is_some()
+                && object.get("authUrl").and_then(Value::as_str).is_some()
+        }
         RequestKind::ThreadList => {
             object
                 .get("data")
@@ -844,6 +1102,65 @@ fn valid_response_result(kind: &RequestKind, result: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|turn_id| turn_id == expected_turn_id.as_str()),
     }
+}
+
+fn account_login_completion(value: &Value) -> Option<(&str, bool)> {
+    let params = value.get("params")?.as_object()?;
+    let login_id = params.get("loginId")?.as_str()?;
+    let success = params.get("success")?.as_bool()?;
+    if !params
+        .get("error")
+        .is_none_or(|error| error.is_null() || error.is_string())
+        || !params.get("onboardingEntrypoint").is_none_or(|entrypoint| {
+            entrypoint.is_null() || entrypoint.as_str() == Some("life_sciences")
+        })
+    {
+        return None;
+    }
+    Some((login_id, success))
+}
+
+fn valid_account_updated(value: &Value) -> bool {
+    let Some(params) = value.get("params").and_then(Value::as_object) else {
+        return false;
+    };
+    params.get("authMode").is_none_or(|mode| {
+        mode.is_null()
+            || mode.as_str().is_some_and(|mode| {
+                matches!(
+                    mode,
+                    "apikey"
+                        | "chatgpt"
+                        | "chatgptAuthTokens"
+                        | "headers"
+                        | "agentIdentity"
+                        | "personalAccessToken"
+                        | "bedrockApiKey"
+                )
+            })
+    }) && params.get("planType").is_none_or(|plan| {
+        plan.is_null()
+            || plan.as_str().is_some_and(|plan| {
+                matches!(
+                    plan,
+                    "free"
+                        | "go"
+                        | "plus"
+                        | "pro"
+                        | "prolite"
+                        | "team"
+                        | "self_serve_business_prolite"
+                        | "self_serve_business_usage_based"
+                        | "business"
+                        | "ent26"
+                        | "enterprise_cbp_automation"
+                        | "enterprise_cbp_usage_based"
+                        | "enterprise"
+                        | "edu"
+                        | "unknown"
+                )
+            })
+    })
 }
 
 fn valid_thread(value: &Value) -> bool {
@@ -1210,7 +1527,9 @@ async fn settle_runtime(
         } else {
             HarnessError::Disconnected
         };
-        let _ = pending.reply.send(Err(error));
+        if let Some(reply) = pending.reply {
+            let _ = reply.send(Err(error));
+        }
     }
     server_requests.clear();
     let active_runs = runs.values().cloned().collect::<Vec<_>>();
@@ -1355,10 +1674,20 @@ async fn read_stderr(mut stderr: impl AsyncRead + Unpin, sender: mpsc::Sender<In
 
 async fn spawn_child(
     spec: &CodexRuntimeSpec,
+    sanitizer: &Sanitizer,
     process_group: Arc<AtomicU32>,
 ) -> Result<(ChildGuard, ChildStdin, ChildStdout), HarnessError> {
     let mut command = Command::new(&spec.program);
     command
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                matches!(
+                    name,
+                    "PATH" | "HOME" | "LANG" | "LANGUAGE" | "TMPDIR" | "TMP" | "TEMP"
+                ) || name.starts_with("LC_")
+            })
+        }))
         .args(&spec.args)
         .arg("app-server")
         .env("CODEX_HOME", &spec.key.codex_home)
@@ -1366,6 +1695,9 @@ async fn spawn_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some((variable, secret)) = &sanitizer.environment {
+        command.env(variable, secret.expose_secret());
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|_| HarnessError::Runtime {

@@ -2308,6 +2308,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "libc",
+ "secrecy",
  "serde",
  "serde_json",
  "tempfile",
@@ -4543,6 +4544,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
  "yakshed-application",
  "yakshed-domain",
  "yakshed-harness",

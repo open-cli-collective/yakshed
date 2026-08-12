@@ -28,6 +28,7 @@ pub struct HarnessDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessCredentialDelivery {
     HarnessManaged,
+    Delegated { authority: String },
     ProcessEnvironment { variable: String },
 }
 
@@ -36,6 +37,15 @@ pub enum HarnessCredentialDelivery {
 pub struct HarnessCredentialRequirement {
     pub slot: CredentialSlot,
     pub delivery: HarnessCredentialDelivery,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessAccountStatus {
+    NotAuthenticated,
+    LoginInProgress { login_id: String, auth_url: String },
+    Authenticated { email: Option<String>, plan: String },
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -477,7 +487,7 @@ impl fmt::Display for HarnessEvent {
     }
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HarnessError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
@@ -491,6 +501,8 @@ pub enum HarnessError {
     Overloaded,
     #[error("runtime is disconnected")]
     Disconnected,
+    #[error("provider account is not authenticated")]
+    NotAuthenticated,
     #[error("outcome is unknown for mutating operation: {operation}")]
     OutcomeUnknown { operation: &'static str },
     #[error("harness event stream is closed")]
@@ -547,6 +559,24 @@ pub trait HarnessAdapter: Send + Sync {
     fn descriptor(&self) -> HarnessDescriptor;
 
     fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement>;
+
+    async fn account_status(
+        &self,
+        _runtime: &RuntimeHandle,
+    ) -> Result<HarnessAccountStatus, HarnessError> {
+        Err(HarnessError::Unsupported("account status"))
+    }
+
+    async fn account_login_start(
+        &self,
+        _runtime: &RuntimeHandle,
+    ) -> Result<HarnessAccountStatus, HarnessError> {
+        Err(HarnessError::Unsupported("account login"))
+    }
+
+    async fn account_logout(&self, _runtime: &RuntimeHandle) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported("account logout"))
+    }
 
     async fn capabilities(
         &self,

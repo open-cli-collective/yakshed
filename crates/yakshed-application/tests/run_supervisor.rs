@@ -386,6 +386,7 @@ fn map_error(error: HarnessError) -> HarnessPortError {
         HarnessError::Unsupported(message) => HarnessPortError::Unsupported(message.to_owned()),
         HarnessError::Overloaded => HarnessPortError::Overloaded,
         HarnessError::Disconnected => HarnessPortError::Disconnected,
+        HarnessError::NotAuthenticated => HarnessPortError::NotAuthenticated,
         HarnessError::OutcomeUnknown { operation } => {
             HarnessPortError::OutcomeUnknown { operation }
         }

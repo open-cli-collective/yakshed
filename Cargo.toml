@@ -41,6 +41,7 @@ time = "=0.3.44"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "sync", "time"] }
 toml = "=1.1.4"
 uuid = { version = "=1.24.0", features = ["serde", "v7"] }
+url = "=2.5.8"
 yakshed-application = { path = "crates/yakshed-application" }
 yakshed-desktop-api = { path = "crates/yakshed-desktop-api" }
 yakshed-domain = { path = "crates/yakshed-domain" }

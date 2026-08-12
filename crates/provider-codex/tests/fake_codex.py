@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 
 SCENARIO = sys.argv[1]
@@ -19,6 +20,35 @@ initialized = False
 active = None
 boundary_errors = set()
 recorded = {}
+account_state = "none" if SCENARIO.startswith("account_") else "authenticated"
+if SCENARIO in ("mode_b", "mode_b_rotation"):
+    credential = os.environ.get("FIREWORKS_API_KEY")
+    if SCENARIO == "mode_b":
+        assert credential == "YAKSHED_MODE_B_CANARY"
+    account_state = "none"
+    if SCENARIO == "mode_b_rotation":
+        marker = {
+            None: "missing",
+            "YAKSHED_MODE_B_CANARY_V1": "v1",
+            "YAKSHED_MODE_B_CANARY_V2": "v2",
+        }.get(credential, "unexpected")
+        with open(os.path.join(os.environ["CODEX_HOME"], "credential-generation.log"), "a", encoding="utf-8") as credential_log:
+            credential_log.write(f"{marker}\n")
+account_reads = 0
+
+
+def complete_login_after_delay():
+    global account_state
+    time.sleep(0.05)
+    account_state = "authenticated"
+    emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": True, "error": None}})
+
+
+def external_login_after_delay():
+    global account_state
+    time.sleep(0.05)
+    account_state = "authenticated"
+    emit({"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "plus"}})
 
 
 def record_golden(value):
@@ -373,6 +403,8 @@ def run_events():
     elif SCENARIO == "oversized":
         os.write(1, ("{\"method\":\"future/huge\",\"padding\":\"" + "x" * 4096 + "\"}\n").encode())
         terminal()
+    elif SCENARIO == "mode_b_rotation":
+        terminal()
 
 
 for line in sys.stdin:
@@ -436,7 +468,50 @@ for line in sys.stdin:
         initialized = True
     else:
         assert initialized, "request arrived before initialized notification"
-        if method == "thread/start":
+        with open(os.path.join(os.environ["CODEX_HOME"], "requests.log"), "a", encoding="utf-8") as request_log:
+            request_log.write(f"{method}\n")
+        if method == "account/read":
+            account_reads += 1
+            account = None
+            if account_state == "authenticated":
+                account = {"type": "chatgpt", "email": "yak@example.test", "planType": "plus"}
+            elif account_state == "unknown":
+                account = {"type": "amazonBedrock"}
+            emit({"id": request_id, "result": {"account": account, "requiresOpenaiAuth": SCENARIO not in ("mode_b", "mode_b_rotation")}})
+        elif method == "account/login/start":
+            assert message["params"]["type"] == "chatgpt"
+            assert "apiKey" not in message["params"]
+            crash_marker = os.path.join(os.environ["CODEX_HOME"], "login-crashed")
+            if SCENARIO == "account_login_crash_once" and not os.path.exists(crash_marker):
+                open(crash_marker, "w", encoding="utf-8").close()
+                sys.exit(7)
+            if SCENARIO == "account_login_slow_start":
+                time.sleep(0.05)
+            if SCENARIO == "account_login_update_before_response":
+                account_state = "authenticated"
+                emit({"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "plus"}})
+            emit({"id": request_id, "result": {"type": "chatgpt", "loginId": "login-1", "authUrl": "https://chatgpt.com/codex/login-1"}})
+            if SCENARIO == "account_login_malformed_update":
+                emit({"method": "account/updated", "params": {"authMode": "YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT"}})
+            if SCENARIO == "account_login_failure":
+                account_state = "unknown"
+                emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": False, "error": "YAKSHED_CREDENTIAL_CANARY_DO_NOT_EMIT"}})
+            elif SCENARIO == "account_login_delayed":
+                threading.Thread(target=complete_login_after_delay).start()
+            elif SCENARIO == "account_login_external_change":
+                threading.Thread(target=external_login_after_delay).start()
+            elif SCENARIO == "account_login_malformed_update":
+                pass
+            elif SCENARIO in ("account_login_missed_completion", "account_login_slow_start", "account_login_crash_once", "account_login_update_before_response"):
+                account_state = "authenticated"
+            else:
+                account_state = "authenticated"
+                emit({"method": "account/login/completed", "params": {"loginId": "login-1", "success": True, "error": None}})
+        elif method == "account/logout":
+            account_state = "none"
+            emit({"id": request_id, "result": {}})
+            emit({"method": "account/updated", "params": {"authMode": None}})
+        elif method == "thread/start":
             thread_id = f"thread-{len(threads) + 1}"
             value = thread(thread_id, message["params"]["cwd"])
             threads.append(value)
@@ -495,6 +570,8 @@ for line in sys.stdin:
             if SCENARIO == "crash":
                 sys.exit(7)
             run_events()
+            if SCENARIO == "mode_b_rotation":
+                sys.exit(7)
         elif method == "turn/steer":
             if SCENARIO == "malformed_steer_ack":
                 emit({"id": request_id, "result": {}})

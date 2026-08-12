@@ -554,6 +554,8 @@ pub enum ConfigPortError {
     },
     #[error("configuration value is invalid")]
     Validation,
+    #[error("credential requirement is not satisfied: {0}")]
+    CredentialRequirement(String),
     #[error("not found")]
     NotFound,
     #[error("unsupported operation")]

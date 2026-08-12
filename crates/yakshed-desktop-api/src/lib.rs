@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 pub use yakshed_application::RunOrchestrationError;
 use yakshed_application::{
-    AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort, CachePortError,
-    Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem,
+    AccountStatus, AppEvent, AppEventKind, AppStore, ArtifactPort, ArtifactPortError, CachePort,
+    CachePortError, Clock, ConfigPort, ConfigPortError, CreateProject, CreateWorkItem,
     CredentialMigrationPendingReason, CredentialMigrationStatus, IdGenerator, ListWorkItems,
     OpenArtifactCommand, OpenArtifactPayload, PublicCredentialBinding, PublicCredentialSource,
     PutConnectionCommand, RunHarness, RunSupervisor, SecretPort, SecretPortError,
@@ -46,6 +46,7 @@ pub enum DesktopErrorCode {
     NotFound,
     Unsupported,
     BackendUnavailable,
+    NotAuthenticated,
     PersistenceError,
     OutcomeUnknown,
     InternalError,
@@ -134,6 +135,52 @@ pub enum FrontendRunStatus {
     Interrupted,
     Disconnected,
     OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum FrontendAccountStatus {
+    NotAuthenticated,
+    LoginInProgress { login_id: String, auth_url: String },
+    Authenticated { email: Option<String>, plan: String },
+    Unknown,
+}
+
+impl TryFrom<AccountStatus> for FrontendAccountStatus {
+    type Error = DesktopError;
+
+    fn try_from(status: AccountStatus) -> Result<Self> {
+        Ok(match status {
+            AccountStatus::NotAuthenticated => Self::NotAuthenticated,
+            AccountStatus::LoginInProgress { login_id, auth_url } => Self::LoginInProgress {
+                login_id,
+                auth_url: validate_account_auth_url(auth_url)?,
+            },
+            AccountStatus::Authenticated { email, plan } => Self::Authenticated { email, plan },
+            AccountStatus::Unknown => Self::Unknown,
+        })
+    }
+}
+
+fn validate_account_auth_url(auth_url: String) -> Result<String> {
+    const MAX_AUTH_URL_BYTES: usize = 8 * 1024;
+    if auth_url.len() > MAX_AUTH_URL_BYTES {
+        return Err(invalid_account_auth_url());
+    }
+    let parsed = url::Url::parse(&auth_url).map_err(|_| invalid_account_auth_url())?;
+    if parsed.scheme() != "https"
+        || !matches!(parsed.host_str(), Some("auth.openai.com" | "chatgpt.com"))
+        || parsed.port().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(invalid_account_auth_url());
+    }
+    Ok(auth_url)
+}
+
+fn invalid_account_auth_url() -> DesktopError {
+    DesktopError::invalid_request("provider returned an invalid authentication URL")
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -747,6 +794,35 @@ impl DesktopApi {
             .id)
     }
 
+    pub async fn account_status(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<FrontendAccountStatus> {
+        self.run_supervisor
+            .account_status(connection_id)
+            .await
+            .map_err(map_run_error)?
+            .try_into()
+    }
+
+    pub async fn account_login_start(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<FrontendAccountStatus> {
+        self.run_supervisor
+            .account_login_start(connection_id)
+            .await
+            .map_err(map_run_error)?
+            .try_into()
+    }
+
+    pub async fn account_logout(&self, connection_id: ConnectionId) -> Result<()> {
+        self.run_supervisor
+            .account_logout(connection_id)
+            .await
+            .map_err(map_run_error)
+    }
+
     pub async fn steer_run(&self, run_id: RunId, message: impl Into<String>) -> Result<()> {
         let message = message.into();
         validate_text_limit(
@@ -1185,6 +1261,10 @@ fn map_run_error(error: RunOrchestrationError) -> DesktopError {
             yakshed_application::HarnessPortError::Unsupported(_) => {
                 DesktopError::unsupported("operation unsupported")
             }
+            yakshed_application::HarnessPortError::NotAuthenticated => DesktopError::new(
+                DesktopErrorCode::NotAuthenticated,
+                "connection is not authenticated",
+            ),
             yakshed_application::HarnessPortError::Disconnected => {
                 DesktopError::unsupported("harness disconnected")
             }
@@ -1227,6 +1307,11 @@ fn map_config_error(error: ConfigPortError) -> DesktopError {
             DesktopError::conflict("configuration revision conflict")
         }
         ConfigPortError::Validation => DesktopError::invalid_request("configuration is invalid"),
+        ConfigPortError::CredentialRequirement(remediation) => DesktopError {
+            code: DesktopErrorCode::InvalidRequest,
+            message: "credential requirement is not satisfied",
+            detail: Some(remediation),
+        },
         ConfigPortError::MigrationPending => {
             DesktopError::conflict("credential migration is pending")
         }
@@ -1352,5 +1437,36 @@ fn to_public_connection(connection: Connection) -> PublicConnection {
                 }
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod account_auth_url_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_pinned_https_login_origins() {
+        for auth_url in [
+            "https://chatgpt.com/auth/login?state=opaque",
+            "https://auth.openai.com/oauth/authorize?state=opaque",
+        ] {
+            assert!(validate_account_auth_url(auth_url.to_owned()).is_ok());
+        }
+        for auth_url in [
+            "javascript:alert(1)",
+            "file:///tmp/credential",
+            "https://evil.example/login",
+            "https://chatgpt.com.evil.example/login",
+            "https://chatgpt.com:444/login",
+            "https://user@chatgpt.com/login",
+        ] {
+            let error = validate_account_auth_url(auth_url.to_owned()).unwrap_err();
+            assert_eq!(error.code, DesktopErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "provider returned an invalid authentication URL"
+            );
+            assert!(!format!("{error:?}").contains(auth_url));
+        }
     }
 }

@@ -9,6 +9,7 @@ serde.workspace = true
 yakshed-application.workspace = true
 yakshed-domain.workspace = true
 tokio = { workspace = true }
+url.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

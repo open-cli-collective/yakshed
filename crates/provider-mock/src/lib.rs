@@ -868,7 +868,12 @@ impl HarnessAdapter for MockHarness {
 
     fn credential_requirements(&self) -> Vec<HarnessCredentialRequirement> {
         [
-            ("codex.account", HarnessCredentialDelivery::HarnessManaged),
+            (
+                "codex.account",
+                HarnessCredentialDelivery::Delegated {
+                    authority: "mock-delegated".to_owned(),
+                },
+            ),
             (
                 "anthropic.api_key",
                 HarnessCredentialDelivery::ProcessEnvironment {
@@ -886,6 +891,7 @@ impl HarnessAdapter for MockHarness {
         .map(|(slot, delivery)| HarnessCredentialRequirement {
             slot: CredentialSlot::new(slot).expect("mock requirement slot is valid"),
             delivery,
+            required: false,
         })
         .collect()
     }

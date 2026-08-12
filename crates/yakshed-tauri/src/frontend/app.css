@@ -86,6 +86,8 @@ label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px
 .settings { width: 330px; flex: 0 0 330px; padding: 16px; overflow-y: auto; border-left: 1px solid var(--edge2); background: var(--reader); }
 .settings > header { display: flex; align-items: flex-start; justify-content: space-between; }
 .settings form { margin-top: 18px; padding: 14px; border: 1px solid var(--edge); border-radius: 9px; background: var(--readerCard); }
+.account-status { margin-top: 18px; padding: 14px; border: 1px solid var(--edge); border-radius: 9px; background: var(--readerCard); }
+.account-status button { align-self: flex-start; }
 .settings form input { margin-bottom: 12px; }
 .settings label small { float: right; font-family: "JetBrains Mono", ui-monospace, monospace; }
 .startup { width: 100%; display: grid; place-content: center; gap: 12px; text-align: center; }

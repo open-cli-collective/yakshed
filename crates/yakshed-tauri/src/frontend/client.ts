@@ -14,6 +14,7 @@ export interface DesktopError {
     | "not_found"
     | "unsupported"
     | "backend_unavailable"
+    | "not_authenticated"
     | "persistence_error"
     | "outcome_unknown"
     | "internal_error";
@@ -132,6 +133,11 @@ export interface ConnectionList {
   credential_migration: CredentialMigrationStatus;
 }
 export interface SecretWrite { overwritten: boolean }
+export type AccountStatus =
+  | { state: "not_authenticated" }
+  | { state: "login_in_progress"; login_id: string; auth_url: string }
+  | { state: "authenticated"; email: string | null; plan: string }
+  | { state: "unknown" };
 export interface Artifact { id: string; kind: string; byte_len: number; work_item_id: string }
 export interface ArtifactList { revision: number; artifacts: Artifact[] }
 export interface OpenArtifact { artifact: Artifact; bytes: number[]; media_type: string }
@@ -198,6 +204,9 @@ export const client = {
   listConnections: () => invoke<ConnectionList>("list_connections"),
   setCredential: (connectionId: string, slot: string, value: string, overwrite: boolean) =>
     invoke<SecretWrite>("set_connection_credential", { connectionId, slot, value, overwrite }),
+  accountStatus: (connectionId: string) => invoke<AccountStatus>("account_status", { connectionId }),
+  accountLoginStart: (connectionId: string) => invoke<AccountStatus>("account_login_start", { connectionId }),
+  accountLogout: (connectionId: string) => invoke<void>("account_logout", { connectionId }),
   listArtifacts: (workItemId: string) => invoke<ArtifactList>("list_artifacts", { workItemId }),
   openArtifact: (workItemId: string, artifactId: string, maxBytes: number) =>
     invoke<OpenArtifact>("open_artifact", { workItemId, artifactId, maxBytes }),
