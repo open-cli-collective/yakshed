@@ -326,6 +326,8 @@ pub enum FrontendCredentialMigrationPendingReason {
     Denied,
     Unavailable,
     Collision,
+    MissingSource,
+    SourceInUse,
     Failed,
     CleanupRequired,
 }
@@ -700,6 +702,12 @@ impl DesktopApi {
                             }
                             CredentialMigrationPendingReason::Collision => {
                                 FrontendCredentialMigrationPendingReason::Collision
+                            }
+                            CredentialMigrationPendingReason::MissingSource => {
+                                FrontendCredentialMigrationPendingReason::MissingSource
+                            }
+                            CredentialMigrationPendingReason::SourceInUse => {
+                                FrontendCredentialMigrationPendingReason::SourceInUse
                             }
                             CredentialMigrationPendingReason::Failed => {
                                 FrontendCredentialMigrationPendingReason::Failed

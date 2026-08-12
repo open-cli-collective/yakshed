@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yakshed_application::{
     AppConfig, ConfigChange, ConfigRevision, ConfigSnapshot, ConfigValidationError,
-    SecretBackendCapability, SecretBackendConfigurationError, UiConfig,
+    CredentialCopyReceipt, CredentialCopyState, CredentialMigrationPhase,
+    CredentialMigrationRecord, SecretBackendCapability, SecretBackendConfigurationError, UiConfig,
 };
 use yakshed_domain::{
     Connection, ConnectionId, CredentialBinding, CredentialBindingRecord, CredentialSlot,
@@ -32,6 +33,8 @@ struct ConfigDto {
     connections: Vec<ConnectionDto>,
     #[serde(default)]
     secret_backends: Vec<SecretBackendDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_migration: Option<CredentialMigrationDto>,
     #[serde(default)]
     ui: UiDto,
 }
@@ -78,6 +81,37 @@ struct SecretBackendDto {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CredentialMigrationDto {
+    source: SecretBackendDto,
+    target: SecretBackendDto,
+    phase: CredentialMigrationPhaseDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    receipts: Vec<CredentialCopyReceiptDto>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialMigrationPhaseDto {
+    Copying,
+    CleanupPending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialCopyReceiptDto {
+    locator: String,
+    state: CredentialCopyStateDto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialCopyStateDto {
+    Copying,
+    Copied,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UiDto {
     theme: String,
 }
@@ -105,6 +139,10 @@ impl TryFrom<ConfigDto> for AppConfig {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+            credential_migration: config
+                .credential_migration
+                .map(TryInto::try_into)
+                .transpose()?,
             ui: UiConfig {
                 theme: config.ui.theme,
             },
@@ -118,9 +156,66 @@ impl From<&AppConfig> for ConfigDto {
             schema_version: SCHEMA_VERSION,
             connections: config.connections.iter().map(Into::into).collect(),
             secret_backends: config.secret_backends.iter().map(Into::into).collect(),
+            credential_migration: config.credential_migration.as_ref().map(Into::into),
             ui: UiDto {
                 theme: config.ui.theme.clone(),
             },
+        }
+    }
+}
+
+impl TryFrom<CredentialMigrationDto> for CredentialMigrationRecord {
+    type Error = ValidationError;
+
+    fn try_from(record: CredentialMigrationDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            source: record.source.try_into()?,
+            target: record.target.try_into()?,
+            phase: match record.phase {
+                CredentialMigrationPhaseDto::Copying => CredentialMigrationPhase::Copying,
+                CredentialMigrationPhaseDto::CleanupPending => {
+                    CredentialMigrationPhase::CleanupPending
+                }
+            },
+            receipts: record
+                .receipts
+                .into_iter()
+                .map(|receipt| {
+                    Ok(CredentialCopyReceipt {
+                        locator: SecretLocator::new(receipt.locator)?,
+                        state: match receipt.state {
+                            CredentialCopyStateDto::Copying => CredentialCopyState::Copying,
+                            CredentialCopyStateDto::Copied => CredentialCopyState::Copied,
+                        },
+                    })
+                })
+                .collect::<Result<_, ValidationError>>()?,
+        })
+    }
+}
+
+impl From<&CredentialMigrationRecord> for CredentialMigrationDto {
+    fn from(record: &CredentialMigrationRecord) -> Self {
+        Self {
+            source: (&record.source).into(),
+            target: (&record.target).into(),
+            phase: match record.phase {
+                CredentialMigrationPhase::Copying => CredentialMigrationPhaseDto::Copying,
+                CredentialMigrationPhase::CleanupPending => {
+                    CredentialMigrationPhaseDto::CleanupPending
+                }
+            },
+            receipts: record
+                .receipts
+                .iter()
+                .map(|receipt| CredentialCopyReceiptDto {
+                    locator: receipt.locator.as_str().to_owned(),
+                    state: match receipt.state {
+                        CredentialCopyState::Copying => CredentialCopyStateDto::Copying,
+                        CredentialCopyState::Copied => CredentialCopyStateDto::Copied,
+                    },
+                })
+                .collect(),
         }
     }
 }
@@ -327,7 +422,7 @@ impl StoreInner {
         }
 
         let mut config = current.config;
-        apply_change(&mut config, change);
+        apply_change(&mut config, change)?;
         validate_config(&config, self.backend_capabilities)?;
         let revision = current
             .revision
@@ -359,7 +454,7 @@ impl StoreInner {
     }
 }
 
-fn apply_change(config: &mut AppConfig, change: ConfigChange) {
+fn apply_change(config: &mut AppConfig, change: ConfigChange) -> Result<(), ConfigError> {
     match change {
         ConfigChange::PutConnection(connection) => {
             config.connections.retain(|item| item.id != connection.id);
@@ -392,7 +487,27 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
         ConfigChange::RemoveSecretBackend(id) => {
             config.secret_backends.retain(|item| item.id != id);
         }
-        ConfigChange::MigrateSecretBackend { from, to } => {
+        ConfigChange::BeginCredentialMigration(record) => {
+            config.credential_migration = Some(record);
+        }
+        ConfigChange::RecordCredentialCopy { locator, state } => {
+            let record = config.credential_migration.as_mut().ok_or_else(|| {
+                ConfigError::Validation("credential migration is not active".to_owned())
+            })?;
+            record.receipts.retain(|receipt| receipt.locator != locator);
+            record
+                .receipts
+                .push(CredentialCopyReceipt { locator, state });
+            record
+                .receipts
+                .sort_by(|left, right| left.locator.cmp(&right.locator));
+        }
+        ConfigChange::CheckpointCredentialMigration => {
+            let record = config.credential_migration.as_mut().ok_or_else(|| {
+                ConfigError::Validation("credential migration is not active".to_owned())
+            })?;
+            let from = record.source.id.clone();
+            let to = record.target.clone();
             for connection in &mut config.connections {
                 for credential in &mut connection.credentials {
                     if let CredentialBinding::Secret { reference } = &mut credential.binding
@@ -409,10 +524,13 @@ fn apply_change(config: &mut AppConfig, change: ConfigChange) {
             config
                 .secret_backends
                 .sort_by(|left, right| left.id.cmp(&right.id));
+            record.phase = CredentialMigrationPhase::CleanupPending;
         }
+        ConfigChange::FinishCredentialMigration => config.credential_migration = None,
         ConfigChange::SetUiTheme(theme) => config.ui.theme = theme,
         ConfigChange::Reset => *config = AppConfig::default(),
     }
+    Ok(())
 }
 
 fn read_config(
