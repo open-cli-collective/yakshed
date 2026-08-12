@@ -30,9 +30,9 @@ use yakshed_harness::{
     RuntimeHandle, RuntimePath, StartSessionSpec,
 };
 use yakshed_secrets::{
-    BrokerCancellation, CredentialBroker, LocalFileBackend, NoopSecretAuditSink, PutSecretOptions,
-    PutSecretOutcome, SecretAccessContext, SecretAccessPurpose, SecretBackendHandle,
-    backend_capabilities,
+    BrokerCancellation, CredentialBroker, LocalFileBackend, LocalOsBackend, NoopSecretAuditSink,
+    PutSecretOptions, PutSecretOutcome, SecretAccessContext, SecretAccessPurpose,
+    SecretBackendHandle, backend_capabilities,
 };
 use yakshed_store::{
     AppPaths, ArtifactError, ArtifactStore, CacheStore, ConfigError, ConfigStore, SqliteStore,
@@ -127,22 +127,7 @@ fn build_broker(
     if !configured.iter().any(|backend| backend.id == fallback.id) {
         configured.push(fallback.clone());
     }
-    let mut handles = Vec::new();
-    for config in configured {
-        if !matches!(config.settings, SecretBackendSettings::LocalFile { .. }) {
-            continue;
-        }
-        let id = config.id.clone();
-        let backend =
-            Arc::new(LocalFileBackend::from_config(&config).map_err(|_| StartupError::internal())?);
-        handles.push((
-            id,
-            SecretBackendHandle {
-                resolver: backend.clone(),
-                administrator: Some(backend),
-            },
-        ));
-    }
+    let handles = build_backend_handles(configured)?;
     CredentialBroker::new(
         handles,
         &snapshot.config.connections,
@@ -150,6 +135,39 @@ fn build_broker(
         Duration::from_secs(5),
     )
     .map_err(|_| StartupError::internal())
+}
+
+fn build_backend_handles(
+    configured: Vec<SecretBackend>,
+) -> Result<Vec<(SecretBackendId, SecretBackendHandle)>, StartupError> {
+    configured
+        .into_iter()
+        .filter_map(|config| {
+            let id = config.id.clone();
+            let handle = match config.settings {
+                SecretBackendSettings::LocalFile { .. } => LocalFileBackend::from_config(&config)
+                    .map(|backend| {
+                        let backend = Arc::new(backend);
+                        SecretBackendHandle {
+                            resolver: backend.clone(),
+                            administrator: Some(backend),
+                        }
+                    }),
+                SecretBackendSettings::LocalOs => {
+                    LocalOsBackend::from_config(&config).map(|backend| {
+                        let backend = Arc::new(backend);
+                        SecretBackendHandle {
+                            resolver: backend.clone(),
+                            administrator: Some(backend),
+                        }
+                    })
+                }
+                _ => return None,
+            };
+            Some(handle.map(|handle| (id, handle)))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|_| StartupError::internal())
 }
 
 struct ProductionConfig {
@@ -1023,6 +1041,27 @@ mod tests {
 
         assert_eq!(snapshot.config.secret_backends, vec![backend]);
         assert_eq!(snapshot.config.connections.len(), 1);
+    }
+
+    #[test]
+    fn every_production_configured_backend_kind_builds_a_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_file = local_backend(&AppPaths::for_test(temp.path()));
+        let local_os = SecretBackend {
+            id: SecretBackendId::new("local-os").unwrap(),
+            settings: SecretBackendSettings::LocalOs,
+        };
+        let handles = build_backend_handles(vec![local_file.clone(), local_os.clone()]).unwrap();
+
+        assert_eq!(handles.len(), 2);
+        for backend in [local_file, local_os] {
+            let (_, handle) = handles
+                .iter()
+                .find(|(id, _)| id == &backend.id)
+                .expect("available production backend must have a handle");
+            assert_eq!(handle.resolver.descriptor().kind, backend.kind());
+            assert!(handle.administrator.is_some());
+        }
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
-use security_framework::item::{ItemClass, ItemSearchOptions};
+use security_framework::item::{ItemClass, ItemSearchOptions, Reference, SearchResult};
 use security_framework::os::macos::keychain::SecKeychain;
 
 use crate::{
@@ -100,19 +100,19 @@ impl KeychainStore for NativeKeychain {
         overwrite: bool,
     ) -> Result<bool, StoreError> {
         let keychain = self.keychain()?;
-        match keychain.find_generic_password(service, account) {
-            Ok((_, mut item)) if overwrite => {
+        match find_item(&keychain, service, account) {
+            Ok(mut item) if overwrite => {
                 item.set_password(value).map_err(map_native_error)?;
                 Ok(true)
             }
             Ok(_) => Err(StoreError::Duplicate),
-            Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {
+            Err(StoreError::NotFound) => {
                 keychain
                     .add_generic_password(service, account, value)
                     .map_err(map_native_error)?;
                 Ok(false)
             }
-            Err(error) => Err(map_native_error(error)),
+            Err(error) => Err(error),
         }
     }
 
@@ -129,6 +129,25 @@ impl KeychainStore for NativeKeychain {
             Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(false),
             Err(error) => Err(map_native_error(error)),
         }
+    }
+}
+
+fn find_item(
+    keychain: &SecKeychain,
+    service: &str,
+    account: &str,
+) -> Result<security_framework::os::macos::keychain_item::SecKeychainItem, StoreError> {
+    let mut query = ItemSearchOptions::new();
+    query
+        .keychains(std::slice::from_ref(keychain))
+        .class(ItemClass::generic_password())
+        .service(service)
+        .account(account)
+        .load_refs(true);
+    match query.search().map_err(map_native_error)?.pop() {
+        Some(SearchResult::Ref(Reference::KeychainItem(item))) => Ok(item),
+        Some(_) => Err(StoreError::Failed),
+        None => Err(StoreError::NotFound),
     }
 }
 
@@ -357,6 +376,8 @@ mod tests {
     #[derive(Default)]
     struct FakeKeychain(Mutex<HashMap<(String, String), Vec<u8>>>);
 
+    struct FailingKeychain(StoreError);
+
     impl KeychainStore for FakeKeychain {
         fn probe(&self) -> Result<(), StoreError> {
             Ok(())
@@ -395,6 +416,30 @@ mod tests {
                 .unwrap()
                 .remove(&(service.to_owned(), account.to_owned()))
                 .is_some())
+        }
+    }
+
+    impl KeychainStore for FailingKeychain {
+        fn probe(&self) -> Result<(), StoreError> {
+            Err(self.0)
+        }
+
+        fn resolve(&self, _service: &str, _account: &str) -> Result<Vec<u8>, StoreError> {
+            Err(self.0)
+        }
+
+        fn put(
+            &self,
+            _service: &str,
+            _account: &str,
+            _value: &[u8],
+            _overwrite: bool,
+        ) -> Result<bool, StoreError> {
+            Err(self.0)
+        }
+
+        fn delete(&self, _service: &str, _account: &str) -> Result<bool, StoreError> {
+            Err(self.0)
         }
     }
 
@@ -469,6 +514,81 @@ mod tests {
         };
         assert!(matches!(missing, SecretError::NotFound { .. }));
         assert!(!format!("{missing:?}").contains(CANARY));
+    }
+
+    #[tokio::test]
+    async fn fake_store_failures_are_typed_and_redacted() {
+        const LOCATOR_CANARY: &str = "locator-internal-canary-37ad";
+        const SECRET_CANARY: &str = "secret-native-canary-19cf";
+        for (store_error, expected) in [
+            (StoreError::Locked, "locked"),
+            (StoreError::Denied, "denied"),
+            (StoreError::Unavailable, "unavailable"),
+            (StoreError::Failed, "failure"),
+        ] {
+            let backend = LocalOsBackend::with_store(
+                SecretBackendId::new("failing").unwrap(),
+                Arc::new(FailingKeychain(store_error)),
+            );
+            let locator = SecretLocator::new(LOCATOR_CANARY).unwrap();
+            let error = match backend.resolve(&locator, &context()).await {
+                Ok(_) => panic!("failing keychain resolved a secret"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    (&error, expected),
+                    (SecretError::Locked { .. }, "locked")
+                        | (SecretError::Denied { .. }, "denied")
+                        | (SecretError::BackendUnavailable { .. }, "unavailable")
+                        | (SecretError::BackendFailure { .. }, "failure")
+                ),
+                "unexpected mapping: {error}"
+            );
+            let put_error = backend
+                .put(
+                    &locator,
+                    &SecretString::from(SECRET_CANARY.to_owned()),
+                    PutSecretOptions::OVERWRITE,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&put_error),
+                std::mem::discriminant(&error)
+            );
+            let rendered = format!("{error:?} {put_error:?}");
+            assert!(!rendered.contains(LOCATOR_CANARY));
+            assert!(!rendered.contains(SECRET_CANARY));
+            assert!(!rendered.contains("native"));
+        }
+    }
+
+    #[test]
+    fn native_status_codes_map_without_messages() {
+        use security_framework::base::Error;
+
+        assert_eq!(
+            map_native_error(Error::from_code(ERR_SEC_INTERACTION_NOT_ALLOWED)),
+            StoreError::Locked
+        );
+        assert_eq!(
+            map_native_error(Error::from_code(ERR_SEC_AUTH_FAILED)),
+            StoreError::Denied
+        );
+        assert_eq!(
+            map_native_error(Error::from_code(ERR_SEC_USER_CANCELED)),
+            StoreError::Denied
+        );
+        assert_eq!(
+            map_native_error(Error::from_code(ERR_SEC_NOT_AVAILABLE)),
+            StoreError::Unavailable
+        );
+        assert_eq!(
+            map_native_error(Error::from_code(ERR_SEC_NO_SUCH_KEYCHAIN)),
+            StoreError::Unavailable
+        );
+        assert_eq!(map_native_error(Error::from_code(-1)), StoreError::Failed);
     }
 
     #[test]
