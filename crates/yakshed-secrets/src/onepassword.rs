@@ -194,13 +194,25 @@ pub(crate) fn validate_locator(locator: &SecretLocator) -> Result<(), &'static s
 }
 
 fn classify_exit(backend: &SecretBackendId, _status: ExitStatus, stderr: &[u8]) -> SecretError {
+    // Sources: op CLI "Sign in" and "Grant and revoke vault permissions" docs. They define
+    // these states but no stable per-error exit codes, so match category phrases only.
     if contains_ascii_case_insensitive(stderr, b"not signed in")
+        || contains_ascii_case_insensitive(stderr, b"not currently signed in")
         || contains_ascii_case_insensitive(stderr, b"authentication required")
         || contains_ascii_case_insensitive(stderr, b"locked")
     {
         SecretError::Locked {
             backend: backend.clone(),
             remediation: Some("sign in to the 1Password CLI".to_owned()),
+        }
+    } else if contains_ascii_case_insensitive(stderr, b"permission denied")
+        || contains_ascii_case_insensitive(stderr, b"not authorized")
+        || contains_ascii_case_insensitive(stderr, b"forbidden")
+        || contains_ascii_case_insensitive(stderr, b"does not have access")
+    {
+        SecretError::Denied {
+            backend: backend.clone(),
+            remediation: Some("grant the account access to the 1Password item".to_owned()),
         }
     } else if contains_ascii_case_insensitive(stderr, b"not found")
         || contains_ascii_case_insensitive(stderr, b"isn't an item")
@@ -457,6 +469,19 @@ mod tests {
         let locked = fake.backend("locked").probe().await.unwrap_err();
         assert!(matches!(locked, SecretError::Locked { .. }));
         assert!(!format!("{locked:?}").contains(CANARY));
+
+        let signed_out = fake.backend("signed-out-work").probe().await.unwrap_err();
+        assert!(matches!(signed_out, SecretError::Locked { .. }));
+        assert!(!format!("{signed_out:?}").contains("signed-out-work"));
+
+        let denied = match backend.resolve(&locator("forbidden"), &context()).await {
+            Ok(_) => panic!("forbidden secret resolved"),
+            Err(error) => error,
+        };
+        assert!(matches!(denied, SecretError::Denied { .. }));
+        let denied = format!("{denied:?}");
+        assert!(!denied.contains("op://vault/item/forbidden"));
+        assert!(!denied.contains("account work"));
 
         let absent = OnePasswordBackend::from_config(&SecretBackend {
             id: SecretBackendId::new("missing-op").unwrap(),

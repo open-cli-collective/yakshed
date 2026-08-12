@@ -18,6 +18,9 @@ root = Path(__file__).resolve().parent
 if "--account" in sys.argv and sys.argv[sys.argv.index("--account") + 1] == "locked":
     print("[ERROR] not signed in", file=sys.stderr)
     raise SystemExit(1)
+if "--account" in sys.argv and sys.argv[sys.argv.index("--account") + 1] == "signed-out-work":
+    print("[ERROR] account signed-out-work is not currently signed in", file=sys.stderr)
+    raise SystemExit(1)
 
 if sys.argv[1:3] == ["account", "get"]:
     print("{}", end="")
@@ -33,6 +36,9 @@ if field == "malformed":
     raise SystemExit(0)
 if field == "failure":
     print("[ERROR] onepassword-secret-canary-731", file=sys.stderr)
+    raise SystemExit(1)
+if field == "forbidden":
+    print(f"[ERROR] permission denied for {reference} in account work", file=sys.stderr)
     raise SystemExit(1)
 if field == "hang":
     descendant = subprocess.Popen(["/bin/sleep", "60"])
