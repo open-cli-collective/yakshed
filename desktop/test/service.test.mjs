@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import os from "node:os";
 import path from "node:path";
@@ -63,6 +63,7 @@ test("service supplies a valid temp directory when the parent omits TMPDIR", asy
   const helper = path.join(root, "helper.cjs");
   const tempDir = path.join(root, "native-temp");
   const previous = process.env.TMPDIR;
+  let service;
   const source = `#!/usr/bin/env node
 const { mkdirSync, writeFileSync } = require("node:fs");
 const path = require("node:path");
@@ -70,6 +71,7 @@ const index = process.argv.indexOf("--data-dir");
 const dataDir = process.argv[index + 1];
 mkdirSync(dataDir, { recursive: true });
 writeFileSync(path.join(dataDir, "tmpdir"), process.env.TMPDIR || "");
+writeFileSync(path.join(dataDir, "cwd"), process.cwd());
 process.stdin.resume();
 `;
   try {
@@ -78,13 +80,14 @@ process.stdin.resume();
     await mkdir(tempDir);
     delete process.env.TMPDIR;
     const dataDir = path.join(root, "data");
-    const service = new BackendService({ dataDir, packaged: true, serviceBinary: helper, tempDir });
+    service = new BackendService({ dataDir, packaged: true, serviceBinary: helper, tempDir });
     service.on("error", () => {});
     service.start();
     const observed = (await waitForFile(path.join(dataDir, "tmpdir"))).trim();
     assert.equal(observed, tempDir);
-    await service.stop();
+    assert.equal((await waitForFile(path.join(dataDir, "cwd"))).trim(), await realpath(dataDir));
   } finally {
+    await service?.stop();
     if (previous === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = previous;
     await rm(root, { recursive: true, force: true });

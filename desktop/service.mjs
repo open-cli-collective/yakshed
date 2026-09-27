@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
@@ -42,7 +42,7 @@ function commandFor({ packaged, dataDir, demo, serviceBinary, python }) {
   if (packaged) {
     const binary = serviceBinary || path.join(process.resourcesPath, "bin", "yakshed-service");
     if (!existsSync(binary)) throw new Error("YakShed service binary is not installed");
-    return { command: binary, args: ["--data-dir", dataDir, ...(demo ? ["--demo"] : [])], cwd: path.dirname(binary) };
+    return { command: binary, args: ["--data-dir", dataDir, ...(demo ? ["--demo"] : [])], cwd: dataDir };
   }
   return {
     command: python || process.env.YAKSHED_PYTHON || "python3",
@@ -72,6 +72,7 @@ export class BackendService extends EventEmitter {
 
   start() {
     if (this.child) return;
+    if (this.packaged) mkdirSync(this.dataDir, { recursive: true });
     const command = commandFor({
       packaged: this.packaged,
       dataDir: this.dataDir,
