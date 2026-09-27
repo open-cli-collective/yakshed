@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { eventText, latestTaskContext, projectTimeline, type Detail, type TimelineEvent } from "../../frontend/src/client";
+import { eventText, latestTaskContext, projectTimeline, taskResumeState, type Detail, type TimelineEvent } from "../../frontend/src/client";
 
 test("projects assistant deltas per run and replaces the completed text", () => {
   const events: TimelineEvent[] = [
@@ -47,4 +47,19 @@ test("restores a child workspace reported by the session effective options", () 
   } as Pick<Detail, "runs" | "sessions">);
 
   expect(context).toEqual({ workspace: "/child-repo", connectionId: "connection-child" });
+});
+
+test("blocks direct prompts for a managed child session while retaining its history", () => {
+  const detail = {
+    runs: [{ id: "child-run", session_id: "child-session", requested_options: { workspace: "/child-repo" } }],
+    sessions: [{
+      id: "child-session",
+      metadata: { capabilities: { resumable: false } },
+    }],
+  } as Pick<Detail, "runs" | "sessions">;
+
+  expect(taskResumeState(detail)).toEqual({
+    resumable: false,
+    reason: "This session is managed by its parent task and cannot accept direct prompts.",
+  });
 });

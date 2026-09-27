@@ -154,6 +154,7 @@ kbd { display: inline-block; color: var(--faint); font-size: 10px; white-space: 
 .waiting-callout strong { color: var(--accent); font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 10px; }
 .waiting-callout span { color: var(--muted); }
 .composer-area { position: relative; padding: 0 30px 21px; }
+.resume-hint { max-width: 740px; margin: 0 auto 8px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .composer-meta { display: flex; align-items: center; gap: 11px; max-width: 740px; margin: 0 auto 8px; padding: 0 4px; color: var(--faint); font-size: 12px; }
 .clock-button { display: flex; align-items: baseline; gap: 7px; padding: 3px 4px; color: var(--faint); }
 .clock-button:hover { color: var(--text); }

@@ -265,6 +265,10 @@ class CodexAdapter:
                 "parent_native_id": thread.get("parentThreadId"),
                 "runtime_version": thread.get("cliVersion"),
                 "workspace": thread.get("cwd"),
+                # App-server v2 child threads are owned by the parent
+                # collaboration turn. The SDK exposes their transcript and
+                # metadata, but direct turns on the child thread are rejected.
+                "capabilities": {"resumable": False},
                 "reported_start_at": self._reported_time(thread.get("createdAt")),
                 "reported_end_at": self._reported_time(thread.get("updatedAt")),
                 "metadata": {

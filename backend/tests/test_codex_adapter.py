@@ -156,6 +156,7 @@ class CodexAdapterTest(unittest.TestCase):
         adapter._client = FakeClient()
         snapshot = adapter._read_child_thread("child")
         self.assertEqual(snapshot["session"]["name"], "Scout")
+        self.assertEqual(snapshot["session"]["capabilities"]["resumable"], False)
 
 
 if __name__ == "__main__":

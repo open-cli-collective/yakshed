@@ -94,6 +94,11 @@ export interface TaskContext {
   connectionId?: string;
 }
 
+export interface TaskResumeState {
+  resumable: boolean;
+  reason?: string;
+}
+
 export interface BridgeEvent {
   event?: string;
   revision?: number;
@@ -219,6 +224,20 @@ export function latestTaskContext(detail: Pick<Detail, "runs" | "sessions">): Ta
     ...(workspace ? { workspace } : {}),
     ...(connectionId ? { connectionId } : {}),
   };
+}
+
+/** Read the neutral session capability that controls whether this task accepts direct prompts. */
+export function taskResumeState(detail: Pick<Detail, "runs" | "sessions">): TaskResumeState {
+  const latestRun = detail.runs.slice().reverse()[0];
+  const sessionId = text(latestRun?.session_id);
+  const session = detail.sessions.slice().reverse().find((candidate) => text(candidate.id) === sessionId)
+    ?? detail.sessions.slice().reverse()[0];
+  const metadata = object(session?.metadata);
+  const capabilities = object(metadata.capabilities);
+  if (capabilities.resumable === false) {
+    return { resumable: false, reason: "This session is managed by its parent task and cannot accept direct prompts." };
+  }
+  return { resumable: true };
 }
 
 export function eventPayload(event: TimelineEvent): Record<string, unknown> {

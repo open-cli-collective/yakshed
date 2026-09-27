@@ -348,6 +348,8 @@ class Service:
         reported_workspace = session_info.get("workspace")
         if isinstance(reported_workspace, str) and reported_workspace.strip():
             effective_options["workspace"] = reported_workspace
+        if isinstance(session_info.get("capabilities"), dict):
+            metadata["capabilities"] = session_info["capabilities"]
         session_changes: dict[str, Any] = {
             "native_id": session_info.get("native_id") or session.get("native_id"),
             "name": session_info.get("name") or session.get("name"),
@@ -589,6 +591,9 @@ class Service:
                 raise KeyError("session not found for task")
             if session.get("connection_id") != connection["id"] or session.get("adapter") != connection["adapter"]:
                 raise ValueError("provider switch requires a new session")
+            capabilities = (session.get("metadata") or {}).get("capabilities")
+            if isinstance(capabilities, dict) and capabilities.get("resumable") is False:
+                raise ValueError("This session is managed by its parent task and cannot accept direct prompts.")
             if self.store.active_run_for_session(session_id) or session.get("state") in {"queued", "starting", "running", "waiting", "cancelling"}:
                 raise ValueError("session already has an active run")
         else:

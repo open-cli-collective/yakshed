@@ -18,7 +18,9 @@
     type PermissionMode,
     type Task,
     type TaskContext,
+    type TaskResumeState,
     type Todo,
+    taskResumeState,
   } from "./client";
   import SettingToggle from "./SettingToggle.svelte";
   import TaskRow from "./TaskRow.svelte";
@@ -106,6 +108,7 @@
   let reloadSerial = 0;
   let layoutPreferencesLoaded = false;
   let stats: Record<string, unknown> | null = null;
+  let resumeState: TaskResumeState = { resumable: true };
   let stopEvents: (() => void) | undefined;
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let detailSerial = 0;
@@ -115,6 +118,7 @@
   $: currentRun = detail?.runs.slice().reverse().find((run) => ["queued", "starting", "running", "waiting", "cancelling"].includes(String(run.state ?? run.status))) ?? null;
   $: selectedConnection = connections.find((connection) => connection.id === selectedConnectionId) ?? null;
   $: currentCapabilities = selectedConnection ? adapterFor(selectedConnection)?.capabilities ?? [] : [];
+  $: resumeState = detail ? taskResumeState(detail) : { resumable: true };
   $: effectivePermission = selectedTask ? effectivePermissionMode(selectedTask) : "read_only";
   $: allLabels = collectLabels(tasks);
   $: activeRows = treeRows("active", tasks, includeArchived, folded);
@@ -655,7 +659,7 @@
   }
 
   async function submitPrompt(): Promise<void> {
-    if (!selectedId || !currentDraft.trim() || !selectedConnectionId || runBusy) return;
+    if (!selectedId || !currentDraft.trim() || !selectedConnectionId || runBusy || !resumeState.resumable) return;
     const taskId = selectedId;
     const connectionId = selectedConnectionId;
     const prompt = currentDraft.trim();
@@ -1037,9 +1041,10 @@
           <button class="expand-button" type="button" aria-label="Open settings" onclick={() => { settingsOpen = true; settingsSection = "general"; }}>⌘,</button>
         </div>
         {#if usageOpen}<div class="usage-popover"><div class="section-label"><span>Where the time and usage went</span><i></i></div><div class="usage-grid"><span>This task</span><strong>{formatDuration(detail?.duration.own_ms ?? 0)}</strong><span>Branch total</span><strong>{formatDuration(detail?.duration.subtree_ms ?? 0)}</strong>{#if detail?.usage?.own}<span>Tokens, this task <em class="usage-quality">{usageCompleteness(detail.usage.own)}</em></span><strong>{formatNumber(detail.usage.own.total_tokens)}</strong>{/if}{#if detail?.usage?.subtree}<span>Tokens, branch <em class="usage-quality">{usageCompleteness(detail.usage.subtree)}</em></span><strong>{formatNumber(detail.usage.subtree.total_tokens)}</strong>{/if}</div></div>{/if}
+        {#if !resumeState.resumable}<p id="resume-hint" class="resume-hint" role="status">{resumeState.reason}</p>{/if}
         <form class="composer" onsubmit={(event) => { event.preventDefault(); void submitPrompt(); }}>
-          <textarea value={currentDraft} oninput={(event) => updateDraft(event.currentTarget.value)} onkeydown={onComposerKey} placeholder={selectedConnectionId ? "Reply, or start the next run…" : "Add a connection to start a run…"} aria-label="Task prompt"></textarea>
-          <div class="composer-footer"><span class="send-hint">↵ send</span><select value={selectedConnectionId} onchange={(event) => selectConnection(event.currentTarget.value)} aria-label="Connection"><option value="">No connection</option>{#each connections as connection (connection.id)}<option value={connection.id}>{connection.name}{connection.model ? ` · ${connection.model}` : ""}</option>{/each}</select><span class="grow"></span><button class="workspace-button" type="button" onclick={() => void chooseWorkspacePath()} title={workspacePath || "Choose workspace"}>⌂ {workspacePath ? workspacePath.split("/").at(-1) : "Choose workspace"}</button>{#if currentRun && supports("interrupt")}<button class="stop-button" type="button" onclick={() => void interruptRun()}>Stop</button>{:else}<button class="send-button" type="submit" disabled={!currentDraft.trim() || !selectedConnectionId || runBusy}>{runBusy ? "Starting…" : "Run"}</button>{/if}</div>
+          <textarea value={currentDraft} oninput={(event) => updateDraft(event.currentTarget.value)} onkeydown={onComposerKey} placeholder={selectedConnectionId ? "Reply, or start the next run…" : "Add a connection to start a run…"} aria-label="Task prompt" aria-describedby={resumeState.resumable ? undefined : "resume-hint"}></textarea>
+          <div class="composer-footer"><span class="send-hint">↵ send</span><select value={selectedConnectionId} onchange={(event) => selectConnection(event.currentTarget.value)} aria-label="Connection"><option value="">No connection</option>{#each connections as connection (connection.id)}<option value={connection.id}>{connection.name}{connection.model ? ` · ${connection.model}` : ""}</option>{/each}</select><span class="grow"></span><button class="workspace-button" type="button" onclick={() => void chooseWorkspacePath()} title={workspacePath || "Choose workspace"}>⌂ {workspacePath ? workspacePath.split("/").at(-1) : "Choose workspace"}</button>{#if currentRun && supports("interrupt")}<button class="stop-button" type="button" onclick={() => void interruptRun()}>Stop</button>{:else}<button class="send-button" type="submit" disabled={!resumeState.resumable || !currentDraft.trim() || !selectedConnectionId || runBusy} title={resumeState.reason}>{runBusy ? "Starting…" : "Run"}</button>{/if}</div>
         </form>
       </footer>
     {/if}

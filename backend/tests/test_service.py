@@ -111,7 +111,7 @@ class ServiceTest(unittest.TestCase):
             "child_native_id": "child-native",
             "state": "completed",
             "child_snapshot": {
-                "session": {"native_id": "child-native", "name": "Child title", "model": "demo-model", "provider": "demo", "runtime_version": "test", "workspace": self.directory.name, "reported_start_at": "2026-01-01T00:00:00+00:00", "reported_end_at": "2026-01-01T00:00:03+00:00", "metadata": {"visibility": "snapshot"}},
+                "session": {"native_id": "child-native", "name": "Child title", "model": "demo-model", "provider": "demo", "runtime_version": "test", "workspace": self.directory.name, "capabilities": {"resumable": False}, "reported_start_at": "2026-01-01T00:00:00+00:00", "reported_end_at": "2026-01-01T00:00:03+00:00", "metadata": {"visibility": "snapshot"}},
                 "runs": [{"native_id": "child-turn", "state": "completed", "reported_start_at": "2026-01-01T00:00:00+00:00", "reported_end_at": "2026-01-01T00:00:03+00:00", "events": [{"kind": "assistant", "native_key": "message", "payload": {"message_id": "message", "phase": "completed", "text": "child result"}}]}],
             },
         }))
@@ -121,9 +121,18 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(child_detail["sessions"][0]["name"], "Child title")
         self.assertEqual(child_detail["sessions"][0]["requested_options"]["workspace"], self.directory.name)
         self.assertEqual(child_detail["sessions"][0]["effective_options"]["workspace"], self.directory.name)
+        self.assertEqual(child_detail["sessions"][0]["metadata"]["capabilities"]["resumable"], False)
         self.assertEqual(child_detail["runs"][0]["state"], "completed")
         self.assertEqual(child_detail["events"][0]["payload"]["text"], "child result")
         self.assertEqual(child_detail["duration"]["own_ms"], 3000)
+        with self.assertRaisesRegex(ValueError, "This session is managed by its parent task and cannot accept direct prompts\\."):
+            self.service.call("run.start", {
+                "task_id": detail["children"][0]["id"],
+                "connection_id": connection["id"],
+                "session_id": child_detail["sessions"][0]["id"],
+                "prompt": "resume child",
+                "workspace": self.directory.name,
+            })
         self.service.store.update_session(session["id"], native_id="parent-native")
         self.service._provider_event(context, self.service.adapters["demo"], AdapterEvent("subagent.started", "grandchild:start", {"child_native_id": "grandchild-native", "parent_native_id": "child-native", "state": "running"}))
         grandchild = self.service.call("task.detail", {"task_id": detail["children"][0]["id"]})
