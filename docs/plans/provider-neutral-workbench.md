@@ -69,7 +69,7 @@ is historical context only; new product work follows this document.
 
 ## Acceptance evidence (2026-09-27)
 
-- Renderer checks: `npm run typecheck` (0 errors/warnings), `npm run build:frontend`, `npm run test:e2e` (5 passed), and `git diff --check`.
+- Renderer and shell checks: `npm run typecheck` (0 errors/warnings), `npm run build:frontend`, `npm run test:e2e` (5 passed), `npm run test:shell` (5 passed), and `git diff --check`.
 - Rendered browser review covered empty startup, root/child task creation with inherited labels and permissions, note/todo persistence after reload, archive/undo, palette and light/dark themes, Reader artifacts, approval response, and per-task workspace/connection restoration across switching and reload.
 - Live SDK evidence: an isolated read-only start accepted prompt `YAKSHED_OK`; two-turn resume retained `cedar` in one native session while producing distinct native run IDs; an actual interrupt reached `interrupted`; and a native child requested `calculate 7*6`, persisted a completed native run with reported 2s duration, and hydrated usage. The measured subtree total was 87,851 (parent 66,135 + child 21,716).
-- Anthropic and OSS adapters are future work and are not shipped. Child usage remains `null`/`partial` when unavailable rather than being inferred. Final package and CI gates remain pending.
+- Anthropic and OSS adapters are future work and are not shipped. Child usage remains `null`/`partial` when unavailable rather than being inferred. The final PyInstaller freeze, Electron DMG/ZIP package, and `npm run package:smoke` passed locally on the final tree; remote CI remains the final gate.

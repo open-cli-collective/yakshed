@@ -21,7 +21,7 @@
     "package": "npm run build:frontend && node scripts/package-preflight.mjs && electron-builder --config desktop/electron-builder.yml",
     "browser-preview": "npm run build:frontend && node scripts/browser-preview.mjs --demo",
     "test:e2e": "playwright test",
-    "test:shell": "node --test desktop/test",
+    "test:shell": "node --test desktop/test/*.test.mjs",
     "test:syntax": "node --check desktop/main.mjs && node --check desktop/service.mjs && node --check scripts/browser-preview.mjs && node --check scripts/dev.mjs && node --check scripts/package-preflight.mjs && node --check scripts/package-smoke.mjs",
     "package:smoke": "node scripts/package-smoke.mjs",
     "backend:test": "python3 -m unittest discover -s backend/tests -p 'test_*.py'"
