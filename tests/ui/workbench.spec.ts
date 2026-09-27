@@ -96,4 +96,51 @@ test.describe("YakShed workbench", () => {
     await page.getByRole("button", { name: "Stop", exact: true }).click();
     await expect(page.getByText("Run interrupted.", { exact: true })).toBeVisible({ timeout: 10_000 });
   });
+
+  test("keeps a managed child readable without offering a direct run", async ({ page }) => {
+    let connectionId = "";
+    await page.route("**/__yakshed_rpc", async (route) => {
+      const request = route.request();
+      if (request.method() !== "POST") return route.continue();
+      const payload = JSON.parse(request.postData() ?? "{}");
+      const response = await route.fetch();
+      const value = await response.json();
+      if (payload.method === "connection.create" && typeof value.result?.id === "string") connectionId = value.result.id;
+      if (payload.method === "task.detail" && value.result?.task?.title === "Managed child task") {
+        const child = value.result.task;
+        value.result.sessions = [{
+          id: "fixture-managed-session",
+          task_id: child.id,
+          connection_id: connectionId,
+          requested_options: { workspace: "/managed-child-workspace" },
+          effective_options: { workspace: "/managed-child-workspace" },
+          metadata: { capabilities: { resumable: false } },
+        }];
+        value.result.events = [{ id: "fixture-managed-event", type: "assistant", payload: { text: "Managed child history remains available." } }];
+      }
+      await route.fulfill({ response, json: value });
+    });
+
+    await page.goto("/");
+    await page.getByRole("button", { name: "Open settings" }).click();
+    await page.getByRole("dialog", { name: "YakShed settings" }).getByRole("button", { name: "Connections", exact: true }).click();
+    await page.getByRole("button", { name: /Add connection/ }).click();
+    await page.getByLabel("Connection name").fill("Managed child fixture connection");
+    await page.getByLabel("Adapter").selectOption({ label: "Deterministic demo" });
+    await page.getByRole("button", { name: "Add connection", exact: true }).click();
+    await page.getByRole("dialog", { name: "YakShed settings" }).getByRole("button", { name: /Close/ }).click();
+
+    await page.getByRole("button", { name: /New task/ }).click();
+    await page.getByLabel("Title", { exact: true }).fill("Managed parent task");
+    await page.getByRole("button", { name: "Create task", exact: true }).click();
+    await expect(page.getByText("Managed parent task", { exact: true }).first()).toBeVisible();
+    await page.keyboard.press("Shift+c");
+    await page.getByRole("dialog", { name: "Create task" }).getByLabel("Title", { exact: true }).fill("Managed child task");
+    await page.getByRole("dialog", { name: "Create task" }).getByRole("button", { name: "Create task", exact: true }).click();
+
+    await expect(page.getByText("Managed child history remains available.", { exact: true })).toBeVisible();
+    await expect(page.locator("button.workspace-button")).toHaveAttribute("title", "/managed-child-workspace");
+    await expect(page.locator("#resume-hint")).toHaveText("This session is managed by its parent task and cannot accept direct prompts.");
+    await expect(page.getByRole("button", { name: "Run", exact: true })).toBeDisabled();
+  });
 });
