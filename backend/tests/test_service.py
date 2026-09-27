@@ -40,13 +40,22 @@ class ServiceTest(unittest.TestCase):
         connection = self.service.call("connection.create", {"name": "Demo", "adapter": "demo"})
         run = self.service.call("run.start", {"task_id": task["id"], "connection_id": connection["id"], "prompt": "inspect", "workspace": self.directory.name})
         wait_for(lambda: self.service.store.run(run["id"])["state"] == "waiting")
+        wait_for(lambda: (
+            any(event["type"] == "approval" for event in self.service.store.events_for_task(task["id"]))
+            and any(event["type"] == "tool" and event["payload"].get("status") == "waiting_for_approval" for event in self.service.store.events_for_task(task["id"]))
+        ))
         self.assertEqual(self.service.call("snapshot", {})["tasks"][0]["status"], "waiting")
         self.assertEqual(self.service.call("snapshot", {})["active_count"], 1)
         events = self.service.store.events_for_task(task["id"])
         approval = next(event["payload"]["approval_id"] for event in events if event["type"] == "approval")
         self.assertTrue(any(event["payload"].get("status") == "waiting_for_approval" for event in events if event["type"] == "tool"))
         self.service.call("approval.respond", {"approval_id": approval, "decision": "approve"})
-        wait_for(lambda: self.service.store.run(run["id"])["state"] == "completed")
+        wait_for(lambda: (
+            self.service.store.run(run["id"])["state"] == "completed"
+            and any(event["type"] == "run.completed" and event["run_id"] == run["id"] for event in self.service.store.events_for_task(task["id"]))
+            and any(event["type"] == "subagent.completed" for event in self.service.store.events_for_task(task["id"]))
+            and any(item["kind"] == "text" for item in self.service.store.artifacts(task["id"]))
+        ))
         self.assertEqual(self.service.call("snapshot", {})["tasks"][0]["status"], "inbox")
         self.assertEqual(self.service.call("snapshot", {})["active_count"], 0)
         detail = self.service.call("task.detail", {"task_id": task["id"]})
