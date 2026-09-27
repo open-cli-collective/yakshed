@@ -54,12 +54,14 @@ test("blocks direct prompts for a managed child session while retaining its hist
     runs: [{ id: "child-run", session_id: "child-session", requested_options: { workspace: "/child-repo" } }],
     sessions: [{
       id: "child-session",
+      connection_id: "connection-child",
       metadata: { capabilities: { resumable: false } },
     }],
   } as Pick<Detail, "runs" | "sessions">;
 
-  expect(taskResumeState(detail)).toEqual({
+  expect(taskResumeState(detail, "connection-child")).toEqual({
     resumable: false,
     reason: "This session is managed by its parent task and cannot accept direct prompts.",
   });
+  expect(taskResumeState(detail, "connection-other")).toEqual({ resumable: true });
 });

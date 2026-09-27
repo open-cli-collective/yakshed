@@ -226,12 +226,10 @@ export function latestTaskContext(detail: Pick<Detail, "runs" | "sessions">): Ta
   };
 }
 
-/** Read the neutral session capability that controls whether this task accepts direct prompts. */
-export function taskResumeState(detail: Pick<Detail, "runs" | "sessions">): TaskResumeState {
-  const latestRun = detail.runs.slice().reverse()[0];
-  const sessionId = text(latestRun?.session_id);
-  const session = detail.sessions.slice().reverse().find((candidate) => text(candidate.id) === sessionId)
-    ?? detail.sessions.slice().reverse()[0];
+/** Read the neutral session capability for the connection that will receive a prompt. */
+export function taskResumeState(detail: Pick<Detail, "runs" | "sessions">, connectionId: string): TaskResumeState {
+  const session = detail.sessions.slice().reverse().find((candidate) => text(candidate.connection_id) === connectionId);
+  if (!session) return { resumable: true };
   const metadata = object(session?.metadata);
   const capabilities = object(metadata.capabilities);
   if (capabilities.resumable === false) {

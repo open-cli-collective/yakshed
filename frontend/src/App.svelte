@@ -118,7 +118,7 @@
   $: currentRun = detail?.runs.slice().reverse().find((run) => ["queued", "starting", "running", "waiting", "cancelling"].includes(String(run.state ?? run.status))) ?? null;
   $: selectedConnection = connections.find((connection) => connection.id === selectedConnectionId) ?? null;
   $: currentCapabilities = selectedConnection ? adapterFor(selectedConnection)?.capabilities ?? [] : [];
-  $: resumeState = detail ? taskResumeState(detail) : { resumable: true };
+  $: resumeState = detail ? taskResumeState(detail, selectedConnectionId) : { resumable: true };
   $: effectivePermission = selectedTask ? effectivePermissionMode(selectedTask) : "read_only";
   $: allLabels = collectLabels(tasks);
   $: activeRows = treeRows("active", tasks, includeArchived, folded);
