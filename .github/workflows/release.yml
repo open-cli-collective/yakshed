@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the signed draft after artifact checks
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('manual-{0}', github.run_number) }}
+
+concurrency:
+  group: yakshed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build release artifacts
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: npm install --global npm@11.19.0
+      - run: python -m pip install -r backend/requirements.txt PyInstaller==6.16.0
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build:frontend
+      - run: npm run test:shell
+      - run: npm run test:syntax
+      - run: python -m unittest discover -s backend/tests -p 'test_*.py' -v
+      - name: Freeze service sidecar
+        run: |
+          test -f scripts/freeze_service.py
+          python scripts/freeze_service.py --output backend/dist/yakshed-service
+          test -x backend/dist/yakshed-service
+      - name: Require signing secrets for a public release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$CSC_LINK"
+          test -n "$CSC_KEY_PASSWORD"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_APP_SPECIFIC_PASSWORD"
+          test -n "$APPLE_TEAM_ID"
+      - name: Package release artifact
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run package
+      - run: npm run package:smoke
+      - name: Verify signed app before public publish
+        if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+        run: |
+          app_path="$(find dist -type d -name 'YakShed.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose "$app_path"
+          xcrun stapler validate "$app_path"
+      - name: Checksums
+        run: |
+          mkdir -p release
+          find dist -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' \) -exec cp {} release/ \;
+          test -n "$(find release -maxdepth 1 -type f -print -quit)"
+          shasum -a 256 release/* > release/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yakshed-${{ github.sha }}
+          path: release/*
+          if-no-files-found: error
+
+  draft:
+    name: Attach draft release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: yakshed-${{ github.sha }}
+          path: dist
+      - name: Draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          generate_release_notes: true
+          files: dist/*
+
+  publish:
+    name: Publish signed release
+    needs: draft
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require signing and notarization evidence
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$CSC_LINK"
+          test -n "$CSC_KEY_PASSWORD"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_APP_SPECIFIC_PASSWORD"
+          test -n "$APPLE_TEAM_ID"
+      - name: Publish draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false

@@ -1,0 +1,32 @@
+appId: com.yakshed.app
+productName: YakShed
+artifactName: YakShed-${version}-${os}-${arch}.${ext}
+asar: true
+compression: maximum
+files:
+  - desktop/main.mjs
+  - desktop/preload.cjs
+  - desktop/protocol.mjs
+  - desktop/service.mjs
+  - desktop/frontend/**/*
+  - package.json
+extraResources:
+  - from: backend/dist/yakshed-service
+    to: bin/yakshed-service
+directories:
+  output: dist
+publish: null
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: true
+  gatekeeperAssess: false
+linux:
+  category: Development
+  target:
+    - AppImage
+win:
+  target:
+    - nsis

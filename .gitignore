@@ -5,7 +5,18 @@ crates/**/target/
 # Node / frontend
 node_modules/
 dist/
+release/
 .vite/
+playwright-report/
+test-results/
+frontend/.svelte-kit/
+desktop/frontend/
+backend/dist/
+__pycache__/
+*.py[cod]
+.venv/
+*.sqlite3
+*.sqlite3-*
 crates/yakshed-tauri/test-results/
 crates/yakshed-desktop/frontend/
 crates/yakshed-desktop/gen/

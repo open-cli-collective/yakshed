@@ -1,146 +1,103 @@
 # YakShed
 
-YakShed is a local-first macOS desktop workbench for organizing, supervising,
-and resuming software work performed with coding-agent harnesses. It is built
-with Tauri, Svelte, and Rust. Codex App Server is the first harness boundary;
-the product model is the work item, not the provider conversation.
+YakShed is a local-first desktop workbench for organizing, supervising, and
+resuming software work performed by coding-agent harnesses. The active build
+is an Electron shell around a Python service and Svelte renderer. Codex is the
+first real provider; the product model remains provider-neutral.
 
-## Current state
+## Active layout
 
-The repository contains a working vertical slice and its supporting contracts:
+- `backend/yakshed` owns SQLite state, the JSONL product service, supervision,
+  redaction, and provider adapters.
+- `desktop` owns the Electron main process, preload bridge, service lifecycle,
+  IPC validation, packaging, and shell tests.
+- `frontend` owns the Svelte workbench. The Vite build writes to
+  `desktop/frontend` for packaged startup.
+- `docs/plans/provider-neutral-workbench.md` is the active implementation
+  authority. The files under `design/YakShed-UI` remain visual references.
 
-- Rust workspace layers for domain state, application use cases, persistence,
-  secrets, harnesses, the Codex adapter, the desktop API, and the Tauri shell.
-- Durable config, SQLite state, cache/artifact storage, revisioned snapshots,
-  and restart-safe state boundaries under injected `AppPaths`.
-- Explicit delegated or secret-backed credential bindings, a macOS Keychain
-  backend, development/test stores, narrow write-only credential ingress, and
-  canary-based redaction tests.
-- Codex JSONL transport/reduction with approvals, user input, steering,
-  interruption, process cleanup, unknown-event handling, and a generated schema
-  pin. The last validated Codex release is 0.147.0; it is metadata, not a
-  runtime version gate.
-- A Svelte/Tauri surface for work-item creation, Codex connection setup and
-  sign-in, run controls, timeline updates, approvals, user input, and outcome
-  reconciliation.
-- A deterministic mock harness, fake Codex process, test-only JSONL contract
-  host, Rust integration tests, and Playwright UI coverage.
+The previous Rust/Tauri implementation was removed from this branch. Git
+history retains it for archaeology; new work follows the Electron/Python
+boundary described in [the architecture guide](docs/architecture/overall.md).
 
-This is an implementation workbench, not yet the complete product described by
-the north star. The current shell does not expose every planned work-graph,
-working-copy, Reader, multi-harness, or remote-runtime workflow.
+## Prerequisites
 
-## Product direction
-
-The product is heading toward a durable work graph in which yaks can branch,
-pause, depend on one another, move between harnesses, and be resumed without
-reconstructing context from terminal scrollback. Planned direction includes
-first-class notes, todos, labels, worktrees, artifacts and Reader views,
-provider-neutral second-harness support, richer permission/runtime controls,
-and longer-lived background supervision. See the
-[product gestalt](docs/product/gestalt.md) and
-[overall architecture](docs/architecture/overall.md) for the intended scope.
-
-## Supported environment and prerequisites
-
-- macOS is the supported desktop target, including native Keychain use and
-  packaged-app smoke checks. The Rust backend, contract host, and web checks
-  can run without opening the desktop shell.
-- Rust 1.96.0 is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); use
-  the committed [`Cargo.lock`](Cargo.lock).
-- Node.js 22 and npm are required for the Svelte/Tauri toolchain;
-  [`package.json`](crates/yakshed-tauri/package.json) records npm 11.19.0 as
-  the package-manager reference. `npm ci` installs the locked UI dependencies.
-- Python 3 is required for the standard-library contract and packaging helper
-  scripts.
-- Live Codex runs require a `codex` executable on `PATH` and a Codex App Server
-  login. Contract, mock, Rust, and Playwright checks do not require a real
-  provider credential.
+- macOS for the desktop target and package smoke; Linux is supported for CI
+  checks and browser preview.
+- Node.js 22.14 or later and npm 11.19 or later within the ranges in
+  `package.json`.
+- Python 3.11 or later for the service. Python 3.12 or 3.13 is used for the
+  frozen service because the Codex SDK and PyInstaller wheels must match.
+- A delegated Codex login is required only for live Codex operations. Demo and
+  backend tests do not read or require provider credentials.
 
 ## Quick start
 
-Run the deterministic backend checks from the repository root:
-
 ```sh
-python3 scripts/verify_agent_guidance.py --self-test
-python3 scripts/verify_agent_guidance.py
-cargo test --workspace --locked
-cargo build -p yakshed-contract-host --locked
-python3 scripts/backend_contract_test.py \
-  --host target/debug/yakshed-contract-host \
-  --fake-harness scripts/fake_harness.py
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r backend/requirements.txt
+export YAKSHED_PYTHON="$PWD/.venv/bin/python"
+npm ci
+npm run dev
 ```
 
-Build and exercise the web surface:
+The normal app starts with an empty local data directory. To use the isolated
+deterministic adapter and fixture workspace, run:
 
 ```sh
-cd crates/yakshed-tauri
-npm ci
+npm run dev:demo
+```
+
+For rendered browser checks backed by the real demo JSONL service:
+
+```sh
+npm run browser-preview
+```
+
+The preview is test-only, binds to loopback, rejects live provider login and
+connections, uses a per-process token, and deletes its temporary data on exit.
+
+## Checks and packaging
+
+```sh
 npm run typecheck
-npm run build
+npm run build:frontend
+npm run test:shell
+npm run test:syntax
+npm run backend:test
 npm run test:e2e
 ```
 
-On macOS, validate and start the real desktop shell with the deterministic fake
-Codex process after installing the locked UI dependencies:
+The backend freeze step supplies `backend/dist/yakshed-service`, including the
+Codex native runtime and package metadata. After that artifact exists, build
+and exercise the real app bundle:
 
 ```sh
-cd crates/yakshed-tauri
-npm ci
-cd ../..
-python3 scripts/dev_app.py --self-test
-python3 scripts/dev_app.py --scenario approval
+npm run package
+npm run package:smoke
 ```
 
-This is the real WebView → Tauri IPC → application/store → Codex adapter path
-with a fake external process; it never makes a production Codex call. In the
-window, add a `Codex` connection with provider `openai` (the fake reports it as
-authenticated), create a work item, and start a run. With `approval`, the
-timeline must show `reader-still-live` while approval is pending; approve it
-and observe completion. Relaunch with `--scenario user_input` and answer
-`blue`. Relaunch with `--scenario chunked` and inspect the message, file, and
-command timeline entries. The launcher prints the exact preserved state root
-and cleanup command; use the [desktop debug runbook](docs/runbooks/tauri-packaging.md)
-for the full journey and cleanup boundary.
+`python scripts/freeze_service.py --output backend/dist/yakshed-service` uses
+the pinned Python environment and PyInstaller; when invoked from an unsupported
+system Python it can bootstrap the same build through `uv`.
 
-For a normal live Codex development process, use `npm run tauri -- dev` from
-`crates/yakshed-tauri`. For a packaged app and clean launch/quit check, use
-[`docs/runbooks/tauri-packaging.md`](docs/runbooks/tauri-packaging.md).
+See the [Electron runbook](docs/runbooks/electron-desktop.md) for lifecycle,
+freeze, release, and cleanup details. CI runs the Linux checks and macOS
+package lane. Tag and manual release runs create draft artifacts; public
+publishing requires verified signing and notarization.
 
-## Verification
+## Data, authentication, and extension boundaries
 
-The practical full workspace lane is:
+Normal data lives under the OS application-data directory selected by Electron.
+The demo directory is separate and opt-in. The renderer receives product
+snapshots and revision hints through a narrow preload API; it never gets Node,
+filesystem, SQL, provider, or generic process access. Production startup does
+not expose a localhost HTTP service.
 
-```sh
-python3 scripts/verify_agent_guidance.py --self-test
-python3 scripts/verify_agent_guidance.py
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-python3 scripts/verify_schema_pin.py
-python3 scripts/verify_codex_metadata.py
-```
+Authentication is delegated to the provider harness. YakShed does not ask the
+renderer to handle tokens and never stores credentials in SQLite, events,
+URLs, argv, logs, or frontend state. The Codex adapter is the only backend
+module that imports the SDK. A future adapter must implement the same product
+seam and sanitized event model rather than adding a provider RPC to the shell.
 
-Run the frontend checks when the UI changes, and the macOS package smoke when
-packaging, startup, or process lifecycle changes. Codex drift is checked by
-the scheduled/manual procedure in
-[`codex-tracking.md`](docs/standards/codex-tracking.md) rather than by ordinary
-hermetic checks.
-
-## Repository knowledge store
-
-Start with [`AGENTS.md`](AGENTS.md), then use the source-of-truth documents:
-
-- [Harness-engineering standard](docs/standards/harness-engineering.md)
-- [Product gestalt](docs/product/gestalt.md)
-- [Overall architecture](docs/architecture/overall.md)
-- [Sandboxing and approvals](docs/architecture/sandboxing.md)
-- [Backend composition and testing](docs/standards/backend-composition-and-testing.md)
-- [Working with secrets](docs/standards/working-with-secrets.md)
-- [Working with state](docs/standards/working-with-state.md)
-- [Backend contract v1](docs/contracts/backend-contract-v1.md)
-- [Codex phase-0 verification](pins/phase0-verification.md) and [lock record](pins/codex-lock.json)
-- [Tauri success criteria](docs/standards/tauri-success-criteria.md)
-- [Credentials and packaging criteria](docs/standards/credentials-packaging-criteria.md)
-- [Codex authentication](docs/runbooks/codex-auth.md), [packaging](docs/runbooks/tauri-packaging.md), and [release signing](docs/runbooks/release-signing.md)
-- [Repo-local review agents](.codereview/agents/README.md)
+Read [the product gestalt](docs/product/gestalt.md), [the active contract](docs/contracts/backend-contract-v1.md), and [the sandboxing guide](docs/architecture/sandboxing.md) before changing a boundary.

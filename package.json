@@ -1,0 +1,40 @@
+{
+  "name": "yakshed",
+  "version": "0.1.0",
+  "description": "Local-first coding workbench",
+  "author": "YakShed",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.19.0",
+  "engines": {
+    "node": ">=22.14.0 <27",
+    "npm": ">=11.19.0"
+  },
+  "main": "desktop/main.mjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:demo": "node scripts/dev.mjs --demo",
+    "dev:frontend": "vite --host 127.0.0.1",
+    "build:frontend": "vite build",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json",
+    "build": "npm run build:frontend && node scripts/package-preflight.mjs && electron-builder --dir --config desktop/electron-builder.yml",
+    "package": "npm run build:frontend && node scripts/package-preflight.mjs && electron-builder --config desktop/electron-builder.yml",
+    "browser-preview": "npm run build:frontend && node scripts/browser-preview.mjs --demo",
+    "test:e2e": "playwright test",
+    "test:shell": "node --test desktop/test",
+    "test:syntax": "node --check desktop/main.mjs && node --check desktop/service.mjs && node --check scripts/browser-preview.mjs && node --check scripts/dev.mjs && node --check scripts/package-preflight.mjs && node --check scripts/package-smoke.mjs",
+    "package:smoke": "node scripts/package-smoke.mjs",
+    "backend:test": "python3 -m unittest discover -s backend/tests -p 'test_*.py'"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "@types/node": "24.3.0",
+    "electron": "44.4.5",
+    "electron-builder": "26.0.12",
+    "svelte": "5.56.8",
+    "svelte-check": "4.7.5",
+    "typescript": "6.0.3",
+    "vite": "8.2.1"
+  }
+}
