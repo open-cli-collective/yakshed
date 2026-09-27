@@ -2,7 +2,6 @@ appId: com.yakshed.app
 productName: YakShed
 artifactName: YakShed-${version}-${os}-${arch}.${ext}
 asar: true
-compression: maximum
 files:
   - desktop/main.mjs
   - desktop/preload.cjs

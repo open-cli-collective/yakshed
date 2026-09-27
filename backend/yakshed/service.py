@@ -158,6 +158,9 @@ class Service:
                     run_changes["native_id"] = payload["run_native_id"]
                 if isinstance(payload.get("metadata"), dict):
                     run_changes["metadata"] = payload["metadata"]
+                # Other adapters may report this run's own timestamps at
+                # start time. Codex uses the session_reported_* fields below
+                # for its historical provider-thread timestamps.
                 if payload.get("reported_start_at") is not None:
                     run_changes["reported_start_at"] = payload["reported_start_at"]
                 if payload.get("reported_end_at") is not None:
@@ -175,10 +178,10 @@ class Service:
                     session_changes["effective_options"] = effective
                 if isinstance(payload.get("metadata"), dict):
                     session_changes["metadata"] = payload["metadata"]
-                if current_session.get("reported_start_at") is None and payload.get("reported_start_at") is not None:
-                    session_changes["reported_start_at"] = payload["reported_start_at"]
-                if current_session.get("reported_end_at") is None and payload.get("reported_end_at") is not None:
-                    session_changes["reported_end_at"] = payload["reported_end_at"]
+                if current_session.get("reported_start_at") is None and payload.get("session_reported_start_at") is not None:
+                    session_changes["reported_start_at"] = payload["session_reported_start_at"]
+                if current_session.get("reported_end_at") is None and payload.get("session_reported_end_at") is not None:
+                    session_changes["reported_end_at"] = payload["session_reported_end_at"]
                 self.store.update_session(context.session_id, **session_changes)
         elif event.kind == "run.metadata":
             current = (self.store.run(context.run_id) or {}).get("state")
@@ -204,7 +207,7 @@ class Service:
             self.store.update_run(context.run_id, **run_changes)
             session_changes: dict[str, Any] = {"state": state, "ended_at": self._timestamp(), "last_error": payload.get("error"), "cancellation_reason": payload.get("reason")}
             current_session = self.store.session(context.session_id) or {}
-            if current_session.get("reported_end_at") is None and payload.get("reported_end_at") is not None:
+            if payload.get("reported_end_at") is not None:
                 session_changes["reported_end_at"] = payload["reported_end_at"]
             self.store.update_session(context.session_id, **session_changes)
         elif event.kind == "usage":
@@ -284,7 +287,12 @@ class Service:
                 child_name = str(event.payload.get("name") or event.payload.get("agent_path") or event.payload.get("agent_nickname") or "Child task")
                 session_name = str(event.payload.get("name") or event.payload.get("agent_path") or event.payload.get("agent_nickname") or "Child agent")
                 child = self.store.create_task(child_name, parent_task_id=parent_task_id)
-                child_session = self.store.create_session(child["id"], context.adapter_id, context.provider, event.payload.get("model"), {}, parent_session_id=parent_session_id, relation="subagent", name=session_name, connection_id=context.connection_id)
+                # The parent run's workspace is the only safe requested
+                # workspace available before a provider child snapshot has
+                # been reconciled. Keep it durable so selecting/resuming a
+                # child does not lose the parent context.
+                requested_options = {"workspace": context.workspace} if context.workspace else {}
+                child_session = self.store.create_session(child["id"], context.adapter_id, context.provider, event.payload.get("model"), requested_options, parent_session_id=parent_session_id, relation="subagent", name=session_name, connection_id=context.connection_id)
                 link = (child["id"], child_session["id"])
             self._subagent_links[key] = link
         child_task, child_session = link
@@ -336,8 +344,13 @@ class Service:
         session = self.store.session(session_id) or {}
         metadata = dict(session.get("metadata") or {})
         metadata.update(session_info.get("metadata") if isinstance(session_info.get("metadata"), dict) else {})
+        effective_options = dict(session.get("effective_options") or {})
+        reported_workspace = session_info.get("workspace")
+        if isinstance(reported_workspace, str) and reported_workspace.strip():
+            effective_options["workspace"] = reported_workspace
         session_changes: dict[str, Any] = {
             "native_id": session_info.get("native_id") or session.get("native_id"),
+            "name": session_info.get("name") or session.get("name"),
             "model": session_info.get("model") or session.get("model"),
             "provider": session_info.get("provider") or session.get("provider"),
             "runtime_version": session_info.get("runtime_version") or session.get("runtime_version"),
@@ -345,6 +358,8 @@ class Service:
             "reported_start_at": session_info.get("reported_start_at"),
             "reported_end_at": session_info.get("reported_end_at"),
         }
+        if effective_options:
+            session_changes["effective_options"] = effective_options
         self.store.update_session(session_id, **session_changes)
         runs = response.get("runs") if isinstance(response.get("runs"), list) else []
         for run_info in runs:

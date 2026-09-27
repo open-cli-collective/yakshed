@@ -111,14 +111,16 @@ class ServiceTest(unittest.TestCase):
             "child_native_id": "child-native",
             "state": "completed",
             "child_snapshot": {
-                "session": {"native_id": "child-native", "name": "Child title", "model": "demo-model", "provider": "demo", "runtime_version": "test", "reported_start_at": "2026-01-01T00:00:00+00:00", "reported_end_at": "2026-01-01T00:00:03+00:00", "metadata": {"visibility": "snapshot"}},
+                "session": {"native_id": "child-native", "name": "Child title", "model": "demo-model", "provider": "demo", "runtime_version": "test", "workspace": self.directory.name, "reported_start_at": "2026-01-01T00:00:00+00:00", "reported_end_at": "2026-01-01T00:00:03+00:00", "metadata": {"visibility": "snapshot"}},
                 "runs": [{"native_id": "child-turn", "state": "completed", "reported_start_at": "2026-01-01T00:00:00+00:00", "reported_end_at": "2026-01-01T00:00:03+00:00", "events": [{"kind": "assistant", "native_key": "message", "payload": {"message_id": "message", "phase": "completed", "text": "child result"}}]}],
             },
         }))
         detail = self.service.call("task.detail", {"task_id": task["id"]})
         self.assertEqual(len(detail["children"]), 1)
         child_detail = self.service.call("task.detail", {"task_id": detail["children"][0]["id"]})
-        self.assertEqual(child_detail["sessions"][0]["name"], "Child agent")
+        self.assertEqual(child_detail["sessions"][0]["name"], "Child title")
+        self.assertEqual(child_detail["sessions"][0]["requested_options"]["workspace"], self.directory.name)
+        self.assertEqual(child_detail["sessions"][0]["effective_options"]["workspace"], self.directory.name)
         self.assertEqual(child_detail["runs"][0]["state"], "completed")
         self.assertEqual(child_detail["events"][0]["payload"]["text"], "child result")
         self.assertEqual(child_detail["duration"]["own_ms"], 3000)
@@ -133,6 +135,25 @@ class ServiceTest(unittest.TestCase):
         }))
         grandchild = self.service.call("task.detail", {"task_id": detail["children"][0]["id"]})
         self.assertEqual(len(grandchild["children"]), 1)
+
+    def test_session_reported_times_do_not_become_resumed_run_duration(self) -> None:
+        task = self.service.call("task.create", {"title": "Root"})["task"]
+        connection = self.service.call("connection.create", {"name": "Demo", "adapter": "demo"})
+        session = self.service.store.create_session(task["id"], "demo", "demo", "demo-model", {}, connection_id=connection["id"])
+        run = self.service.store.create_run(task["id"], session["id"], "resume", {})
+        context = RunContext(run_id=run["id"], session_id=session["id"], task_id=task["id"], prompt="resume", workspace=self.directory.name, adapter_id="demo", provider="demo", connection_id=connection["id"])
+        self.service._provider_event(context, self.service.adapters["demo"], AdapterEvent("run.started", "thread.started", {
+            "native_id": "provider-session",
+            "session_reported_start_at": "2026-01-01T00:00:00+00:00",
+        }))
+        self.service._provider_event(context, self.service.adapters["demo"], AdapterEvent("run.failed", "run.failed", {"error": "turn could not start", "reported_end_at": "2026-01-01T00:00:03+00:00"}))
+        stored_run = self.service.store.run(run["id"])
+        stored_session = self.service.store.session(session["id"])
+        self.assertIsNone(stored_run["reported_start_at"])
+        self.assertEqual(stored_run["reported_end_at"], "2026-01-01T00:00:03+00:00")
+        self.assertEqual(stored_session["reported_start_at"], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(stored_session["reported_end_at"], "2026-01-01T00:00:03+00:00")
+        self.assertLess(self.service.store.duration_rollup(task["id"])["own_ms"], 10_000)
 
     def test_codex_child_raw_fixture_preserves_root_child_grandchild_chain(self) -> None:
         root = self.service.call("task.create", {"title": "Root"})["task"]

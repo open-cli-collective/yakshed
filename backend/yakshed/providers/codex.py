@@ -634,7 +634,11 @@ class CodexAdapter:
             }
             with self._lock:
                 self._runs[context.run_id] = {"thread": thread, "emit": emit, "context": context}
-            emit(AdapterEvent("run.started", "thread.started", {"native_id": thread.id, "runtime_version": getattr(client, "_runtime_version", None), "model": effective_model, "provider": effective_provider, "effective_options": effective_options, "reported_start_at": self._reported_time(getattr(started_thread, "created_at", None)), "reported_end_at": self._reported_time(getattr(started_thread, "updated_at", None)), "metadata": {**response_metadata, "provider_thread": {"name": getattr(started_thread, "name", None), "created_at": getattr(started_thread, "created_at", None), "updated_at": getattr(started_thread, "updated_at", None), "source": self._enum_value(getattr(started_thread, "source", None)), "cwd": str(getattr(started_thread, "cwd", ""))}}}))
+            # The thread timestamps describe the provider session lifetime,
+            # while the turn timestamps describe this product run. Keep the
+            # two observations separate so a resumed turn does not inherit
+            # the whole historical thread duration.
+            emit(AdapterEvent("run.started", "thread.started", {"native_id": thread.id, "runtime_version": getattr(client, "_runtime_version", None), "model": effective_model, "provider": effective_provider, "effective_options": effective_options, "session_reported_start_at": self._reported_time(getattr(started_thread, "created_at", None)), "metadata": {**response_metadata, "provider_thread": {"name": getattr(started_thread, "name", None), "created_at": getattr(started_thread, "created_at", None), "updated_at": getattr(started_thread, "updated_at", None), "source": self._enum_value(getattr(started_thread, "source", None)), "cwd": str(getattr(started_thread, "cwd", ""))}}}))
             # An interrupt can arrive after thread/start (or resume) but
             # before Thread.turn has created a handle.  Do not start a turn
             # after cancellation was requested.

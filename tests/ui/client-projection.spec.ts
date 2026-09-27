@@ -30,3 +30,21 @@ test("restores the latest run workspace with its session connection", () => {
 
   expect(context).toEqual({ workspace: "/repoB", connectionId: "connection-b" });
 });
+
+test("restores a child workspace reported by the session effective options", () => {
+  const context = latestTaskContext({
+    runs: [
+      { id: "child-run", task_id: "child-task", session_id: "child-session", requested_options: {} },
+    ],
+    sessions: [
+      {
+        id: "child-session",
+        connection_id: "connection-child",
+        effective_options: { workspace: "/child-repo" },
+        requested_options: { workspace: "/stale-requested-repo" },
+      },
+    ],
+  } as Pick<Detail, "runs" | "sessions">);
+
+  expect(context).toEqual({ workspace: "/child-repo", connectionId: "connection-child" });
+});

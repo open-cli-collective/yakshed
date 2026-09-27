@@ -211,8 +211,9 @@ export function latestTaskContext(detail: Pick<Detail, "runs" | "sessions">): Ta
   const sessionId = text(latestRun?.session_id);
   const session = detail.sessions.slice().reverse().find((candidate) => text(candidate.id) === sessionId)
     ?? detail.sessions.slice().reverse()[0];
+  const effectiveOptions = object(session?.effective_options);
   const sessionOptions = object(session?.requested_options);
-  const workspace = text(runOptions.workspace ?? sessionOptions.workspace);
+  const workspace = text(runOptions.workspace ?? effectiveOptions.workspace ?? sessionOptions.workspace);
   const connectionId = text(session?.connection_id);
   return {
     ...(workspace ? { workspace } : {}),
