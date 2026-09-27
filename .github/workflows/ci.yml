@@ -72,5 +72,5 @@ jobs:
           test -f scripts/freeze_service.py
           python scripts/freeze_service.py --output backend/dist/yakshed-service
           test -x backend/dist/yakshed-service
-      - run: npm run package
+      - run: npm run build
       - run: npm run package:smoke
