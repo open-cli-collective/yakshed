@@ -32,9 +32,9 @@ function hasValidTempDirectory(value) {
   }
 }
 
-function childEnvironment() {
+function childEnvironment(tempDir) {
   const environment = { ...process.env, PYTHONUNBUFFERED: "1", YAKSHED_DESKTOP: "1" };
-  if (!hasValidTempDirectory(environment.TMPDIR)) environment.TMPDIR = os.tmpdir();
+  if (!hasValidTempDirectory(environment.TMPDIR)) environment.TMPDIR = hasValidTempDirectory(tempDir) ? tempDir : os.tmpdir();
   return environment;
 }
 
@@ -52,13 +52,14 @@ function commandFor({ packaged, dataDir, demo, serviceBinary, python }) {
 }
 
 export class BackendService extends EventEmitter {
-  constructor({ dataDir, demo = false, packaged = false, serviceBinary, python, requestTimeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  constructor({ dataDir, demo = false, packaged = false, serviceBinary, python, tempDir, requestTimeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
     super();
     this.dataDir = asAbsoluteDirectory(dataDir, "data directory");
     this.demo = Boolean(demo);
     this.packaged = Boolean(packaged);
     this.serviceBinary = serviceBinary;
     this.python = python;
+    this.tempDir = tempDir;
     this.requestTimeoutMs = requestTimeoutMs;
     this.child = null;
     this.stdout = "";
@@ -80,7 +81,7 @@ export class BackendService extends EventEmitter {
     });
     const child = spawn(command.command, command.args, {
       cwd: command.cwd,
-      env: childEnvironment(),
+      env: childEnvironment(this.tempDir),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,

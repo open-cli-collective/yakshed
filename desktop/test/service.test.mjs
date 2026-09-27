@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import os from "node:os";
 import path from "node:path";
@@ -61,6 +61,7 @@ test("spawn failures settle and stop remains bounded", async () => {
 test("service supplies a valid temp directory when the parent omits TMPDIR", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "yakshed-service-tmpdir-"));
   const helper = path.join(root, "helper.cjs");
+  const tempDir = path.join(root, "native-temp");
   const previous = process.env.TMPDIR;
   const source = `#!/usr/bin/env node
 const { mkdirSync, writeFileSync } = require("node:fs");
@@ -74,13 +75,14 @@ process.stdin.resume();
   try {
     await writeFile(helper, source, { mode: 0o755 });
     await chmod(helper, 0o755);
+    await mkdir(tempDir);
     delete process.env.TMPDIR;
     const dataDir = path.join(root, "data");
-    const service = new BackendService({ dataDir, packaged: true, serviceBinary: helper });
+    const service = new BackendService({ dataDir, packaged: true, serviceBinary: helper, tempDir });
     service.on("error", () => {});
     service.start();
     const observed = (await waitForFile(path.join(dataDir, "tmpdir"))).trim();
-    assert.equal(observed, os.tmpdir());
+    assert.equal(observed, tempDir);
     await service.stop();
   } finally {
     if (previous === undefined) delete process.env.TMPDIR;

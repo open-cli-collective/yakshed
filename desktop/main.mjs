@@ -84,6 +84,7 @@ async function start() {
     demo,
     packaged: isPackaged,
     serviceBinary: undefined,
+    tempDir: app.getPath("temp"),
   });
   backend.on("event", (event) => {
     if (event.event === "changed") updateActiveCount(event);
