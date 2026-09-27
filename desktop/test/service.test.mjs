@@ -58,6 +58,37 @@ test("spawn failures settle and stop remains bounded", async () => {
   }
 });
 
+test("service supplies a valid temp directory when the parent omits TMPDIR", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "yakshed-service-tmpdir-"));
+  const helper = path.join(root, "helper.cjs");
+  const previous = process.env.TMPDIR;
+  const source = `#!/usr/bin/env node
+const { mkdirSync, writeFileSync } = require("node:fs");
+const path = require("node:path");
+const index = process.argv.indexOf("--data-dir");
+const dataDir = process.argv[index + 1];
+mkdirSync(dataDir, { recursive: true });
+writeFileSync(path.join(dataDir, "tmpdir"), process.env.TMPDIR || "");
+process.stdin.resume();
+`;
+  try {
+    await writeFile(helper, source, { mode: 0o755 });
+    await chmod(helper, 0o755);
+    delete process.env.TMPDIR;
+    const dataDir = path.join(root, "data");
+    const service = new BackendService({ dataDir, packaged: true, serviceBinary: helper });
+    service.on("error", () => {});
+    service.start();
+    const observed = (await waitForFile(path.join(dataDir, "tmpdir"))).trim();
+    assert.equal(observed, os.tmpdir());
+    await service.stop();
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("leader exit cleanup reaps a detached descendant", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "yakshed-service-group-"));
   const helper = path.join(root, "leader.cjs");

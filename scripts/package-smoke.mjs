@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -29,15 +29,30 @@ async function findExecutable() {
 
 async function main() {
   const executable = await findExecutable();
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "yakshed-package-smoke-"));
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "yakshed-package-smoke-"));
+  const dataDir = path.join(rootDir, "data");
+  const codexHome = path.join(rootDir, "codex-home");
+  const home = path.join(rootDir, "home");
+  const workingDir = path.join(rootDir, "cwd");
+  await Promise.all([dataDir, codexHome, home, workingDir].map((directory) => mkdir(directory)));
   try {
-    const child = spawn(executable, ["--smoke", "--data-dir", dataDir], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(executable, ["--smoke", "--data-dir", dataDir], {
+      cwd: workingDir,
+      env: {
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        HOME: home,
+        CODEX_HOME: codexHome,
+        LANG: "en_US.UTF-8",
+        LC_ALL: "en_US.UTF-8",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { output += chunk; });
     child.stderr.on("data", (chunk) => { output += chunk; });
-    const timer = setTimeout(() => child.kill("SIGTERM"), 15_000);
+    const timer = setTimeout(() => child.kill("SIGTERM"), 45_000);
     const code = await new Promise((resolve, reject) => {
       child.once("error", reject);
       child.once("exit", (exitCode, signal) => resolve(exitCode ?? (signal ? 1 : 0)));
@@ -48,7 +63,7 @@ async function main() {
     if (!entries.length) throw new Error("packaged app did not initialize its isolated data directory");
     console.log(`package smoke passed: ${path.basename(path.dirname(path.dirname(path.dirname(executable))))}`);
   } finally {
-    await rm(dataDir, { recursive: true, force: true });
+    await rm(rootDir, { recursive: true, force: true });
   }
 }
 

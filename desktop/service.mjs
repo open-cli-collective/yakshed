@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { EventEmitter } from "node:events";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -20,6 +21,21 @@ function asAbsoluteDirectory(value, label) {
     throw new TypeError(`${label} must be an absolute path`);
   }
   return path.normalize(value);
+}
+
+function hasValidTempDirectory(value) {
+  if (typeof value !== "string" || !value || !path.isAbsolute(value)) return false;
+  try {
+    return statSync(value).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function childEnvironment() {
+  const environment = { ...process.env, PYTHONUNBUFFERED: "1", YAKSHED_DESKTOP: "1" };
+  if (!hasValidTempDirectory(environment.TMPDIR)) environment.TMPDIR = os.tmpdir();
+  return environment;
 }
 
 function commandFor({ packaged, dataDir, demo, serviceBinary, python }) {
@@ -64,7 +80,7 @@ export class BackendService extends EventEmitter {
     });
     const child = spawn(command.command, command.args, {
       cwd: command.cwd,
-      env: { ...process.env, PYTHONUNBUFFERED: "1", YAKSHED_DESKTOP: "1" },
+      env: childEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,

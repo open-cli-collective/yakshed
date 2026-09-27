@@ -328,15 +328,18 @@ function sendEvent(event) {
 }
 
 function startSmokeCheck() {
-  smokeTimer = setTimeout(() => failSmoke("packaged renderer/service readiness timed out"), 15_000);
+  smokeTimer = setTimeout(() => failSmoke("packaged renderer/service readiness timed out"), 30_000);
   if (startupError) {
     failSmoke(startupError);
     return;
   }
-  backend.request("snapshot").then(() => {
+  backend.request("snapshot").then(() => backend.request("adapter.status", { adapter: "codex" })).then((status) => {
+    if (!status || typeof status !== "object" || status.installed !== true || typeof status.version !== "string" || !status.version || typeof status.authenticated !== "boolean" || status.error != null) {
+      throw new Error("packaged Codex runtime status unavailable");
+    }
     smokeBackendReady = true;
     maybeFinishSmoke();
-  }).catch((error) => failSmoke(safeErrorMessage(error, "packaged service snapshot failed")));
+  }).catch((error) => failSmoke(safeErrorMessage(error, "packaged service status failed")));
 }
 
 function maybeFinishSmoke() {
