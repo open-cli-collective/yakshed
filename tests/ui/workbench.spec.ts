@@ -1,6 +1,41 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("YakShed workbench", () => {
+  test("defaults to system appearance and preserves explicit modes and palette changes", async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.goto("/");
+    const app = page.locator(".app");
+    await page.getByRole("button", { name: "Open appearance palette" }).click();
+    await page.getByRole("button", { name: "Appearance", exact: true }).click();
+    const modes = page.getByRole("group", { name: "Appearance mode" });
+    await expect(modes.getByRole("button", { name: "System" })).toHaveAttribute("aria-pressed", "true");
+    await expect(app).toHaveAttribute("data-theme", /-light$/);
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expect(app).toHaveAttribute("data-theme", /-dark$/);
+    await page.getByRole("button", { name: /Ledger/ }).click();
+    await expect(modes.getByRole("button", { name: "System" })).toHaveAttribute("aria-pressed", "true");
+    await page.emulateMedia({ colorScheme: "light" });
+    await expect(app).toHaveAttribute("data-theme", "ledger-light");
+
+    await modes.getByRole("button", { name: "Light", exact: true }).click();
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expect(app).toHaveAttribute("data-theme", "ledger-light");
+    await page.reload();
+    await expect(app).toHaveAttribute("data-theme", "ledger-light");
+    await page.getByRole("button", { name: "Open appearance palette" }).click();
+    await page.getByRole("button", { name: "Appearance", exact: true }).click();
+    await expect(modes.getByRole("button", { name: "Light", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await modes.getByRole("button", { name: "Dark", exact: true }).click();
+    await page.emulateMedia({ colorScheme: "light" });
+    await expect(app).toHaveAttribute("data-theme", "ledger-dark");
+    await modes.getByRole("button", { name: "System" }).click();
+    await expect(app).toHaveAttribute("data-theme", "ledger-light");
+    await page.screenshot({ path: "test-results/system-appearance.png" });
+    await page.reload();
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expect(app).toHaveAttribute("data-theme", "ledger-dark");
+  });
+
   test("creates a task tree, edits notes and todos, and restores an archive", async ({ page }) => {
     await page.goto("/");
     await page.getByRole("button", { name: /New task/ }).click();

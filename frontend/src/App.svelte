@@ -65,6 +65,8 @@
   let settingsOpen = false;
   let settingsSection = "general";
   let palette = "og";
+  let appearance: "system" | "light" | "dark" = "system";
+  let systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   let mode: "light" | "dark" = "dark";
   let defaultPermission: PermissionMode = "read_only";
   let focusZone: "threads" | "todos" = "threads";
@@ -127,6 +129,7 @@
   $: archivedRows = tasks.filter((task) => task.archived).map((task) => ({ task, depth: 0 }));
   $: taskCount = tasks.filter((task) => !task.archived).length;
   $: pendingTodoCount = detail?.todos.filter((todo) => !todo.done).length ?? 0;
+  $: mode = appearance === "system" ? (systemDark ? "dark" : "light") : appearance;
   $: themeName = palettes.find((item) => item.id === palette)?.[mode === "dark" ? "darkName" : "name"] ?? "Original";
   $: statsTaskCounts = object(stats?.tasks);
   $: timelineEvents = projectTimeline(detail?.events ?? []);
@@ -149,16 +152,15 @@
     if (typeof value !== "string") return;
     const parts = value.toLowerCase().split("-");
     const nextPalette = palettes.some((item) => item.id === parts[0]) ? parts[0] : palette;
-    const nextMode = parts[1] === "light" || parts[1] === "dark" ? parts[1] : mode;
     palette = nextPalette;
-    mode = nextMode;
+    if (parts[1] === "light" || parts[1] === "dark") appearance = parts[1];
   }
 
   function loadLocalPreferences(): void {
     if (typeof localStorage === "undefined") return;
     const storedMode = localStorage.getItem("yakshed.mode");
     const storedPalette = localStorage.getItem("yakshed.palette");
-    if (storedMode === "light" || storedMode === "dark") mode = storedMode;
+    if (storedMode === "system" || storedMode === "light" || storedMode === "dark") appearance = storedMode;
     if (palettes.some((item) => item.id === storedPalette)) palette = storedPalette ?? palette;
   }
 
@@ -642,8 +644,8 @@
     await setSetting("default_permission", value);
   }
 
-  async function setTheme(nextMode = mode, nextPalette = palette): Promise<void> {
-    mode = nextMode;
+  async function setTheme(nextMode = appearance, nextPalette = palette): Promise<void> {
+    appearance = nextMode;
     palette = nextPalette;
     localStorage.setItem("yakshed.mode", nextMode);
     localStorage.setItem("yakshed.palette", nextPalette);
@@ -874,7 +876,7 @@
     if (key === "t") {
       const index = palettes.findIndex((item) => item.id === palette);
       const next = palettes[(index + (event.shiftKey ? palettes.length - 1 : 1)) % palettes.length];
-      void setTheme(mode, next.id);
+      void setTheme(appearance, next.id);
       return;
     }
     if (event.key === ",") { settingsOpen = !settingsOpen; return; }
@@ -898,14 +900,16 @@
   }
 
   onMount(() => {
-    const systemDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
-    mode = systemDark ? "dark" : "light";
+    const systemAppearance = window.matchMedia("(prefers-color-scheme: dark)");
+    const updateSystemAppearance = () => { systemDark = systemAppearance.matches; };
+    updateSystemAppearance();
+    systemAppearance.addEventListener("change", updateSystemAppearance);
     void loadSnapshot();
     void subscribe((event) => {
       if (event.event === "changed" || typeof event.revision === "number") void loadSnapshot(false);
     }).then((unsubscribe) => { stopEvents = unsubscribe; });
     window.addEventListener("keydown", handleKeydown);
-    return () => { stopEvents?.(); window.removeEventListener("keydown", handleKeydown); };
+    return () => { stopEvents?.(); window.removeEventListener("keydown", handleKeydown); systemAppearance.removeEventListener("change", updateSystemAppearance); };
   });
 </script>
 
@@ -1084,7 +1088,7 @@
         <nav class="settings-nav"><div class="eyebrow">SETTINGS</div>{#each [["general", "General"], ["appearance", "Appearance"], ["permissions", "Permissions"], ["connections", "Connections"], ["keyboard", "Keyboard"], ["stats", "Stats"]] as item}<button class:current={settingsSection === item[0]} type="button" onclick={() => { settingsSection = item[0]; if (item[0] === "stats") void loadStats(); }}>{item[1]}</button>{/each}<span class="grow"></span><p>Settings are a layer over the workbench.<br /><kbd>esc</kbd> closes it.</p></nav>
         <div class="settings-content"><header><h2>{settingsSection[0].toUpperCase() + settingsSection.slice(1)}</h2><button type="button" onclick={() => settingsOpen = false}>Close <kbd>esc</kbd></button></header>
           {#if settingsSection === "general"}<div class="settings-rows"><SettingToggle label="Stay awake while a task runs" description="Keep the machine available for active work." value={Boolean(settings.stay_awake)} ontoggle={(value) => void setSetting("stay_awake", value)} /><SettingToggle label="Keep a menu-bar presence" description="Show active task count while the window is closed." value={Boolean(settings.menubar)} ontoggle={(value) => void setSetting("menubar", value)} /><div class="setting-row"><div><strong>Send with</strong><small>Enter sends; Shift+Enter inserts a newline.</small></div><select value={text(settings.send_shortcut, "enter")} onchange={(event) => void setSetting("send_shortcut", event.currentTarget.value)}><option value="enter">Enter</option><option value="command_enter">Command+Enter</option></select></div></div>
-          {:else if settingsSection === "appearance"}<div class="appearance-settings"><div class="setting-row"><div><strong>Mode</strong><small>Use the system at launch, then change it with <kbd>d</kbd>.</small></div><div class="segmented"><button class:current={mode === "light"} type="button" onclick={() => void setTheme("light")}>Light</button><button class:current={mode === "dark"} type="button" onclick={() => void setTheme("dark")}>Dark</button></div></div><div class="setting-label">Palette</div><div class="palette-grid">{#each palettes as item}<button class:current={palette === item.id} type="button" onclick={() => void setTheme(mode, item.id)}><span class="palette-swatch" data-palette={item.id} data-mode={mode}></span><strong>{item[mode === "dark" ? "darkName" : "name"]}</strong><small>{item.description}</small></button>{/each}</div></div>
+          {:else if settingsSection === "appearance"}<div class="appearance-settings"><div class="setting-row"><div><strong>Mode</strong><small>Follow your system appearance, or choose a fixed mode. <kbd>d</kbd> toggles light/dark.</small></div><div class="segmented" role="group" aria-label="Appearance mode">{#each ["system", "light", "dark"] as choice}<button class:current={appearance === choice} aria-pressed={appearance === choice} type="button" onclick={() => void setTheme(choice as typeof appearance)}>{choice[0].toUpperCase() + choice.slice(1)}</button>{/each}</div></div><div class="setting-label">Palette</div><div class="palette-grid">{#each palettes as item}<button class:current={palette === item.id} type="button" onclick={() => void setTheme(appearance, item.id)}><span class="palette-swatch" data-palette={item.id} data-mode={mode}></span><strong>{item[mode === "dark" ? "darkName" : "name"]}</strong><small>{item.description}</small></button>{/each}</div></div>
           {:else if settingsSection === "permissions"}<div class="permission-settings"><p class="settings-intro">New top-level tasks begin here. Children inherit the nearest task override.</p><div class="permission-cards">{#each permissionModes as permission}<button class:current={defaultPermission === permission.id} type="button" onclick={() => void setDefaultPermission(permission.id)}><span class={`permission-dot ${permission.id}`}></span><span><strong>{permission.name}</strong><small>{permission.description}</small></span>{#if defaultPermission === permission.id}✓{/if}</button>{/each}</div>{#if selectedTask}<div class="override-row"><span>Current task</span><strong>{selectedTask.title}</strong><span class="grow"></span><span>{permissionName(effectivePermission)}{selectedTask.permissions?.mode ? " · override" : " · inherited"}</span><button type="button" onclick={() => { settingsOpen = false; permissionsOpen = true; }}>edit</button></div>{/if}</div>
           {:else if settingsSection === "connections"}<div class="connections-settings"><p class="settings-intro">Connections choose where work runs and which model to use. Available abilities come from the selected connection.</p>{#each connections as connection}<div class="connection-row"><div><strong>{connection.name}</strong><small>{adapterFor(connection)?.name ?? connection.adapter}{connection.model ? ` · ${connection.model}` : ""}</small></div><span class="grow"></span><span class="connection-status">{adapterStatus[connection.adapter] ?? "status unknown"}</span><button type="button" onclick={() => void inspectAdapter(connection.adapter)}>status</button>{#if adapterSupports(connection.adapter, "login", "auth")}<button type="button" onclick={() => void loginAdapter(connection.adapter)}>login</button>{/if}</div>{/each}{#if !connections.length}<p class="empty-setting">No connections yet. Add one when a work connection is available.</p>{/if}{#if connectionFormOpen}<form class="connection-form" onsubmit={(event) => { event.preventDefault(); void createConnection(); }}><input bind:value={connectionName} placeholder="Connection name" aria-label="Connection name" /><select bind:value={connectionAdapter} aria-label="Adapter"><option value="">Choose adapter</option>{#each adapters as adapter}<option value={adapter.id}>{adapter.name}</option>{/each}</select><input bind:value={connectionModel} placeholder="Model (optional)" aria-label="Model" /><button type="submit" disabled={connectionBusy}>Add connection</button></form>{:else}<button class="add-connection" type="button" onclick={() => { connectionFormOpen = true; connectionAdapter = adapters[0]?.id ?? ""; }}>+ Add connection</button>{/if}</div>
           {:else if settingsSection === "keyboard"}<div class="key-grid">{#each keyHelp as item}<div><kbd>{item[0]}</kbd><span>{item[1]}</span></div>{/each}</div>
